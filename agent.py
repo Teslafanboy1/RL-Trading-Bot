@@ -389,7 +389,13 @@ def should_skip_model_call(raw_sigs, log):
     # cycles where the model had no cash to deploy anyway.
     needs_periodic_check = bool(log.get("open_positions") or pending_buys)
     if needs_periodic_check:
-        elapsed_h = _hours_since(log.get("_state", {}).get("last_model_call_ts"))
+        # Use last_execution_call_ts (stamped only on market_hours_check) so a
+        # research or midweek run doesn't poison this gate.  E.g. pre-market
+        # research at 9:23 should not delay the 9:30 execution by 4 hours.
+        # Fall back to last_model_call_ts for logs written before this field.
+        exec_ts = (log.get("_state", {}).get("last_execution_call_ts")
+                   or log.get("_state", {}).get("last_model_call_ts"))
+        elapsed_h = _hours_since(exec_ts)
         if elapsed_h is None or elapsed_h >= NEWS_CHECK_HOURS:
             reason = "forced_news_check" if log.get("open_positions") else f"pending_buy:{pending_buys[0]}"
             return False, reason
@@ -883,6 +889,8 @@ EXECUTION RULES:
     # exception (process_cycle_state, post-trade pipeline, etc.).
     now_ts = now_iso()
     log["_state"]["last_model_call_ts"] = now_ts
+    if task == "market_hours_check":
+        log["_state"]["last_execution_call_ts"] = now_ts
     # Remember which ENTER_LONG crossovers the model is being shown this call, so
     # a partial-bar flicker can't re-wake it every cycle (see should_skip_model_call).
     # Stale stamps (>= NEWS_CHECK_HOURS) are pruned; a later re-cross counts as new.
