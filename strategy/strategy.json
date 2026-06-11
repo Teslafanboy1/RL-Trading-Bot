@@ -1,0 +1,113 @@
+{
+  "version": 2,
+  "goal": "100% monthly portfolio return",
+  "last_updated": "2026-06-10",
+  "account": {
+    "type": "true_cash",
+    "settlement": "T+1",
+    "starting_capital": 91,
+    "rule": "never_buy_with_unsettled_funds",
+    "cash_reserve": 0.1
+  },
+  "ema_strategy": {
+    "_lengths_note": "EMA lengths are always 8/13/21/55 but measured in BARS at the active chart interval (SIGNAL_INTERVAL): 55 bars = 55 hours on a 1h chart, 55 days on a 1d chart, 55 weeks on a 1w chart. Lengths never change; only the bar interval does.",
+    "lengths_in_bars": {
+      "red": 55,
+      "green": 13,
+      "yellow": 21,
+      "blue": 8
+    },
+    "buy_signal": "55EMA crosses below ALL of 8/13/21 EMA \u2014 becomes lowest line",
+    "sell_signal": "55EMA crosses above ALL of 8/13/21 EMA \u2014 becomes highest line",
+    "hold_rule": "when 55EMA above all 3 \u2014 do nothing, stock is downtrending",
+    "wait_rule": "when 55EMA below all 3 \u2014 hold position"
+  },
+  "research": {
+    "sources": {
+      "news": "web search financial news",
+      "social": "Reddit WSB + investing + stocks",
+      "rss": "Bloomberg Reuters MarketWatch RSS",
+      "fundamental": "Robinhood MCP stock data",
+      "macro": "Fed calendar earnings calendar"
+    },
+    "source_weights": {
+      "news": 0.3,
+      "social": 0.2,
+      "fundamental": 0.35,
+      "macro": 0.15
+    },
+    "source_performance": {
+      "news": {
+        "wins": 1,
+        "losses": 0,
+        "accuracy": 1.0
+      },
+      "social": {
+        "wins": 0,
+        "losses": 0,
+        "accuracy": 0
+      },
+      "fundamental": {
+        "wins": 0,
+        "losses": 0,
+        "accuracy": 0
+      },
+      "macro": {
+        "wins": 0,
+        "losses": 0,
+        "accuracy": 0
+      },
+      "rss": {
+        "wins": 0,
+        "losses": 0,
+        "accuracy": 0
+      }
+    },
+    "min_confidence_to_trade": 60,
+    "min_trades_before_weight_shift": 5
+  },
+  "capital_allocation": {
+    "90_to_100_confidence": 0.3,
+    "75_to_89_confidence": 0.2,
+    "60_to_74_confidence": 0.15,
+    "cash_reserve": 0.1,
+    "max_single_position": 0.3
+  },
+  "blackout_windows": {
+    "earnings_days": 5,
+    "fed_meeting_days": 3
+  },
+  "progress_tracking": {
+    "monthly_goal": "100%",
+    "month_start_value": 100.17,
+    "current_value": 104.67,
+    "current_return": "+4.49%",
+    "on_track": false,
+    "required_weekly_return": 38.57,
+    "_note": "Updated 2026-06-10 after BTSG exit (+3.98%). HOOD and CLOV open. ~$35 cash to deploy June 11 (BTSG settles T+1)."
+  },
+  "risk_management": {
+    "stop_loss_pct": 0.1,
+    "action": "sell_immediately",
+    "note": "Hard stop: if any open position falls 10% below entry price, sell all shares at market immediately \u2014 overrides EMA signal and blackout windows."
+  },
+  "learned_rules": [],
+  "confidence_accuracy": [
+    {
+      "trade_id": "T0001",
+      "symbol": "BTSG",
+      "confidence_at_entry": 68,
+      "outcome": "WIN",
+      "pnl_pct": 3.98,
+      "note": "adopted_position — exclude from calibration. Win was market drift, not thesis. Exit driven by news (KKR secondary). Not representative of 68-band accuracy."
+    }
+  ],
+  "version_history": [
+    {
+      "version": 1,
+      "snapshot_file": "history/strategy_v1.json",
+      "date": "2026-06-10",
+      "reason": "Pre-victory-001 snapshot. BTSG confidence_decay exit. news source +1 win. Progress tracking updated."
+    }
+  ]
+}

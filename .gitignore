@@ -1,0 +1,17 @@
+# Runtime state — not for version control
+trade_log.json
+research/
+postmortems/
+strategy/history/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+
+# macOS
+.DS_Store
+
+# Claude Code local session data
+.claude/

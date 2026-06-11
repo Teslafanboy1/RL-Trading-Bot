@@ -1,0 +1,3 @@
+# Runtime: the `claude` CLI (Claude Code) supplies the model AND the authorized
+# robinhood-cli connection — no API key needed. Only pip dependency is the timer.
+schedule>=1.2.0

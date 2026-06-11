@@ -1,0 +1,173 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Running the agent
+
+```bash
+pip install -r requirements.txt       # installs schedule; the claude CLI supplies the model + Robinhood MCP
+bash run.sh                           # advisory mode (read-only, no real orders)
+EXECUTION_MODE=live bash run.sh       # live mode — places real orders via Robinhood MCP
+```
+
+The agent requires the `claude` CLI (Claude Code) to be in PATH; set `CLAUDE_BIN` if it lives elsewhere. No `ANTHROPIC_API_KEY` is needed — the CLI supplies the model and the authorized `robinhood-cli` MCP connection.
+
+Key env vars:
+| Variable | Default | Effect |
+|---|---|---|
+| `EXECUTION_MODE` | `advisory` | `live` arms real orders |
+| `SIGNAL_INTERVAL` | `1h` | Bar width for EMA (e.g. `30m`, `1d`) |
+| `WATCHLIST` | `SPY` | Comma-separated symbols to scan |
+| `POLL_MINUTES` | `15` | Cycle frequency during market hours |
+| `MODEL` | `claude-opus-4-8` | Used for research/postmortem calls |
+| `CHECK_MODEL` | `claude-haiku-4-5-20251001` | Used for routine market-hours checks (most cycles skip the model entirely) |
+| `RH_ACCOUNT` | `696283985` | Robinhood Agentic cash account number |
+| `NEWS_CHECK_HOURS` | `4` | Force a thesis/news check at least every N hours even when EMA is flat — catches news-driven thesis breaks before the lagging EMA can reflect them |
+
+Compute EMA signals directly (no full agent run):
+```bash
+python3 signals.py SPY MU CAT
+SIGNAL_INTERVAL=1d python3 signals.py SPY    # daily-chart mode
+```
+
+## Architecture
+
+### Core loop (`agent.py`)
+
+`main()` schedules `run_agent()` every `POLL_MINUTES` during market hours. Each cycle:
+1. Calls `signals.signals_with_raw()` to compute EMA signals once (reused for both skip check and prompt).
+2. **Smart skip** (`should_skip_model_call`): if all signals are NEUTRAL/HOLD, no stop-loss is triggered, and no weekend pick is pending execution, the cycle returns immediately with 0 tokens used. This eliminates ~90% of model calls on flat days.
+3. If a model call IS needed: loads `strategy/strategy.json` and the current skill. For `market_hours_check` cycles, postmortems and closed-trade history are stripped from the prompt (smaller context = fewer tokens per tool-call turn).
+4. Calls `run_model()` which shells out to `claude -p` with the full prompt over stdin, with `--allowedTools` restricting MCP access (read-only unless `EXECUTION_MODE=live`). `Skill`/`Task`/`Agent` are hard-disallowed (`--disallowedTools`) — a headless model once tried to "launch" a trading skill mid-cycle, the call was denied, and the turn ended without the JSON footer. On `rc≠0` the error detail is captured from stdout as well as stderr (with `--output-format json` the CLI reports usage-cap/auth failures on stdout).
+5. The model writes a machine-readable `{cash, positions, actions_taken}` JSON footer; `process_cycle_state()` parses it to detect opens/closes and fire the learning loop.
+6. `adopt_untracked_positions()` is called inside `process_cycle_state()` after buy-action recording: any account-held position not already in `open_positions` (e.g. manually entered, or entered before the agent started) is adopted using the broker's average cost as entry price. This ensures the stop-loss monitor and learning loop cover all held positions, not only agent-opened ones.
+7. After parsing, if any stop-loss position is still open (model failed to sell), a `WARNING` is printed to stdout and the alert re-fires next cycle.
+
+#### Startup behaviour when market is closed
+
+When `bash run.sh` is invoked while the market is closed (any day, including weekends),
+the agent prompts `r` or `w`:
+- **`r`** — run research now and exit.
+- **`w`** — wait until **9:20 AM ET** on the next trading day, run pre-market research
+  (`skill_1_research.md`, `claude-opus-4-8`), then sleep the remaining 10 minutes and
+  start the trading loop at 9:30 AM ET. The picks file produced by research is
+  automatically loaded into every execution cycle, so the trading loop acts on the
+  picks immediately at open.
+
+#### Smart skip trigger conditions (`should_skip_model_call`)
+
+A market-hours cycle calls the model only when at least one of these is true:
+- Any symbol has transition `ENTER_LONG` (new buy opportunity) **that the model hasn't already been shown within `NEWS_CHECK_HOURS`** — `_state.enter_long_seen` stamps each crossover at model-call time, so a partial-bar flicker on an intraday chart can't re-wake the model every 15-min cycle for hours
+- Any **held** symbol has transition `EXIT` (sell signal on a position we own)
+- `check_stop_loss_alerts()` returns a triggered position (≥10% drawdown)
+- `signals.py` is unavailable or returns an error for any symbol (unknown state → model decides)
+- Open positions exist OR unowned weekend picks are in `BUY` state AND `now − _state.last_model_call_ts ≥ NEWS_CHECK_HOURS` → `forced_news_check` / `pending_buy` (unified time-gate: thesis check + buy opportunity, at most once per NEWS_CHECK_HOURS to avoid calling the model every 15-min cycle while a pick stays in BUY state for days)
+
+`EXIT` on a symbol we don't hold is ignored — nothing to sell. Research and midweek phases bypass the skip entirely. `last_model_call_ts` is stamped in `trade_log.json._state` at the start of every real model call so the gate is persistent across restarts. All timestamps are written via `now_iso()` (ET with UTC offset); `_hours_since()` parses naive legacy stamps as machine-local and never raises.
+
+After a midweek or research run, `persist_phase_output()` writes the model's text to `research/midweek_review_YYYY-MM-DD.md` / `research/weekend_picks_YYYY-MM-DD.md` (never clobbering an existing file, never persisting an error). This is required because the headless model has **no file-write tool** — before this, the midweek review file never got created, so `active_skill()` re-fired `midweek_validation` on every remaining cycle of the day.
+
+#### Weekend pick symbols (`weekend_pick_symbols`)
+
+Reads the latest `research/weekend_picks_*.md` and extracts tickers from `### #N — SYMBOL` headings. Used by both `watchlist_symbols()` (so their EMA signals are fetched every cycle) and `should_skip_model_call()` (to wake the model when a pick is in BUY state and unowned).
+
+### Signal layer (`signals.py`)
+
+Computes the 4-EMA ribbon (blue=8, green=13, yellow=21, red=55) from real price data. EMA lengths are always **8/13/21/55 BARS** at the active chart interval (`SIGNAL_INTERVAL`, default `1h`): on a 1h chart, 55 bars = 55 hours; on a 1d chart, 55 bars = 55 days. The lengths never change — only the bar interval does. Data sources tried in order: (1) `data/<SYMBOL>.csv` local file, (2) Yahoo Finance API for all intervals. Returns `INSUFFICIENT_DATA` if `< 60 bars` — the agent blocks on this, never fabricates a signal.
+
+All HTTPS fetches use `_ssl_context()` which loads certifi's CA bundle (fixes `CERTIFICATE_VERIFY_FAILED` on python.org macOS Python builds where `ssl.get_default_verify_paths().cafile` is `None`). Set `ALLOW_INSECURE_FETCH=1` only as a last resort in environments with broken CA chains.
+
+Signal classification: `red < min(others)` = BUY, `red > max(others)` = SELL, else NEUTRAL.
+
+Key public functions:
+- `signal_for(symbol)` — full signal dict for one symbol (state, transition, EMA values, last close)
+- `signals_block(symbols)` — formatted one-line-per-symbol string for injection into prompts
+- `signals_with_raw(symbols)` — returns `(raw_dict, formatted_block)` in one pass, avoiding double Yahoo fetches; used by the core loop so signals are fetched exactly once per cycle
+
+Drop a CSV with a `Close` column at `data/<SYMBOL>.csv` to override Yahoo Finance for that symbol (e.g. sandbox testing or local backtesting).
+
+### Skills (`skills/`)
+
+Eight role-based markdown prompts loaded as the `system` context for each agent turn:
+- `skill_0_orchestrator.md` — injected every cycle; coordinates the other skills
+- `skill_1_research.md` — weekend/after-hours scanner, writes `research/weekend_picks_*.md`
+- `skill_2_execution.md` — market-hours executor (Mon + intraweek)
+- `skill_3_midweek.md` — Wednesday position review, writes `research/midweek_review_*.md`
+- `skill_4_postmortem.md` — fires on LOSS; writes `postmortems/postmortem_NNN.md`
+- `skill_4b_victory.md` — fires on WIN; writes `postmortems/victory_NNN.md`
+- `skill_5_strategy_rewriter.md` — updates `strategy/strategy.json` and skill files after every trade
+- `skill_6_pattern_detector.md` — quarterly systemic review across all postmortems
+
+Phase routing in `agent.py:active_skill()`:
+- Market hours + Wednesday ≥ 12:00 PM ET (and `midweek_review_{today}.md` not yet written) → skill_3
+- Market hours (all other times) → skill_2
+- Off-hours + Wednesday (and `midweek_review_{today}.md` not yet written) → skill_3 (fallback if script started after close)
+- Otherwise → skill_1
+
+`skill_2_execution.md` runs a **thesis integrity check** on every cycle (including `forced_news_check` wakeups): for each held position, searches for breaking news, re-scores confidence, and sells immediately if the thesis-breaking event has occurred or confidence drops below 60. This is the only sell path that can fire before a −10% stop-loss when news changes faster than the EMA can react.
+
+#### Research phase (`skill_1_research.md`)
+
+Runs on weekends and any weekday cycle outside market hours. Always calls the model (no skip); uses `MODEL` (Opus) for depth. Receives the full prompt: postmortems + full trade log + strategy.
+
+Steps:
+1. **Goal-pace check**: reads `progress_tracking` from `strategy.json` to compute remaining return needed, weeks left, and a per-position move threshold. Stocks below the threshold go to watchlist only.
+2. **Open position review** (before scanning new candidates): re-scores every held position 0–100 using the full scoring formula (EMA gate, momentum, source scoring). Computes each position's current portfolio weight and compares it to its confidence band maximum. Positions above their band max are flagged for trim; positions with confidence below 60 are flagged `TRIM_TO_ZERO`. Proceeds from trims/exits are added to the deployable capital pool. All existing positions and new candidates are ranked together by confidence before allocation — the portfolio is always weighted toward the highest-conviction ideas regardless of when they were entered.
+3. Scans a **broad candidate universe** — two sources combined:
+   - *Static high-beta universe*: 60+ tickers across semis, AI/cloud, high-beta tech/fintech, biotech, leveraged ETFs, and energy — checked every run regardless of news.
+   - *Dynamic MCP scan*: `get_popular_lists` (daily movers, most popular), `search` for momentum/breakout terms, and user watchlists.
+4. For each candidate: checks the EMA signal — ENTER_LONG or active BUY zone qualifies; SELL/NEUTRAL → skip.
+5. Checks momentum: 5-day % range and recent direction. Only stocks that can realistically hit the move threshold stay as buy candidates.
+6. Scores each candidate 0–100 from EMA strength, momentum, and source agreement (news, Reddit, RSS, fundamentals, macro) weighted by `source_performance`.
+7. Targets **5+ qualified candidates** before stopping. If fewer than 5 pass, expands search with additional web queries.
+8. Sets entry/exit target prices; checks blackout windows (earnings ≤5 days, Fed ≤3 days → skip).
+9. Allocates capital portfolio-wide (against total portfolio value, not just new cash): 90–100→30%, 75–89→20%, 60–74→15%, <60→exit if held / skip if new. Always keeps the 10% cash reserve; max 30% per position.
+
+Output: `research/weekend_picks_YYYY-MM-DD.md` — open-position reassessment table, ranked picks with confidence scores, entry/exit targets, stop-loss levels, dollar allocation, full reasoning, and the one thing that would invalidate each thesis. Header includes goal-pace math and the move threshold used. Deployment summary includes any trim/exit actions alongside new buys.
+
+The picks file is automatically loaded into the system prompt for every subsequent market-hours execution cycle so `skill_2` knows exactly which symbols to watch and at what targets.
+
+#### Midweek validation (`skill_3_midweek.md`)
+
+Fires once on Wednesday at **12:00 PM ET** during market hours (the agent detects noon in `active_skill()` and routes there if `research/midweek_review_{today}.md` does not yet exist). Falls back to off-hours if the script is started after close and the file still doesn't exist. Always calls the model; uses `MODEL` (Opus). Receives the full prompt including postmortems.
+
+Full re-scoring pass — same rigor as weekend research, not a qualitative gut-check:
+1. Pulls live prices, portfolio value, and settled cash from the Robinhood MCP.
+2. Re-scores every open position 0–100 from scratch (EMA health, news search, momentum). Confidence band is re-derived from current data, not carried from entry.
+3. Compares each position's current portfolio weight to its new confidence band max. Over-weighted or confidence-decayed positions are trimmed; positions below 60 confidence are fully exited.
+4. Builds a combined ranked list of existing positions + redeployment candidates and allocates capital top-down.
+5. Executes all trim/exit orders and any redeployment buys via the Robinhood MCP in the same cycle.
+6. Reports the explicit T+1 settlement schedule so the execution skill never plans buys against unsettled funds.
+
+Output: `research/midweek_review_YYYY-MM-DD.md` — per-position verdict table (hold/trim $X/exit), reasoning per non-hold position, all MCP order IDs placed this cycle, settlement schedule, and redeployment details.
+
+### Strategy state (`strategy/strategy.json`)
+
+The living config + learned state: EMA rules, capital allocation bands, blackout windows, source weights, source performance counts, confidence calibration thresholds, `risk_management`, and `progress_tracking`. Every mutation goes through `snapshot_strategy()` which bumps `version`, appends to `version_history`, and copies the prior file to `strategy/history/`. Rollback = swap a history snapshot back.
+
+The `risk_management` block is the single source of truth for the stop-loss threshold (`stop_loss_pct: 0.10`). To change the threshold, edit only this field.
+
+Source-weight rebalancing (`rebalance_source_weights()`) blends toward accuracy-proportional weights with a `±0.05/source` per-update cap. Weights only shift after `min_trades_before_weight_shift` (default 5) trades.
+
+### Trade log (`trade_log.json`)
+
+Single JSON file tracking `open_positions`, closed `trades`, and a rolling `summary` (win rate, total P&L, monthly return vs 100% goal). `_state.last_positions` holds the previous cycle's position snapshot for diff-based close detection. `_state.last_model_call_ts` (ISO timestamp) is stamped after every real model call and is used by `should_skip_model_call` to enforce the `NEWS_CHECK_HOURS` forced-news-check gate.
+
+### Post-trade learning loop
+
+Triggered by `run_post_trade_pipeline()` after every position close:
+1. `trigger_postmortem()` or `trigger_victory_analysis()` — runs the model with web search, writes structured markdown + machine-readable `verdicts` JSON to `postmortems/`. Stop-loss exits always route to `trigger_postmortem()` and include additional focus questions (what caused the drawdown, whether an EMA SELL was missed before the stop hit).
+2. `update_source_weights()` — credits/debits sources based on `verdicts.sources` accuracy flags.
+3. `update_monthly_progress()` — recomputes current return vs. 100% monthly goal.
+4. `flag_strategy_rewrite()` — appends a line to `research/strategy_rewrite_queue.md` for skill_5.
+
+Stop-loss forced exits are tagged `stop_loss: true` in the trade record so the pattern detector (skill_6) can identify systemic drawdown patterns over time.
+
+## Key constraints (enforced at every level)
+
+- **Stop-loss**: if any open position falls ≥ 10% below entry price, sell all shares immediately — overrides EMA signal, blackout windows, and all other rules. The model is instructed to sell first before evaluating anything else. Sells are tagged `reason='stop_loss'` in `actions_taken` and `stop_loss: true` in the trade record. Threshold lives in `strategy/strategy.json` → `risk_management.stop_loss_pct`.
+- **T+1 settlement**: only buy with settled cash. Always read from the Robinhood MCP before any buy; never infer settled cash from the trade log.
+- **Capital bands**: 90-100 confidence → 30%, 75-89 → 20%, 60-74 → 15%, below 60 → skip. 10% cash reserve always held; max 30% per position.
+- **EMA signal gate**: the 55-EMA `ENTER_LONG` transition triggers buys; `EXIT` transition triggers sells. `HOLD` = stay in position (already in BUY zone); `NO_ACTION` = do nothing. Weekend picks in `HOLD` state are still valid buy targets during execution.
+- **Account**: always use account `696283985` (Agentic cash, not the margin account).
+- **Core rule changes** require 3+ similar outcomes before applying; minor tweaks (weights, targets, sizing) auto-apply.
