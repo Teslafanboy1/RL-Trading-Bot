@@ -162,9 +162,21 @@ For each currently held position, a one-line verdict:
 - Re-scored confidence, current portfolio weight vs. band maximum, action: `HOLD` / `TRIM $X` / `EXIT`
 - Brief reason (e.g. "confidence decayed from 82→58, over band at 28% weight")
 
-### Picks table (ranked by confidence × move_potential score)
-For each qualified candidate:
-- Symbol, confidence score (0–100), EMA state (ENTER_LONG / HOLD / APPROACHING)
+### Ranked picks (ranked by confidence × move_potential score)
+**FORMAT IS MANDATORY.** Each qualified candidate MUST be its own heading written
+EXACTLY as:
+
+`### #N — SYMBOL (Company Name) | Confidence: XX/100`
+
+(e.g. `### #1 — HOOD (Robinhood Markets) | Confidence: 78/100`). The agent parses
+this exact heading to (a) save this file at all and (b) extract the tickers that
+execution watches. If you write the picks as prose, a single table, or any other
+format, **the picks are silently dropped, the file is never saved, and execution
+runs on a stale day-old picks file.** Every pick gets its own `### #N — SYMBOL`
+heading — no exceptions, including pre-market prep runs with only a handful of picks.
+
+Under each pick heading include:
+- Confidence score (0–100), EMA state (ENTER_LONG / HOLD / APPROACHING)
 - 5-day % range, recent momentum direction
 - Entry target, exit target, stop-loss level (entry × 0.90)
 - Dollar allocation and share count

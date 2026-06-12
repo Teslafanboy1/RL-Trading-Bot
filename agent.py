@@ -392,9 +392,12 @@ def should_skip_model_call(raw_sigs, log):
         # Use last_execution_call_ts (stamped only on market_hours_check) so a
         # research or midweek run doesn't poison this gate.  E.g. pre-market
         # research at 9:23 should not delay the 9:30 execution by 4 hours.
-        # Fall back to last_model_call_ts for logs written before this field.
-        exec_ts = (log.get("_state", {}).get("last_execution_call_ts")
-                   or log.get("_state", {}).get("last_model_call_ts"))
+        # No fallback to last_model_call_ts: on a log that has never stamped
+        # last_execution_call_ts, a pre-market research run would have just
+        # bumped last_model_call_ts and the fallback would re-suppress the
+        # 9:30 open — the exact bug this field exists to fix. A missing stamp
+        # degrades to one extra model call, which is the safe direction.
+        exec_ts = log.get("_state", {}).get("last_execution_call_ts")
         elapsed_h = _hours_since(exec_ts)
         if elapsed_h is None or elapsed_h >= NEWS_CHECK_HOURS:
             reason = "forced_news_check" if log.get("open_positions") else f"pending_buy:{pending_buys[0]}"
@@ -922,6 +925,24 @@ EXECUTION RULES:
     saved = persist_phase_output(task, text)
     if saved:
         print(f"  phase output saved -> research/{saved}")
+    elif task in ("research_and_prep", "midweek_validation") and not (
+        text.startswith("(claude -p error") or text.startswith("(error:")
+    ):
+        # The run completed but produced nothing the phase routing can consume
+        # (research: no `### #N — SYMBOL` picks; midweek: file already existed).
+        # Fail loudly so a silently-unsaved plan never lets execution run on a
+        # stale picks file, and keep the raw output as a fallback so the plan is
+        # never lost. (An already-existing file is the normal no-op case below.)
+        today = datetime.now(ET).strftime("%Y-%m-%d")
+        expected = (f"weekend_picks_{today}.md" if task == "research_and_prep"
+                    else f"midweek_review_{today}.md")
+        if not os.path.exists(os.path.join(ROOT, "research", expected)):
+            fallback = f"unsaved_{task}_{stamp}.md"
+            with open(os.path.join(ROOT, "research", fallback), "w") as f:
+                f.write(text + "\n")
+            print(f"  WARNING: {task} run produced no parseable output for "
+                  f"research/{expected} — execution will use the stale picks "
+                  f"file. Raw output preserved at research/{fallback}.")
 
     # Phase 2: parse the structured footer and drive the tracker
     state = extract_last_json_block(text)

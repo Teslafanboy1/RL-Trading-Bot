@@ -50,13 +50,20 @@ research, then starts the trading loop at 9:30 AM. Uses `claude-opus-4-8`.
 
 Output → `research/weekend_picks_YYYY-MM-DD.md` — automatically injected into every
 subsequent execution cycle so the trading loop acts on the picks immediately at open.
+Each pick must be written as a `### #N — SYMBOL | Confidence: XX/100` heading: the agent
+parses that exact format both to save the file and to extract the tickers execution
+watches. A research run that produces no parseable picks is never silently dropped — the
+agent logs a `WARNING` and preserves the raw text at `research/unsaved_*.md` so the plan
+is recoverable instead of execution quietly falling back to the prior day's picks.
 
 **B — Execution, Mon + intraweek** (`skill_2_execution.md`)
 - Every cycle: thesis integrity check on all held positions (web search for breaking news;
   sell immediately if thesis broken or confidence decays below 60).
 - Smart skip: if all EMA signals are flat, no stop-loss is triggered, and the
-  last model call was less than `NEWS_CHECK_HOURS` (default 4h) ago, skip the model
-  call entirely (0 tokens). Otherwise call the model to execute buys/sells.
+  last **execution** cycle was less than `NEWS_CHECK_HOURS` (default 4h) ago, skip the
+  model call entirely (0 tokens). Otherwise call the model to execute buys/sells.
+  (The gate keys off the last execution cycle, not the last model call of any kind,
+  so the pre-market research run at 9:23 AM can't suppress the 9:30 open.)
 - Buys require: EMA BUY/HOLD + settled cash + passing news check + no blackout window.
 
 **C — Midweek re-score (Wed, 12:00 PM ET)** (`skill_3_midweek.md`)

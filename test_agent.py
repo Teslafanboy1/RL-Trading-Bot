@@ -527,10 +527,13 @@ class TestTimeGateAndEnterLongDedup(TmpDirMixin):
         with patch.object(agent_module, "check_stop_loss_alerts", return_value=[]):
             return agent_module.should_skip_model_call(raw, log)
 
-    def _log(self, open_positions=None, last_call_ts=None, el_seen=None):
+    def _log(self, open_positions=None, last_call_ts=None, el_seen=None,
+             last_exec_ts=None):
         state = {"last_positions": [], "next_id": 1}
         if last_call_ts is not None:
             state["last_model_call_ts"] = last_call_ts
+        if last_exec_ts is not None:
+            state["last_execution_call_ts"] = last_exec_ts
         if el_seen is not None:
             state["enter_long_seen"] = el_seen
         return {"open_positions": open_positions or [], "_state": state}
@@ -541,13 +544,13 @@ class TestTimeGateAndEnterLongDedup(TmpDirMixin):
 
     # ---------------- forced news check gate ----------------
     def test_fresh_ts_with_open_positions_skips(self):
-        log = self._log([self._open_pos("AAPL")], last_call_ts=self._ts(0.2))
+        log = self._log([self._open_pos("AAPL")], last_exec_ts=self._ts(0.2))
         skip, reason = self._skip({"AAPL": self._sig("HOLD")}, log)
         self.assertTrue(skip)
         self.assertEqual(reason, "all_neutral_no_action")
 
     def test_stale_ts_forces_news_check(self):
-        log = self._log([self._open_pos("AAPL")], last_call_ts=self._ts(5))
+        log = self._log([self._open_pos("AAPL")], last_exec_ts=self._ts(5))
         skip, reason = self._skip({"AAPL": self._sig("HOLD")}, log)
         self.assertFalse(skip)
         self.assertEqual(reason, "forced_news_check")
@@ -561,15 +564,44 @@ class TestTimeGateAndEnterLongDedup(TmpDirMixin):
     def test_timezone_aware_fresh_ts_still_skips(self):
         """Regression: an aware (offset-carrying) timestamp must not break the
         elapsed math and silently force a model call every cycle."""
-        log = self._log([self._open_pos("AAPL")], last_call_ts=self._ts(0.2, aware=True))
+        log = self._log([self._open_pos("AAPL")], last_exec_ts=self._ts(0.2, aware=True))
         skip, reason = self._skip({"AAPL": self._sig("HOLD")}, log)
         self.assertTrue(skip)
 
     def test_garbage_ts_forces_news_check(self):
-        log = self._log([self._open_pos("AAPL")], last_call_ts="not-a-date")
+        log = self._log([self._open_pos("AAPL")], last_exec_ts="not-a-date")
         skip, reason = self._skip({"AAPL": self._sig("HOLD")}, log)
         self.assertFalse(skip)
         self.assertEqual(reason, "forced_news_check")
+
+    def test_premarket_research_cannot_suppress_open(self):
+        """THE 2026-06-11 bug, both halves. A 9:20 pre-market research run
+        stamps last_model_call_ts minutes before the 9:30 first execution
+        cycle. The gate must key off last_execution_call_ts only — with NO
+        fallback to last_model_call_ts — or a log that has never stamped an
+        execution call (e.g. first run after upgrading) re-skips the 9:30
+        open until 13:20."""
+        log = self._log([self._open_pos("AAPL")], last_call_ts=self._ts(0.2))
+        skip, reason = self._skip({"AAPL": self._sig("HOLD")}, log)
+        self.assertFalse(skip)
+        self.assertEqual(reason, "forced_news_check")
+
+    def test_premarket_research_cannot_suppress_pending_buy(self):
+        """Same poisoning scenario, but with no open positions — only an
+        unowned weekend pick in BUY state waiting for the 9:30 open."""
+        self._write_picks("MRVL")
+        log = self._log(last_call_ts=self._ts(0.2))
+        skip, reason = self._skip({"MRVL": self._sig("HOLD", state="BUY")}, log)
+        self.assertFalse(skip)
+        self.assertEqual(reason, "pending_buy:MRVL")
+
+    def test_gate_keyed_to_exec_ts_not_model_ts(self):
+        """Fresh execution stamp + stale model stamp → still skip: only the
+        execution stamp drives the gate."""
+        log = self._log([self._open_pos("AAPL")],
+                        last_call_ts=self._ts(6), last_exec_ts=self._ts(0.2))
+        skip, reason = self._skip({"AAPL": self._sig("HOLD")}, log)
+        self.assertTrue(skip)
 
     # ---------------- pending_buy gate (unowned weekend pick in BUY zone) ----
     def _write_picks(self, *symbols):
@@ -587,7 +619,7 @@ class TestTimeGateAndEnterLongDedup(TmpDirMixin):
 
     def test_pending_buy_gated_by_fresh_ts(self):
         self._write_picks("NVDA")
-        log = self._log(last_call_ts=self._ts(0.2))
+        log = self._log(last_exec_ts=self._ts(0.2))
         skip, _ = self._skip({"NVDA": self._sig("HOLD", state="BUY")}, log)
         self.assertTrue(skip)
 
