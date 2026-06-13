@@ -27,6 +27,7 @@ import re
 import json
 import time
 import shutil
+import urllib.request
 from datetime import datetime, date, timedelta
 from zoneinfo import ZoneInfo
 
@@ -57,6 +58,43 @@ RH_READ = [_RH + t for t in ("get_accounts", "get_portfolio", "get_equity_positi
            "get_equity_orders", "get_equity_quotes", "get_equity_tradability",
            "search", "get_watchlists", "get_watchlist_items", "review_equity_order")]
 RH_WRITE = [_RH + "place_equity_order", _RH + "cancel_equity_order"]
+
+
+def notify_operator(subject, body):
+    """Best-effort OUT-OF-BAND alert for the two conditions the operator must see
+    even when not tailing the log: a hard forced exit (stop-loss / ribbon SELL)
+    that did NOT complete, and claude -p being unavailable (session/usage limit)
+    while a forced exit is pending.
+
+    Two hard constraints:
+      * must NOT depend on the claude CLI — that is exactly what is down in the
+        session-limit case, so the alert is a direct stdlib HTTP POST, not a
+        model call;
+      * must NEVER raise — an alerting failure can't be allowed to break the
+        trading loop, so every delivery path is wrapped and swallowed.
+
+    Always prints to stdout (today's behavior). Additionally POSTs to
+    ALERT_WEBHOOK_URL when set: JSON {"title","message","text"} — the "text"
+    field is Slack/Discord-native, "message"/"title" suit ntfy and generic
+    webhooks. Unconfigured => stdout only, no-op (no new required setup)."""
+    print(f"[ALERT] {subject} :: {body}")
+    url = os.environ.get("ALERT_WEBHOOK_URL")
+    if not url:
+        return
+    try:
+        payload = json.dumps({
+            "title": subject,
+            "message": body,
+            "text": f"*{subject}*\n{body}",  # Slack/Discord-compatible field
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            url, data=payload, method="POST",
+            headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=10)
+    except Exception as e:
+        # Last resort: the stdout line above already fired; just note the miss.
+        print(f"  [ALERT] webhook delivery to ALERT_WEBHOOK_URL failed: {e}")
+
 
 try:
     import signals  # real EMA signal layer (optional; agent degrades if absent)
@@ -1076,6 +1114,11 @@ EXECUTION RULES:
             print(f"[{stamp}] WARNING: forced exit PENDING for {sorted(must_sell)} "
                   "but Claude is unavailable — positions NOT sold. MANUAL SELL may "
                   "be required until the limit resets / connection recovers.")
+            notify_operator(
+                f"Trading bot: forced exit BLOCKED — {why}",
+                f"{sorted(must_sell)} need to be sold (stop-loss / ribbon SELL) but "
+                f"claude -p is unavailable, so NOTHING was sold this cycle. Manual "
+                f"sell may be required until it recovers. Detail: {text[:180]}")
         save_trade_log(log)  # preserve the pre-call stamps
         print(f"[{stamp}] task={task} done (model unavailable).")
         return
@@ -1150,6 +1193,11 @@ EXECUTION RULES:
             print(f"[{stamp}] WARNING: forced exit NOT completed for "
                   f"{sorted(still)} — still held at broker. Will retry next "
                   "cycle; MANUAL SELL may be required.")
+            notify_operator(
+                "Trading bot: forced exit NOT completed",
+                f"{sorted(still)} still held at the broker after BOTH the model "
+                f"turn and the dedicated force-sell. The bot will retry next cycle, "
+                f"but a MANUAL SELL may be required now.")
 
     print(f"[{stamp}] task={task} done.")
 

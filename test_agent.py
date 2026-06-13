@@ -1336,6 +1336,45 @@ class TestBrokerReconciliation(unittest.TestCase):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 14c — out-of-band operator alerts (notify_operator)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestNotifyOperator(unittest.TestCase):
+    """The forced-exit / session-limit alert must reach the operator out of band
+    without depending on the claude CLI, and must NEVER raise — an alerting
+    failure can't be allowed to break the trading loop."""
+
+    def test_no_webhook_is_stdout_only_no_post(self):
+        """Unconfigured (no ALERT_WEBHOOK_URL) => stdout only, no HTTP attempt."""
+        with patch.dict(os.environ, {}, clear=True), \
+             patch.object(agent_module.urllib.request, "urlopen") as mock_open:
+            agent_module.notify_operator("subj", "body")
+        mock_open.assert_not_called()
+
+    def test_webhook_posts_subject_and_body(self):
+        with patch.dict(os.environ, {"ALERT_WEBHOOK_URL": "https://hook.example/x"}), \
+             patch.object(agent_module.urllib.request, "urlopen") as mock_open:
+            agent_module.notify_operator("forced exit BLOCKED", "CLOV not sold")
+        mock_open.assert_called_once()
+        req = mock_open.call_args[0][0]
+        self.assertEqual(req.full_url, "https://hook.example/x")
+        sent = json.loads(req.data.decode("utf-8"))
+        self.assertEqual(sent["title"], "forced exit BLOCKED")
+        self.assertIn("CLOV not sold", sent["message"])
+        self.assertIn("CLOV not sold", sent["text"])  # Slack/Discord field
+
+    def test_webhook_failure_is_swallowed(self):
+        """A dead webhook URL must not propagate an exception to the caller."""
+        with patch.dict(os.environ, {"ALERT_WEBHOOK_URL": "https://hook.example/x"}), \
+             patch.object(agent_module.urllib.request, "urlopen",
+                          side_effect=OSError("connection refused")):
+            try:
+                agent_module.notify_operator("subj", "body")
+            except Exception as e:
+                self.fail(f"notify_operator must never raise, got {e!r}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # SECTION 15 — process_cycle_state integration
 # ═══════════════════════════════════════════════════════════════════════════════
 

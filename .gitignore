@@ -3,6 +3,7 @@ trade_log.json
 research/
 postmortems/
 strategy/history/
+*.log
 
 # Python
 __pycache__/
