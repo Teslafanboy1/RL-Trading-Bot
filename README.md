@@ -10,13 +10,17 @@ stocks with real money, plus web search for news / Reddit / RSS.
   can be redeployed. Never buy with unsettled funds.
 - North star: 100% monthly portfolio return.
 
-## The EMA strategy (core buy/sell signal)
+## The ribbon strategy (core buy/sell signal)
 
-Four EMAs measured in **bars** at the active chart interval (`SIGNAL_INTERVAL`, default `1h`):
-8 (blue), 13 (green), 21 (yellow), 55 (red). On a 1h chart, 55 bars = 55 hours; on a 1d chart, 55 bars = 55 days.
+Four lines matching the TradingView chart the strategy is read from — **TEMA 13/21/55 + EMA 8**:
+blue = EMA(8), green = TEMA(13), yellow = TEMA(21), red = TEMA(55). Lengths are measured in
+**bars** at the active chart interval (`SIGNAL_INTERVAL`): on a 30m chart, 55 bars = 55
+half-hours. TEMA (triple EMA) tracks price with far less lag than a plain EMA — a plain-EMA
+55 line reads BUY long after the chart reads SELL.
 
 - **BUY**  — the 55 (red) crosses below ALL of 8/13/21 and becomes the LOWEST line.
 - **SELL** — the 55 (red) crosses above ALL of 8/13/21 and becomes the HIGHEST line.
+  For a held position, SELL **state** itself triggers the sell — no fresh cross required.
 - **HOLD** — while red stays the lowest line, hold the position.
 - **WAIT** — while red is above all 3 (downtrend), do nothing.
 
@@ -24,7 +28,8 @@ Four EMAs measured in **bars** at the active chart interval (`SIGNAL_INTERVAL`, 
 
 Three independent sell triggers — any one fires a sell:
 
-1. **EMA EXIT** — the 55 EMA crosses above all of 8/13/21 (standard signal).
+1. **Ribbon EXIT** — the 55 (red TEMA) sits above all of 8/13/21: SELL state on a held
+   position sells immediately, whether the cross happened this bar or an earlier one.
 2. **Stop-loss** — position falls ≥10% below entry price. Hard rule, overrides everything.
 3. **Thesis break / confidence decay** — intraday news check finds a thesis-breaking event
    (bad earnings, CEO departure, regulatory reversal, sector shock) or re-scores confidence
@@ -137,7 +142,7 @@ strategy/
 research/                       weekend_picks / midweek_review / agent run logs
 postmortems/                    postmortem_NNN.md / victory_NNN.md
 agent.py                        core loop, scheduling, skip logic, MCP wiring
-signals.py                      EMA computation (Yahoo Finance or local CSV)
+signals.py                      ribbon computation, TEMA 13/21/55 + EMA 8 (Yahoo or local CSV)
 trade_log.json                  open positions, closed trades, learning links
 ```
 

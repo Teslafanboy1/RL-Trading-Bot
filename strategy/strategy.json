@@ -1,7 +1,7 @@
 {
-  "version": 2,
+  "version": 3,
   "goal": "100% monthly portfolio return",
-  "last_updated": "2026-06-10",
+  "last_updated": "2026-06-12",
   "account": {
     "type": "true_cash",
     "settlement": "T+1",
@@ -10,17 +10,17 @@
     "cash_reserve": 0.1
   },
   "ema_strategy": {
-    "_lengths_note": "EMA lengths are always 8/13/21/55 but measured in BARS at the active chart interval (SIGNAL_INTERVAL): 55 bars = 55 hours on a 1h chart, 55 days on a 1d chart, 55 weeks on a 1w chart. Lengths never change; only the bar interval does.",
+    "_lengths_note": "Lengths are always 8/13/21/55 in BARS at the active chart interval (SIGNAL_INTERVAL): 55 bars = 55 half-hours on a 30m chart, 55 days on a 1d chart. Lengths never change; only the bar interval does. Smoothing: the three slow lines (13/21/55) are TEMA (triple EMA) and the 8 is a plain EMA \u2014 matching the TradingView chart the strategy is read from ('TEMA 13 21 55' + 'EMA 8'). A plain-EMA 55 line lags far behind the chart and reads BUY long after the chart reads SELL.",
     "lengths_in_bars": {
       "red": 55,
       "green": 13,
       "yellow": 21,
       "blue": 8
     },
-    "buy_signal": "55EMA crosses below ALL of 8/13/21 EMA \u2014 becomes lowest line",
-    "sell_signal": "55EMA crosses above ALL of 8/13/21 EMA \u2014 becomes highest line",
-    "hold_rule": "when 55EMA above all 3 \u2014 do nothing, stock is downtrending",
-    "wait_rule": "when 55EMA below all 3 \u2014 hold position"
+    "buy_signal": "red TEMA(55) crosses below ALL of EMA(8)/TEMA(13)/TEMA(21) \u2014 becomes lowest line",
+    "sell_signal": "red TEMA(55) crosses above ALL of EMA(8)/TEMA(13)/TEMA(21) \u2014 becomes highest line. For a HELD position, SELL state itself (red on top) triggers the sell even if the cross happened on an earlier bar (no fresh EXIT transition required).",
+    "hold_rule": "when red TEMA(55) is above all 3 \u2014 do nothing, stock is downtrending",
+    "wait_rule": "when red TEMA(55) is below all 3 \u2014 hold position"
   },
   "research": {
     "sources": {
@@ -39,8 +39,8 @@
     "source_performance": {
       "news": {
         "wins": 1,
-        "losses": 0,
-        "accuracy": 1.0
+        "losses": 1,
+        "accuracy": 0.5
       },
       "social": {
         "wins": 0,
@@ -49,8 +49,8 @@
       },
       "fundamental": {
         "wins": 0,
-        "losses": 0,
-        "accuracy": 0
+        "losses": 1,
+        "accuracy": 0.0
       },
       "macro": {
         "wins": 0,
@@ -80,10 +80,10 @@
   "progress_tracking": {
     "monthly_goal": "100%",
     "month_start_value": 100.17,
-    "current_value": 104.67,
-    "current_return": "+4.49%",
+    "current_value": 101.106,
+    "current_return": "0.9%",
     "on_track": false,
-    "required_weekly_return": 38.57,
+    "required_weekly_return": 40.77,
     "_note": "Updated 2026-06-10 after BTSG exit (+3.98%). HOOD and CLOV open. ~$35 cash to deploy June 11 (BTSG settles T+1)."
   },
   "risk_management": {
@@ -99,7 +99,7 @@
       "confidence_at_entry": 68,
       "outcome": "WIN",
       "pnl_pct": 3.98,
-      "note": "adopted_position — exclude from calibration. Win was market drift, not thesis. Exit driven by news (KKR secondary). Not representative of 68-band accuracy."
+      "note": "adopted_position \u2014 exclude from calibration. Win was market drift, not thesis. Exit driven by news (KKR secondary). Not representative of 68-band accuracy."
     }
   ],
   "version_history": [
@@ -108,6 +108,14 @@
       "snapshot_file": "history/strategy_v1.json",
       "date": "2026-06-10",
       "reason": "Pre-victory-001 snapshot. BTSG confidence_decay exit. news source +1 win. Progress tracking updated."
+    },
+    {
+      "version": 3,
+      "date": "2026-06-12",
+      "change": "Indicator corrected to match the operator's chart: 13/21/55 lines are TEMA, 8 stays plain EMA. Plain-EMA ribbon held CLOV through a 2-day fade the chart flagged SELL on Jun 11 11:30 ET at ~$4.875 (breakeven). SELL state on a held position now triggers exit directly (not just the EXIT edge).",
+      "trade_ids": [
+        "T0004"
+      ]
     }
   ]
 }

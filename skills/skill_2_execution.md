@@ -51,8 +51,10 @@ For **each open position**:
    - If the thesis-breaking event has occurred → score drops to 0 → **sell immediately**
    - If sentiment has significantly shifted (e.g., analyst downgrade, key source turned bearish) → re-score; if now below 60 → **sell immediately**
    - If no material change → hold, no action needed
-3. **EMA check**: confirm red(55) is still the lowest line. If it has crossed above
-   any of the 8/13/21 → **sell immediately** (standard EMA EXIT rule).
+3. **Ribbon check**: the ribbon is TEMA 13/21/55 + EMA 8 (matches the operator's
+   chart). If the signal block shows **SELL state** for a held symbol — red(55)
+   on top of all three other lines — **sell immediately**, even if the transition
+   column reads NO_ACTION (the cross may have happened on an earlier bar).
 4. If selling: execute via Robinhood MCP at market, set `reason="thesis_broken"` or
    `reason="ema_exit"` in `actions_taken` so the learning loop fires correctly.
 
@@ -63,6 +65,8 @@ specifically to run this section on days when the EMA never triggers.
 ## SELL
 - Sell immediately when the 55 (red) crosses above ALL of 8/13/21 and becomes the
   HIGHEST line. Execute the sell via the Robinhood MCP at that moment.
+- A held position whose signal reads **SELL state** is a sell NOW, regardless of
+  transition — never wait for a fresh EXIT edge that already passed.
 - Also sell immediately if the thesis integrity check above flags a thesis-breaking
   event or confidence decay below 60.
 - After a sell, cash is unsettled for T+1 — note when it frees up.

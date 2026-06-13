@@ -1,15 +1,23 @@
 """
-signals.py — the real EMA signal layer (closes the "estimated EMA" gap).
+signals.py — the real signal layer (closes the "estimated EMA" gap).
 
-Computes the 4-line EMA ribbon (8/13/21/55) from REAL daily closes and classifies
-the BUY / SELL / NEUTRAL state, so the agent acts on a COMPUTED signal instead of
-eyeballing it. Pure standard library — no pip dependencies, no database.
+Computes the 4-line ribbon from REAL closes and classifies the BUY / SELL /
+NEUTRAL state, so the agent acts on a COMPUTED signal instead of eyeballing it.
+Pure standard library — no pip dependencies, no database.
+
+Lines — MUST match the TradingView chart the strategy is read from, which is
+"TEMA 13 21 55" + "EMA 8" (NOT a plain-EMA ribbon):
+  blue = EMA(8)   green = TEMA(13)   yellow = TEMA(21)   red = TEMA(55)
+TEMA tracks price with far less lag than a plain EMA, so the red(55) line rolls
+over and crosses on top of the ribbon days earlier in a run-up-then-fade. A
+plain EMA(55) here reads BUY long after the chart reads SELL.
 
 Signal (matches strategy.json):
-  blue=EMA8, green=EMA13, yellow=EMA21, red=EMA55
   BUY  = red is the LOWEST line  (uptrend confirmed)
   SELL = red is the HIGHEST line (downtrend confirmed)
   Action fires on the TRANSITION into a state, not every bar it holds.
+  agent.py additionally treats SELL *state* on a HELD position as a sell
+  trigger, so a cross missed while the bot wasn't looking still exits.
 
 Bar interval is set by SIGNAL_INTERVAL (default "1h" = the 1-month chart; use
 "30m"/"15m" for the 1-week chart, "1d" for the daily chart). The 8/13/21/55
@@ -53,7 +61,8 @@ def _ssl_context():
 
 LENGTHS = {"blue": 8, "green": 13, "yellow": 21, "red": 55}
 MIN_BARS = 60        # below this, refuse to emit a signal
-WARMUP_OK = 120      # at/above this the 55-line is well-seeded
+WARMUP_OK = 165      # at/above this the 55-line is well-seeded (TEMA's triple
+                     # EMA cascade carries seed bias ~3x longer than a plain EMA)
 
 # Bar interval the EMA is computed on — MUST match the chart you read signals off.
 #   1-month chart -> "1h" (default)   1-week chart -> "30m" or "15m"   daily -> "1d"
@@ -76,9 +85,23 @@ def ema(values, length):
     return out
 
 
+def tema(values, length):
+    """Triple EMA: 3*e1 - 3*e2 + e3 where e2=EMA(e1), e3=EMA(e2). Same length
+    as input. Matches TradingView's TEMA indicator (much lower lag than EMA)."""
+    e1 = ema(values, length)
+    e2 = ema(e1, length)
+    e3 = ema(e2, length)
+    return [3 * a - 3 * b + c for a, b, c in zip(e1, e2, e3)]
+
+
+# blue(8) is a plain EMA; the three slow lines are TEMA — same as the chart.
+SMOOTHER = {"blue": ema, "green": tema, "yellow": tema, "red": tema}
+
+
 def compute_lines(closes):
-    """Latest value of each of the 4 EMA lines."""
-    return {name: ema(closes, length)[-1] for name, length in LENGTHS.items()}
+    """Latest value of each of the 4 ribbon lines."""
+    return {name: SMOOTHER[name](closes, length)[-1]
+            for name, length in LENGTHS.items()}
 
 
 def classify_signal(lines):

@@ -32,13 +32,19 @@ import agent as agent_module
 
 # ─────────────────────────────────────────── synthetic price series ──────────
 
-def _uptrend(n=120, start=100.0, step=1.0):
-    """Rising closes → EMA55 lags → red(55) is LOWEST → BUY."""
-    return [start + i * step for i in range(n)]
+def _uptrend(n=120, start=100.0, jump_bars=15, step=1.5):
+    """Flat base then a recent upward impulse → red TEMA(55) still climbing
+    from the base → red is LOWEST → BUY. (A steady linear ramp is degenerate
+    for TEMA: its lag-cancellation parks all three TEMAs on the trend line,
+    so BUY/SELL states come from impulse moves, matching real breakouts.)"""
+    flat = [start] * (n - jump_bars)
+    return flat + [start + step * i for i in range(1, jump_bars + 1)]
 
-def _downtrend(n=120, start=200.0, step=1.0):
-    """Falling closes → EMA55 lags high → red(55) is HIGHEST → SELL."""
-    return [start - i * step for i in range(n)]
+def _downtrend(n=120, start=200.0, jump_bars=15, step=1.5):
+    """Flat base then a recent downward impulse → red TEMA(55) still up at
+    the base → red is HIGHEST → SELL."""
+    flat = [start] * (n - jump_bars)
+    return flat + [start - step * i for i in range(1, jump_bars + 1)]
 
 def _flat(n=120, price=100.0):
     """Flat closes → all EMAs converge → NEUTRAL."""
@@ -150,23 +156,30 @@ class TestEMAComputation(unittest.TestCase):
         for length in (8, 13, 21, 55):
             self.assertEqual(len(sig_module.ema(closes, length)), 100)
 
-    def test_ema_uptrend_shorter_faster(self):
-        """In an uptrend, shorter EMAs are higher (they react faster to rising prices)."""
-        closes = _uptrend(120)
-        lines = sig_module.compute_lines(closes)
-        # EMA8 (blue) > EMA13 (green) > EMA21 (yellow) > EMA55 (red)
-        self.assertGreater(lines["blue"], lines["green"])
-        self.assertGreater(lines["green"], lines["yellow"])
-        self.assertGreater(lines["yellow"], lines["red"])
+    def test_tema_constant_series_equals_constant(self):
+        closes = [100.0] * 200
+        self.assertAlmostEqual(sig_module.tema(closes, 55)[-1], 100.0, places=6)
 
-    def test_ema_downtrend_shorter_lower(self):
-        """In a downtrend, shorter EMAs are lower (they fall faster)."""
-        closes = _downtrend(120)
-        lines = sig_module.compute_lines(closes)
-        # EMA8 (blue) < EMA13 (green) < EMA21 (yellow) < EMA55 (red)
-        self.assertLess(lines["blue"], lines["green"])
-        self.assertLess(lines["green"], lines["yellow"])
-        self.assertLess(lines["yellow"], lines["red"])
+    def test_tema_kills_lag_on_linear_ramp(self):
+        """TEMA's defining property: near-zero lag on a steady trend. On a
+        200-bar ramp ending at 299, TEMA(55) sits on the price while a plain
+        EMA(55) lags tens of points behind — the exact difference that made
+        the plain-EMA ribbon disagree with the TradingView chart."""
+        ramp = [100.0 + i for i in range(200)]
+        self.assertAlmostEqual(sig_module.tema(ramp, 55)[-1], ramp[-1], delta=1.0)
+        self.assertLess(sig_module.ema(ramp, 55)[-1], ramp[-1] - 20.0)
+
+    def test_upward_impulse_red_lowest(self):
+        """After a recent breakout, red TEMA(55) is still rising from the base
+        and must be the lowest line (BUY zone)."""
+        lines = sig_module.compute_lines(_uptrend(120))
+        self.assertLess(lines["red"], min(lines["blue"], lines["green"], lines["yellow"]))
+
+    def test_downward_impulse_red_highest(self):
+        """After a recent breakdown, red TEMA(55) is still up at the base and
+        must be the highest line (SELL zone)."""
+        lines = sig_module.compute_lines(_downtrend(120))
+        self.assertGreater(lines["red"], max(lines["blue"], lines["green"], lines["yellow"]))
 
     def test_ema_flat_all_equal(self):
         closes = _flat(120)
@@ -219,6 +232,24 @@ class TestSignalClassification(unittest.TestCase):
     def test_flat_data_produces_neutral(self):
         lines = sig_module.compute_lines(_flat(120))
         self.assertEqual(sig_module.classify_signal(lines), "NEUTRAL")
+
+    def test_runup_then_fade_sells_on_tema_not_on_plain_ema(self):
+        """Regression for the 2026-06-12 CLOV bug: after a sharp rally and a
+        shallow 2-day fade, the TEMA ribbon (the chart the strategy is read
+        from) flips red-on-top = SELL, while a plain-EMA ribbon still reads
+        red-on-bottom = BUY because the plain EMA(55) never caught up to the
+        rally. The bot computed plain EMA and held through the entire fade."""
+        base = [3.95] * 200
+        rally = [3.95 + 1.10 * (i / 25.0) for i in range(1, 26)]
+        fade = [5.05 - 0.47 * (i / 20.0) for i in range(1, 21)]
+        shape = base + rally + fade
+
+        tema_lines = sig_module.compute_lines(shape)
+        self.assertEqual(sig_module.classify_signal(tema_lines), "SELL")
+
+        plain_ema_lines = {name: sig_module.ema(shape, length)[-1]
+                           for name, length in sig_module.LENGTHS.items()}
+        self.assertEqual(sig_module.classify_signal(plain_ema_lines), "BUY")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -277,14 +308,21 @@ class TestSignalFor(unittest.TestCase):
         s = self._patched_signal(_flat(60))
         self.assertTrue(s["ok"])
 
-    def test_warmup_warning_below_120_bars(self):
+    def test_warmup_warning_below_165_bars(self):
         s = self._patched_signal(_uptrend(80))
         self.assertTrue(s["ok"])
         self.assertFalse(s["warmup_ok"])
         self.assertIn("not fully seeded", s["note"])
 
-    def test_warmup_ok_at_120_bars(self):
+    def test_warmup_warning_at_120_bars(self):
+        """120 bars was enough for a plain EMA(55) but not for TEMA's triple
+        cascade, which carries seed bias ~3x longer."""
         s = self._patched_signal(_uptrend(120))
+        self.assertTrue(s["ok"])
+        self.assertFalse(s["warmup_ok"])
+
+    def test_warmup_ok_at_165_bars(self):
+        s = self._patched_signal(_uptrend(165))
         self.assertTrue(s["ok"])
         self.assertTrue(s["warmup_ok"])
         self.assertEqual(s["note"], "")
@@ -469,6 +507,23 @@ class TestSmartSkip(TmpDirMixin):
         skip, _ = self._skip(raw, open_positions=[])
         self.assertTrue(skip)
 
+    def test_sell_state_held_no_skip_even_without_exit_edge(self):
+        """A held position sitting in SELL state must wake the model even when
+        the cross happened on an earlier bar (transition NO_ACTION) — e.g.
+        after downtime or an indicator change. Regression for CLOV 2026-06-12."""
+        raw = {"CLOV": {"ok": True, "transition": "NO_ACTION", "state": "SELL"}}
+        positions = [self._open_pos("CLOV")]
+        skip, reason = self._skip(raw, open_positions=positions)
+        self.assertFalse(skip)
+        self.assertEqual(reason, "ema_sell_held:CLOV")
+
+    def test_sell_state_unheld_skips(self):
+        """SELL state on a symbol we don't own → nothing to sell → skip."""
+        raw = {"CLOV": {"ok": True, "transition": "NO_ACTION", "state": "SELL"},
+               "SPY": self._sig("NO_ACTION")}
+        skip, _ = self._skip(raw, open_positions=[])
+        self.assertTrue(skip)
+
     def test_hold_signal_skip(self):
         """HOLD = already in BUY state, no new action needed → skip."""
         raw = {"SPY": self._sig("HOLD")}
@@ -505,6 +560,41 @@ class TestSmartSkip(TmpDirMixin):
             skip, reason = agent_module.should_skip_model_call({}, {})
         self.assertFalse(skip)
         self.assertEqual(reason, "signals_unavailable")
+
+
+class TestEmaSellBlock(TmpDirMixin):
+    """_format_ema_sell_block: the SELL SIGNAL prompt alert for held positions."""
+
+    def _sell_sig(self):
+        return {"ok": True, "state": "SELL", "transition": "NO_ACTION",
+                "last_close": 4.58,
+                "lines": {"red": 4.83, "blue": 4.62, "green": 4.55, "yellow": 4.54}}
+
+    def test_held_sell_state_produces_block(self):
+        log = {"open_positions": [self._open_pos("CLOV")]}
+        block = agent_module._format_ema_sell_block({"CLOV": self._sell_sig()}, log)
+        self.assertIn("CLOV", block)
+        self.assertIn("SELL SIGNAL ACTIVE", block)
+        self.assertIn("reason='ema_exit'", block)
+        self.assertIn("NO_ACTION does NOT cancel", block)
+
+    def test_unheld_sell_state_no_block(self):
+        block = agent_module._format_ema_sell_block(
+            {"CLOV": self._sell_sig()}, {"open_positions": []})
+        self.assertEqual(block, "")
+
+    def test_held_buy_state_no_block(self):
+        sig = dict(self._sell_sig(), state="BUY")
+        log = {"open_positions": [self._open_pos("CLOV")]}
+        block = agent_module._format_ema_sell_block({"CLOV": sig}, log)
+        self.assertEqual(block, "")
+
+    def test_not_ok_signal_no_block(self):
+        """INSUFFICIENT_DATA / fetch errors must never fabricate a sell order."""
+        sig = dict(self._sell_sig(), ok=False)
+        log = {"open_positions": [self._open_pos("CLOV")]}
+        block = agent_module._format_ema_sell_block({"CLOV": sig}, log)
+        self.assertEqual(block, "")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1191,33 +1281,98 @@ class TestFormatStopLossBlock(unittest.TestCase):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 14b — broker reconciliation primitives (read_broker_state / force_sell)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestBrokerReconciliation(unittest.TestCase):
+    """The independent broker read and the deterministic forced sell must degrade
+    SAFELY when claude -p fails (session limit, garbage output): never claim the
+    account is flat, never claim a sell was placed."""
+
+    def test_read_broker_state_failed_call_returns_none(self):
+        """A failed/garbage model response → (None, set()), NOT an empty position
+        list. None tells the caller 'unknown' so it skips close detection rather
+        than phantom-closing everything."""
+        with patch.object(agent_module, "run_model",
+                          return_value=("(claude -p error rc=1: session limit)", {})):
+            positions, sells = agent_module.read_broker_state()
+        self.assertIsNone(positions)
+        self.assertEqual(sells, set())
+
+    def test_read_broker_state_parses_positions_and_sells(self):
+        payload = ('```json\n{"positions": [{"symbol": "CLOV", "shares": 4.18, '
+                   '"avg_price": 4.89, "last_price": 4.59}, '
+                   '{"symbol": "DEAD", "shares": 0, "avg_price": 1.0}], '
+                   '"sell_orders_today": ["clov"]}\n```')
+        with patch.object(agent_module, "run_model", return_value=(payload, {})):
+            positions, sells = agent_module.read_broker_state()
+        self.assertEqual([p["symbol"] for p in positions], ["CLOV"])  # zero-share dropped
+        self.assertEqual(sells, {"CLOV"})                              # upper-cased
+
+    def test_force_sell_advisory_mode_is_noop(self):
+        with patch.object(agent_module, "EXECUTION_MODE", "advisory"):
+            placed, fill = agent_module.force_sell("CLOV", 4.18, "ema_exit")
+        self.assertFalse(placed)
+        self.assertIsNone(fill)
+
+    def test_force_sell_live_reports_placement(self):
+        payload = ('```json\n{"placed": true, "symbol": "CLOV", '
+                   '"order_id": "abc-123", "fill_price": 4.59}\n```')
+        with patch.object(agent_module, "EXECUTION_MODE", "live"), \
+             patch.object(agent_module, "run_model", return_value=(payload, {})):
+            placed, fill = agent_module.force_sell("CLOV", 4.18, "ema_exit")
+        self.assertTrue(placed)
+        self.assertEqual(fill, 4.59)
+
+    def test_force_sell_live_unconfirmed_is_not_placed(self):
+        """If the confirm step can't verify an order id, placed=false — we must
+        not report a sell we can't confirm."""
+        payload = '```json\n{"placed": false, "symbol": "CLOV", "fill_price": null}\n```'
+        with patch.object(agent_module, "EXECUTION_MODE", "live"), \
+             patch.object(agent_module, "run_model", return_value=(payload, {})):
+            placed, fill = agent_module.force_sell("CLOV", 4.18, "ema_exit")
+        self.assertFalse(placed)
+        self.assertIsNone(fill)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # SECTION 15 — process_cycle_state integration
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TestProcessCycleState(TmpDirMixin):
+    """process_cycle_state now takes (log, actions, broker_positions, exit_info).
+    broker_positions is the AUTHORITATIVE independent broker read — closes fire
+    only when the broker confirms a position is gone, never on the footer alone."""
 
-    def _run_cycle(self, log, state):
+    def _run_cycle(self, log, actions, broker_positions, exit_info=None):
         with patch.object(agent_module, "log_trade_outcome") as mock_close:
             mock_close.return_value = {"id": "T0001", "outcome": "WIN",
                                        "pnl_dollar": 10, "pnl_pct": 10}
-            agent_module.process_cycle_state(log, state)
+            agent_module.process_cycle_state(log, actions, broker_positions, exit_info)
         return mock_close
 
     def test_buy_action_records_open_position(self):
         import copy
         log = copy.deepcopy(self.tradelog)
         self._flush_log()
-        state = {
-            "cash": 80.0,
-            "positions": [{"symbol": "NVDA", "shares": 0.1,
-                           "avg_price": 900.0, "last_price": 905.0}],
-            "actions_taken": [{"type": "buy", "symbol": "NVDA",
-                               "shares": 0.1, "price": 900.0}],
-        }
+        positions = [{"symbol": "NVDA", "shares": 0.1,
+                      "avg_price": 900.0, "last_price": 905.0}]
+        actions = [{"type": "buy", "symbol": "NVDA", "shares": 0.1, "price": 900.0}]
         with patch.object(agent_module, "log_trade_outcome"):
-            agent_module.process_cycle_state(log, state)
+            agent_module.process_cycle_state(log, actions, positions)
         open_syms = [p["symbol"] for p in log["open_positions"]]
         self.assertIn("NVDA", open_syms)
+
+    def test_fabricated_buy_not_recorded(self):
+        """A buy action the broker does NOT confirm must not be recorded."""
+        import copy
+        log = copy.deepcopy(self.tradelog)
+        self._flush_log()
+        actions = [{"type": "buy", "symbol": "NVDA", "shares": 0.1, "price": 900.0}]
+        with patch.object(agent_module, "log_trade_outcome"):
+            agent_module.process_cycle_state(log, actions, [])  # broker shows nothing
+        open_syms = [p["symbol"] for p in log["open_positions"]]
+        self.assertNotIn("NVDA", open_syms)
 
     def test_sell_action_triggers_log_trade_outcome(self):
         import copy
@@ -1225,16 +1380,28 @@ class TestProcessCycleState(TmpDirMixin):
         log["open_positions"].append(self._open_pos("AAPL", 150.0))
         log["_state"]["next_id"] = 2
         self._flush_log()
-        state = {
-            "cash": 160.0,
-            "positions": [],
-            "actions_taken": [{"type": "sell", "symbol": "AAPL",
-                               "shares": 1.0, "price": 160.0}],
-        }
-        mock_close = self._run_cycle(log, state)
+        actions = [{"type": "sell", "symbol": "AAPL", "shares": 1.0, "price": 160.0}]
+        mock_close = self._run_cycle(log, actions, [])  # broker confirms AAPL gone
         mock_close.assert_called_once()
         args = mock_close.call_args
         self.assertEqual(args[0][1]["symbol"], "AAPL")  # open_pos arg
+        self.assertEqual(args[0][2], 160.0)             # exit price from footer
+
+    def test_phantom_sell_not_closed_when_broker_still_holds(self):
+        """The core bug: footer claims a sell, but the broker still holds the
+        position → it must NOT be marked closed."""
+        import copy
+        log = copy.deepcopy(self.tradelog)
+        log["open_positions"].append(self._open_pos("CLOV", 4.89))
+        log["_state"]["next_id"] = 2
+        self._flush_log()
+        actions = [{"type": "sell", "symbol": "CLOV", "shares": 4.18, "price": 4.59}]
+        broker = [{"symbol": "CLOV", "shares": 4.18, "avg_price": 4.89,
+                   "last_price": 4.59}]  # broker STILL holds CLOV
+        with patch.object(agent_module, "log_trade_outcome") as mock_close:
+            agent_module.process_cycle_state(log, actions, broker)
+        mock_close.assert_not_called()
+        self.assertIn("CLOV", [p["symbol"] for p in log["open_positions"]])
 
     def test_sell_stop_loss_flag(self):
         import copy
@@ -1242,32 +1409,38 @@ class TestProcessCycleState(TmpDirMixin):
         log["open_positions"].append(self._open_pos("TEST", 100.0))
         log["_state"]["next_id"] = 2
         self._flush_log()
-        state = {
-            "cash": 90.0,
-            "positions": [],
-            "actions_taken": [{"type": "sell", "symbol": "TEST",
-                               "shares": 1.0, "price": 90.0,
-                               "reason": "stop_loss"}],
-        }
+        actions = [{"type": "sell", "symbol": "TEST", "shares": 1.0,
+                    "price": 90.0, "reason": "stop_loss"}]
         with patch.object(agent_module, "log_trade_outcome") as mock_close:
             mock_close.return_value = {}
-            agent_module.process_cycle_state(log, state)
+            agent_module.process_cycle_state(log, actions, [])
         _, kwargs = mock_close.call_args
         self.assertTrue(kwargs.get("stop_loss"))
 
+    def test_exit_info_reason_and_price_win(self):
+        """A deterministic forced sell supplies reason + price via exit_info even
+        when the footer carries no matching sell action."""
+        import copy
+        log = copy.deepcopy(self.tradelog)
+        log["open_positions"].append(self._open_pos("TEST", 100.0))
+        log["_state"]["next_id"] = 2
+        self._flush_log()
+        exit_info = {"TEST": {"reason": "stop_loss", "price": 88.5}}
+        with patch.object(agent_module, "log_trade_outcome") as mock_close:
+            mock_close.return_value = {}
+            agent_module.process_cycle_state(log, [], [], exit_info)
+        args, kwargs = mock_close.call_args
+        self.assertEqual(args[2], 88.5)            # exit price from exit_info
+        self.assertTrue(kwargs.get("stop_loss"))
+
     def test_vanished_position_safety_net(self):
-        """Position gone from broker report with no sell action → safety net close."""
+        """Position gone from the broker read with no sell action → still closes."""
         import copy
         log = copy.deepcopy(self.tradelog)
         log["open_positions"].append(self._open_pos("GONE", 100.0))
         log["_state"]["next_id"] = 2
         self._flush_log()
-        state = {
-            "cash": 100.0,
-            "positions": [],           # GONE disappeared
-            "actions_taken": [],       # no sell action reported
-        }
-        mock_close = self._run_cycle(log, state)
+        mock_close = self._run_cycle(log, [], [])  # broker confirms flat
         mock_close.assert_called_once()
 
     def test_snapshot_saved_to_state(self):
@@ -1276,9 +1449,8 @@ class TestProcessCycleState(TmpDirMixin):
         self._flush_log()
         positions = [{"symbol": "SPY", "shares": 1.0,
                       "avg_price": 500.0, "last_price": 505.0}]
-        state = {"cash": 50.0, "positions": positions, "actions_taken": []}
         with patch.object(agent_module, "log_trade_outcome"):
-            agent_module.process_cycle_state(log, state)
+            agent_module.process_cycle_state(log, [], positions)
         self.assertEqual(log["_state"]["last_positions"], positions)
 
 

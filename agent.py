@@ -169,16 +169,22 @@ def load_latest_research_file(prefix):
 _EMPTY_USAGE = {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0}
 
 
-def run_model(system, user, *, mcp=False, web=False, timeout=600, model=None):
+def run_model(system, user, *, mcp=False, web=False, timeout=600, model=None,
+              read_only=False, allow_write=False):
     """One agent turn via the `claude` CLI. Returns (text, usage_dict).
 
     usage_dict keys: input_tokens, output_tokens, cost_usd.
     Tools are restricted by --allowedTools: read-only by default; order-placing
-    tools only when EXECUTION_MODE=live. The big prompt goes via stdin."""
+    tools only when EXECUTION_MODE=live. The big prompt goes via stdin.
+
+    read_only=True forces RH read tools only (no order placement) regardless of
+    EXECUTION_MODE — used for the independent broker-state verification read.
+    allow_write=True arms order placement (subject to EXECUTION_MODE=live) for a
+    dedicated forced-sell call even outside the main execution turn."""
     tools = []
     if mcp:
         tools += RH_READ
-        if EXECUTION_MODE == "live":
+        if EXECUTION_MODE == "live" and (allow_write or not read_only):
             tools += RH_WRITE
     if web:
         tools += ["WebSearch", "WebFetch"]
@@ -344,8 +350,8 @@ def should_skip_model_call(raw_sigs, log):
     """Return (skip: bool, reason: str).
 
     Skip only when there is provably nothing for the model to do: every signal
-    is NEUTRAL/HOLD and no stop-loss has triggered and no EXIT applies to a
-    position we actually hold. This eliminates ~90% of cycles on flat days.
+    is NEUTRAL/HOLD, no stop-loss has triggered, and no held position is in
+    SELL state (EXIT edge or not). This eliminates ~90% of cycles on flat days.
 
     Called ONLY for market_hours_check — research and midweek always run.
     """
@@ -375,6 +381,14 @@ def should_skip_model_call(raw_sigs, log):
                 return False, f"enter_long:{sym}"
         if t == "EXIT" and sym in held:
             return False, f"exit:{sym}"
+        # State-based safety net: the EXIT edge exists only on the bar where the
+        # cross happens. If the cross occurred while the bot wasn't looking (down,
+        # or before an indicator change), transition reads NO_ACTION forever and
+        # the edge-based wake above never fires. A held position sitting in SELL
+        # state must wake the model regardless; re-fires every cycle until the
+        # position is actually sold (same deliberate nagging as stop-loss alerts).
+        if s.get("state") == "SELL" and sym in held:
+            return False, f"ema_sell_held:{sym}"
 
     # Collect weekend picks that are in BUY zone and not yet held.
     picks = {s.upper() for s in weekend_pick_symbols()}
@@ -732,45 +746,131 @@ def persist_phase_output(task, text):
     return fname
 
 
-def process_cycle_state(log, state):
-    """Phase 2 bookkeeping from the model's reported state: record new opens,
-    detect/close finished positions, fire the learning loop."""
-    positions = state.get("positions", []) or []
-    actions = state.get("actions_taken", []) or []
-    now = now_iso()
+def read_broker_state():
+    """Independent, read-only broker snapshot via a dedicated `claude -p` call —
+    the AUTHORITATIVE ground truth for close detection. The main execution turn's
+    self-reported footer cannot be trusted: on 2026-06-12 the model reported CLOV
+    and AI sold (cash + a positions list excluding them) while the broker showed
+    both still held at full size and ZERO orders placed. Trusting that footer
+    phantom-closed both positions and fired two bogus postmortems.
 
-    # 1. record opens from buy actions
+    Returns (positions, sell_symbols_today):
+      positions          — list of {symbol, shares, avg_price, last_price}, or
+                           None if the read itself failed (caller must then NOT
+                           treat anything as closed — a failed read is unknown,
+                           not "flat").
+      sell_symbols_today — set of symbols with a SELL order placed today in any
+                           state (used to avoid double-selling: don't force-sell a
+                           name the main turn already has a working order for)."""
+    system = ("You are a read-only Robinhood query tool. Use only the MCP read "
+              "tools. Do not place, modify, or cancel any order.")
+    today = datetime.now(ET).strftime("%Y-%m-%d")
+    user = (
+        f"For Robinhood account {ACCOUNT_NUMBER}:\n"
+        "1. Call get_equity_positions and list every currently held position.\n"
+        f"2. Call get_equity_orders (created_at_gte={today}) and note which symbols "
+        "have a SELL-side order placed today (any state).\n"
+        "Output ONLY one fenced ```json block, no prose:\n"
+        '{"positions": [{"symbol": "X", "shares": <float>, "avg_price": <float>, '
+        '"last_price": <float|null>}], "sell_orders_today": ["SYM", ...]}\n'
+        "shares = quantity held (use 0 only if truly flat). If no positions, use []."
+    )
+    text, _ = run_model(system, user, mcp=True, read_only=True, model=CHECK_MODEL,
+                        timeout=240)
+    block = extract_last_json_block(text)
+    if not (block and isinstance(block, dict) and isinstance(block.get("positions"), list)):
+        return None, set()
+    positions = [p for p in block["positions"]
+                 if p.get("symbol") and float(p.get("shares") or 0) > 0]
+    sells = {s.upper() for s in (block.get("sell_orders_today") or []) if isinstance(s, str)}
+    return positions, sells
+
+
+def force_sell(symbol, shares, reason):
+    """Deterministically place a market SELL for ALL shares of one symbol via a
+    tight, single-purpose `claude -p` call, then self-confirm via get_equity_orders.
+    Returns (placed: bool, fill_price: float|None).
+
+    This is the execution path for HARD forced exits (stop-loss, ribbon SELL): the
+    single most critical action must not depend on the big, chatty execution turn,
+    which has been observed to narrate a sell in its footer without ever calling
+    place_equity_order. A one-instruction prompt on the research model (Opus) is
+    far more likely to actually fire the order, and we verify it afterwards."""
+    if EXECUTION_MODE != "live":
+        return False, None
+    system = ("You place exactly one Robinhood order and then confirm it. No "
+              "analysis, no hedging, no second-guessing.")
+    user = (
+        f"Place a MARKET SELL order for ALL {shares} shares of {symbol} in Robinhood "
+        f"account {ACCOUNT_NUMBER} using place_equity_order RIGHT NOW. This is a "
+        f"pre-authorized forced exit (reason={reason}) — do not analyze, do not skip. "
+        "After placing it, call get_equity_orders to confirm the order exists. "
+        "Output ONLY one fenced ```json block, no prose:\n"
+        '{"placed": true|false, "symbol": "' + symbol + '", "order_id": "<id or null>", '
+        '"fill_price": <float|null>}\n'
+        "Set placed=true ONLY if place_equity_order returned an order id."
+    )
+    text, _ = run_model(system, user, mcp=True, allow_write=True, model=MODEL,
+                        timeout=240)
+    block = extract_last_json_block(text) or {}
+    fp = block.get("fill_price")
+    try:
+        fp = float(fp) if fp is not None else None
+    except (TypeError, ValueError):
+        fp = None
+    return bool(block.get("placed")), fp
+
+
+def process_cycle_state(log, actions, broker_positions, exit_info=None):
+    """Phase 2 bookkeeping driven by the AUTHORITATIVE broker snapshot, not the
+    model's self-report.
+
+    actions          — actions_taken[] from the execution-turn footer (used only
+                       to recover exit prices / reasons for confirmed closes and
+                       to know which buys to record metadata for).
+    broker_positions — the independent broker read (see read_broker_state). A
+                       position is closed ONLY when the broker confirms it is gone.
+    exit_info        — optional {symbol: {"reason": str, "price": float|None}} for
+                       deterministic forced sells placed this cycle.
+    """
+    actions = actions or []
+    exit_info = exit_info or {}
+    now = now_iso()
+    broker_syms = {p["symbol"] for p in broker_positions if float(p.get("shares") or 0) > 0}
+
+    # 1. record opens from buy actions — but ONLY if the broker confirms the
+    #    position actually exists now (a fabricated buy must not be recorded).
     for a in actions:
-        if a.get("type") == "buy" and a.get("symbol"):
+        if a.get("type") == "buy" and a.get("symbol") in broker_syms:
             record_open_position(log, a)
 
     # 1b. adopt account-held positions the agent isn't tracking (manual or
     # pre-existing) so the stop-loss monitor and learning loop cover them too.
-    adopted = adopt_untracked_positions(log, positions)
+    adopted = adopt_untracked_positions(log, broker_positions)
     if adopted:
         print(f"  adopted untracked positions (now stop-loss monitored): {', '.join(adopted)}")
     save_trade_log(log)
 
-    # 2. closes from explicit sell actions (authoritative exit price)
-    handled = set()
-    for a in actions:
-        if a.get("type") == "sell" and a.get("symbol"):
-            op = next((p for p in log["open_positions"] if p["symbol"] == a["symbol"]), None)
-            if op:
-                is_stop_loss = str(a.get("reason", "")).lower() == "stop_loss"
-                log_trade_outcome(log, op, a.get("price") or op["entry_price"], now,
-                                  stop_loss=is_stop_loss)
-                handled.add(a["symbol"])
+    # 2. closes: a tracked open whose symbol is GONE from the broker snapshot.
+    #    Exit price/reason come from the forced-sell record first, then the
+    #    footer's matching sell action, then last price, then entry.
+    sell_actions = {a["symbol"]: a for a in actions
+                    if a.get("type") == "sell" and a.get("symbol")}
+    last_by_sym = {p.get("symbol"): p.get("last_price") for p in broker_positions}
+    prev_last = {p.get("symbol"): p.get("last_price")
+                 for p in log["_state"].get("last_positions", [])}
+    for op in detect_closed_positions(log["open_positions"], broker_positions):
+        sym = op["symbol"]
+        info = exit_info.get(sym, {})
+        a = sell_actions.get(sym, {})
+        reason = info.get("reason") or str(a.get("reason", "")).lower()
+        is_stop_loss = reason == "stop_loss"
+        price = (info.get("price") or a.get("price")
+                 or last_by_sym.get(sym) or prev_last.get(sym) or op["entry_price"])
+        log_trade_outcome(log, op, price, now, stop_loss=is_stop_loss)
 
-    # 3. safety net: positions that vanished without a reported sell action
-    for op in detect_closed_positions(log["open_positions"], positions):
-        if op["symbol"] in handled:
-            continue
-        last = next((p.get("last_price") for p in state.get("_last", []) if p.get("symbol") == op["symbol"]), None)
-        log_trade_outcome(log, op, last or op["entry_price"], now)
-
-    # 4. snapshot for next cycle's diff
-    log["_state"]["last_positions"] = positions
+    # 3. snapshot the authoritative broker positions for next cycle's diff.
+    log["_state"]["last_positions"] = broker_positions
     save_trade_log(log)
 
 
@@ -794,6 +894,34 @@ def _format_stop_loss_block(alerts):
     return "\n".join(lines) + "\n\n"
 
 
+def _format_ema_sell_block(raw_sigs, log):
+    """SELL-ribbon alerts for HELD positions, injected right after stop-loss
+    alerts. Keyed off SELL *state*, not the EXIT transition — the cross may
+    have happened on a bar the bot never evaluated, in which case transition
+    reads NO_ACTION even though the ribbon is in a confirmed downtrend."""
+    held = {p["symbol"]: p for p in log.get("open_positions", [])}
+    rows = []
+    for sym, s in raw_sigs.items():
+        if sym in held and s.get("ok") and s.get("state") == "SELL":
+            ln = s.get("lines", {})
+            rows.append(
+                f"  {sym}: red(55)={ln.get('red')} is ON TOP of "
+                f"blue(8)={ln.get('blue')} green(13)={ln.get('green')} "
+                f"yellow(21)={ln.get('yellow')} | last={s.get('last_close')} "
+                f"entry={held[sym].get('entry_price')}"
+            )
+    if not rows:
+        return ""
+    return (
+        "⚠ SELL SIGNAL ACTIVE ON HELD POSITIONS — core ribbon rule: red(55) on "
+        "top = downtrend = SELL:\n" + "\n".join(rows) + "\n"
+        "For EACH symbol above: sell ALL shares at market via the Robinhood MCP "
+        "THIS cycle. In actions_taken set type='sell' and reason='ema_exit'. "
+        "A transition of NO_ACTION does NOT cancel this — the cross already "
+        "happened on an earlier bar. Only stop-loss alerts take precedence.\n\n"
+    )
+
+
 def run_agent():
     log = load_trade_log()
     strategy_text = load_file("strategy/strategy.json")
@@ -813,6 +941,16 @@ def run_agent():
     if stop_loss_alerts:
         for a in stop_loss_alerts:
             print(f"  [STOP-LOSS] {a['symbol']} down {a['loss_pct']}% — flagging for immediate sell")
+
+    # Hard forced-exit set (from pre-turn signals): stop-loss alerts + held names
+    # sitting in ribbon SELL state. stop_loss takes precedence over ema_exit.
+    # Computed up here so the error path below can warn about pending exits even
+    # when the model call itself fails (e.g. Claude session limit).
+    held_syms = {p["symbol"] for p in log.get("open_positions", [])}
+    must_sell = {a["symbol"]: "stop_loss" for a in stop_loss_alerts}
+    for sym, s in raw_sigs.items():
+        if sym in held_syms and s.get("ok") and s.get("state") == "SELL":
+            must_sell.setdefault(sym, "ema_exit")
 
     # SMART SKIP: if every signal is NEUTRAL/HOLD and no stop-loss → no model call needed.
     # Research and midweek phases always run (they do web research, not just signal checks).
@@ -865,21 +1003,25 @@ EXECUTION RULES:
 - Trade ONLY in Robinhood account {ACCOUNT_NUMBER} (the Agentic cash account).
   Never use the default margin account.
 - T+1 settlement: read SETTLED cash before any buy; never deploy unsettled funds.
-- EMA signal: red(55) lowest = BUY, red highest = SELL; act on the transition.
+- Ribbon signal (TEMA 13/21/55 + EMA 8 — matches the operator's chart):
+  red(55) lowest = BUY, red(55) highest = SELL. ENTER_LONG transition triggers
+  buys; for a HELD position the SELL state itself triggers the sell — never
+  wait for an EXIT transition, the cross may have passed on an earlier bar.
 - Honor blackout windows + min_confidence_to_trade. Real scoreboard = beat SPY;
   100% monthly is the stretch ceiling, not a reason to oversize risk."""
 
     user = (
         f"Task: {task}\nTime (ET): {datetime.now(ET):%Y-%m-%d %H:%M} ({datetime.now(ET):%A})\n\n"
         + _format_stop_loss_block(stop_loss_alerts)
+        + _format_ema_sell_block(raw_sigs, log)
         + "COMPUTED EMA SIGNALS (authoritative — computed from real closes at the "
         "configured bar interval; use these as the BUY/SELL gate, do NOT eyeball. "
         "'INSUFFICIENT_DATA' = unknown, do not trade that name):\n"
         f"{sig_block}\n\n"
         "1. Read settled cash + positions from the Robinhood MCP (account "
         f"{ACCOUNT_NUMBER}).\n"
-        "2. If any STOP-LOSS ALERTS appear above, sell those positions FIRST before "
-        "any other action.\n"
+        "2. If any STOP-LOSS or SELL SIGNAL alerts appear above, execute those "
+        "sells FIRST before any other action.\n"
         "3. Run the active skill. If a valid EMA signal + confidence + settled "
         "cash align, execute the buy/sell via the MCP.\n"
         "4. When you SELL (close a position), report it in actions_taken so the "
@@ -920,6 +1062,24 @@ EXECUTION RULES:
     with open(os.path.join(ROOT, "research", f"agent_run_{stamp}.md"), "w") as f:
         f.write(f"# Agent run {stamp} — task={task}\n\n{text}\n")
 
+    # If the primary model call FAILED (rc≠0 → error string, no footer), claude -p
+    # is unavailable this cycle — the broker read and force_sell would fail too, so
+    # don't attempt them (no phantom closes), but surface WHY loudly. The session
+    # limit (HTTP 429) is the common case and silently no-ops every cycle until it
+    # resets — exactly when a pending forced exit can't be placed.
+    if text.startswith("(claude -p error") or text.startswith("(error:"):
+        session_limited = ("session limit" in text.lower()
+                           or "429" in text or "usage limit" in text.lower())
+        why = "Claude SESSION/USAGE LIMIT hit" if session_limited else "model call FAILED"
+        print(f"[{stamp}] WARNING: {why} — this cycle did NOTHING. {text[:180]}")
+        if must_sell:
+            print(f"[{stamp}] WARNING: forced exit PENDING for {sorted(must_sell)} "
+                  "but Claude is unavailable — positions NOT sold. MANUAL SELL may "
+                  "be required until the limit resets / connection recovers.")
+        save_trade_log(log)  # preserve the pre-call stamps
+        print(f"[{stamp}] task={task} done (model unavailable).")
+        return
+
     # persist midweek/research output to the file the phase routing checks for
     # (the headless model cannot write files itself)
     saved = persist_phase_output(task, text)
@@ -944,24 +1104,52 @@ EXECUTION RULES:
                   f"research/{expected} — execution will use the stale picks "
                   f"file. Raw output preserved at research/{fallback}.")
 
-    # Phase 2: parse the structured footer and drive the tracker
-    state = extract_last_json_block(text)
-    if state and isinstance(state, dict):
-        state["_last"] = log["_state"].get("last_positions", [])
-        process_cycle_state(log, state)
-    else:
-        print(f"[{stamp}] no structured state footer parsed — skipping trade tracking this cycle.")
-        save_trade_log(log)  # still persist the last_model_call_ts stamp
+    # ---- AUTHORITATIVE broker reconciliation ----------------------------------
+    # NEVER trust the execution turn's self-reported footer for closes. The model
+    # has been observed to narrate sells (footer actions_taken + a positions list
+    # excluding the name) without ever calling place_equity_order. We re-read the
+    # broker independently and treat THAT as ground truth, and we deterministically
+    # re-fire any hard forced exit the model failed to place.
+    footer = extract_last_json_block(text)
+    footer_actions = footer.get("actions_taken", []) if isinstance(footer, dict) else []
 
-    # Warn if stop-loss positions were not sold this cycle (model may have failed to act)
-    if stop_loss_alerts:
-        log = load_trade_log()  # reload after process_cycle_state updates
-        still_open = {p["symbol"] for p in log.get("open_positions", [])}
-        missed = [a for a in stop_loss_alerts if a["symbol"] in still_open]
-        if missed:
-            syms = [a["symbol"] for a in missed]
-            print(f"[{stamp}] WARNING: stop-loss NOT executed for {syms} — "
-                  "will retry next cycle.")
+    # must_sell was computed pre-turn (stop-loss + held names in ribbon SELL state).
+    broker_positions, sell_orders_today = read_broker_state()
+    exit_info = {}
+    if broker_positions is None:
+        print(f"[{stamp}] WARNING: could not read authoritative broker state — "
+              "skipping close detection this cycle (no phantom closes). Any "
+              "alerts re-fire next cycle.")
+    else:
+        # Deterministic forced exits: a hard must-sell still held at the broker,
+        # with no working sell order this cycle, gets its own dedicated sell call.
+        if must_sell and is_market_open():
+            held_at_broker = {p["symbol"]: p for p in broker_positions}
+            for sym, reason in must_sell.items():
+                if sym not in held_at_broker:
+                    continue  # already gone (the main turn actually sold it)
+                if sym in sell_orders_today:
+                    continue  # a sell order already exists — don't double-sell
+                shares = held_at_broker[sym].get("shares")
+                print(f"  [FORCED-SELL] {sym} still held after model turn "
+                      f"(reason={reason}) — placing dedicated market sell.")
+                placed, fill = force_sell(sym, shares, reason)
+                exit_info[sym] = {"reason": reason, "price": fill}
+                print(f"  [FORCED-SELL] {sym} placed={placed} fill={fill}")
+            # re-read so close detection sees the post-forced-sell truth
+            reread, _ = read_broker_state()
+            if reread is not None:
+                broker_positions = reread
+
+        process_cycle_state(log, footer_actions, broker_positions, exit_info)
+
+    # Warn if any hard forced exit is STILL held at the broker after everything.
+    if must_sell and broker_positions is not None:
+        still = {p["symbol"] for p in broker_positions} & set(must_sell)
+        if still:
+            print(f"[{stamp}] WARNING: forced exit NOT completed for "
+                  f"{sorted(still)} — still held at broker. Will retry next "
+                  "cycle; MANUAL SELL may be required.")
 
     print(f"[{stamp}] task={task} done.")
 
