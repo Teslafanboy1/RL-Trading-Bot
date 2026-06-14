@@ -31,3 +31,33 @@ be conservative.
 - Do not change the goal away from 100% monthly, but do not chase it by sizing up
   risk beyond the allocation bands either.
 - Never loosen the T+1 / settled-funds rule.
+
+## Output format for agent.py
+
+agent.py runs you headless via `claude -p` and parses your output text directly.
+You cannot write files yourself — agent.py does it from your output.
+
+### strategy.json output
+Always end your response with the COMPLETE updated strategy.json as a fenced
+```json block. Include all fields from the current version — never a partial update.
+Increment the version field. agent.py replaces the current file with this block.
+
+### Skill file output
+When a skill file needs updating, output the COMPLETE new file content using
+EXACTLY this format (case-sensitive, exact whitespace):
+
+## SKILL FILE UPDATE: skill_name_here
+[complete file content — not a diff, the entire file]
+## END SKILL FILE UPDATE
+
+Replace skill_name_here with the filename without .md extension, e.g.:
+skill_1_research, skill_2_execution, skill_4_postmortem, etc.
+
+Rules:
+- Only output a SKILL FILE UPDATE block if the evidence justifies it (3+ similar
+  outcomes for behavioral changes; immediate for factual corrections)
+- Always output the COMPLETE file — agent.py replaces the whole file
+- You can output multiple SKILL FILE UPDATE blocks in one response
+- Never output a SKILL FILE UPDATE block for skill_5_strategy_rewriter itself —
+  that would create a self-modification loop
+- The json block for strategy.json must come AFTER any skill update blocks

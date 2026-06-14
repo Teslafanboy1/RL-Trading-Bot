@@ -745,6 +745,188 @@ def run_post_trade_pipeline(log, trade):
     flag_strategy_rewrite(trade)
 
 
+# ================================================================ PHASE 3
+# Close the learning loop: actually PROCESS the strategy_rewrite_queue (skill_5),
+# and version skill-file edits so a bad rewrite can be rolled back.
+def version_skill_file(skill_name, new_content):
+    """Archive the current skill file into skills/history/ before overwriting it
+    with new_content. Mirrors snapshot_strategy() for skill files so a bad skill_5
+    rewrite is always reversible.
+
+    Naming: skills/history/{skill_name}_v{NNN}.md (zero-padded 3 digits); the
+    version number is (count of existing history files for this skill) + 1.
+    Returns True on success, False on any error (never raises — a versioning
+    failure must not crash the rewrite loop)."""
+    try:
+        skill_path = os.path.join(ROOT, "skills", f"{skill_name}.md")
+        history_dir = os.path.join(ROOT, "skills", "history")
+        os.makedirs(history_dir, exist_ok=True)
+
+        # Count existing versions to determine next version number
+        existing = [f for f in os.listdir(history_dir)
+                    if f.startswith(f"{skill_name}_v") and f.endswith(".md")]
+        version = len(existing) + 1
+
+        # Archive current version
+        if os.path.exists(skill_path):
+            dst = os.path.join(history_dir, f"{skill_name}_v{version:03d}.md")
+            shutil.copy(skill_path, dst)
+
+        # Write new version
+        with open(skill_path, "w") as f:
+            f.write(new_content)
+
+        print(f"  [version] {skill_name} -> v{version:03d} (history saved)")
+        return True
+    except Exception as e:
+        print(f"  [version] ERROR versioning {skill_name}: {e}")
+        return False
+
+
+def rollback_skill(skill_name, version):
+    """Restore a skill file from skills/history/. Manual operator tool — never
+    called automatically. Usage: rollback_skill("skill_1_research", 2) restores
+    skills/history/skill_1_research_v002.md. Returns True on success, False if the
+    version isn't found. Never raises."""
+    try:
+        history_dir = os.path.join(ROOT, "skills", "history")
+        src = os.path.join(history_dir, f"{skill_name}_v{version:03d}.md")
+        dst = os.path.join(ROOT, "skills", f"{skill_name}.md")
+
+        if not os.path.exists(src):
+            print(f"  [rollback] version not found: {src}")
+            return False
+
+        shutil.copy(src, dst)
+        print(f"  [rollback] {skill_name} restored to v{version:03d}")
+        return True
+    except Exception as e:
+        print(f"  [rollback] ERROR: {e}")
+        return False
+
+
+def process_strategy_rewrite_queue():
+    """Read research/strategy_rewrite_queue.md and process the first entry not yet
+    marked [DONE]: run skill_5 (headless, no file-write tool), parse its output, and
+    apply the strategy.json + skill-file updates from Python. Marks the entry [DONE].
+
+    Called at the end of every run_agent() cycle, after process_cycle_state().
+    Processes AT MOST ONE entry per cycle so one bad rewrite can't block the loop.
+    Skips gracefully if the file is missing; never raises (the caller also wraps
+    this in try/except — a rewrite failure must never crash the trading loop)."""
+    queue_path = os.path.join(ROOT, "research", "strategy_rewrite_queue.md")
+    if not os.path.exists(queue_path):
+        return
+
+    with open(queue_path) as f:
+        lines = f.readlines()
+
+    # Find first unprocessed entry
+    target_idx = None
+    target_line = None
+    for i, line in enumerate(lines):
+        if line.startswith("- ") and "[DONE]" not in line:
+            target_idx = i
+            target_line = line.strip()
+            break
+
+    if target_idx is None:
+        return  # all processed
+
+    print(f"  [skill_5] processing rewrite queue entry: {target_line[:80]}")
+
+    try:
+        # Build full context for skill_5
+        skill5 = load_file("skills/skill_5_strategy_rewriter.md")
+        strategy = load_file("strategy/strategy.json")
+        postmortems = load_postmortems()
+        trade_log = json.dumps(load_trade_log(), indent=2)
+
+        # Load all current skill file contents for skill_5 to rewrite
+        skill_contents = {}
+        for sk in ["skill_0_orchestrator", "skill_1_research", "skill_2_execution",
+                   "skill_3_midweek", "skill_4_postmortem", "skill_4b_victory",
+                   "skill_5_strategy_rewriter", "skill_6_pattern_detector"]:
+            skill_contents[sk] = load_file(f"skills/{sk}.md")
+
+        user = f"""A trade closed and requires strategy review. Queue entry: {target_line}
+
+Current strategy.json:
+{strategy}
+
+All postmortems and victory analyses:
+{postmortems}
+
+Full trade log:
+{trade_log}
+
+Current skill file contents:
+{json.dumps(skill_contents, indent=2)}
+
+Your job:
+1. Read the postmortem/victory referenced in the queue entry.
+2. Check if 3+ similar outcomes justify any core rule changes.
+3. Apply minor changes (source weights, target tweaks) immediately.
+4. Flag major changes with reasoning and trade IDs — do not auto-apply.
+5. If any skill file needs updating, output the COMPLETE updated file
+   using this EXACT format (agent.py parses this):
+
+## SKILL FILE UPDATE: skill_name_without_extension
+[complete file content here]
+## END SKILL FILE UPDATE
+
+6. Output the COMPLETE updated strategy.json as a fenced json block.
+7. Be conservative — one or two trades is noise, not signal.
+"""
+
+        text, _usage = run_model(skill5, user, web=False)
+
+        if text.startswith("(claude -p error") or text.startswith("(error:"):
+            print(f"  [skill_5] model call failed: {text[:100]}")
+            return
+
+        # Parse and apply strategy.json updates
+        new_strategy = extract_last_json_block(text)
+        if new_strategy and isinstance(new_strategy, dict) and "version" in new_strategy:
+            current = load_strategy()
+            old_v = current.get("version", 1)
+            # snapshot before overwriting
+            src = os.path.join(ROOT, "strategy", "strategy.json")
+            dst = os.path.join(ROOT, "strategy", "history", f"strategy_v{old_v}.json")
+            if os.path.exists(src):
+                shutil.copy(src, dst)
+            save_json("strategy/strategy.json", new_strategy)
+            print(f"  [skill_5] strategy.json updated v{old_v} -> v{new_strategy.get('version', old_v+1)}")
+
+        # Parse and apply skill file updates
+        skill_updates = re.findall(
+            r"## SKILL FILE UPDATE: (\S+)\n(.*?)\n## END SKILL FILE UPDATE",
+            text, re.DOTALL
+        )
+        for skill_name, new_content in skill_updates:
+            skill_path = os.path.join(ROOT, "skills", f"{skill_name}.md")
+            if os.path.exists(skill_path):
+                version_skill_file(skill_name, new_content.strip())
+                print(f"  [skill_5] skill updated: {skill_name}")
+            else:
+                print(f"  [skill_5] WARNING: unknown skill name in update block: {skill_name}")
+
+        # Save raw output for audit trail
+        stamp = datetime.now(ET).strftime("%Y-%m-%d_%H%M")
+        with open(os.path.join(ROOT, "research", f"skill5_run_{stamp}.md"), "w") as f:
+            f.write(f"# skill_5 run {stamp}\nQueue entry: {target_line}\n\n{text}\n")
+
+        # Mark entry as DONE
+        lines[target_idx] = lines[target_idx].rstrip() + f" [DONE {now_iso()}]\n"
+        with open(queue_path, "w") as f:
+            f.writelines(lines)
+
+        print(f"  [skill_5] queue entry marked [DONE]")
+
+    except Exception as e:
+        print(f"  [skill_5] ERROR processing rewrite queue: {e} — skipping this entry")
+
+
 # ================================================================ MAIN RUN
 FOOTER_INSTRUCTION = (
     "\n\nAFTER you finish, END YOUR RESPONSE WITH ONE fenced ```json block "
@@ -1199,6 +1381,15 @@ EXECUTION RULES:
                 f"turn and the dedicated force-sell. The bot will retry next cycle, "
                 f"but a MANUAL SELL may be required now.")
 
+    # Phase 3: process any pending strategy rewrites (skill_5). Runs AFTER all
+    # broker reconciliation so a rewrite never interferes with close detection or
+    # forced exits, and is fully isolated — a rewrite failure must not crash the
+    # trading loop.
+    try:
+        process_strategy_rewrite_queue()
+    except Exception as e:
+        print(f"  [skill_5] rewrite queue processing failed: {e}")
+
     print(f"[{stamp}] task={task} done.")
 
 
@@ -1217,6 +1408,19 @@ def main():
           f"check_model={CHECK_MODEL} research_model={MODEL} "
           f"account={ACCOUNT_NUMBER} mode={EXECUTION_MODE} "
           f"interval={os.environ.get('SIGNAL_INTERVAL', '1h')}. Ctrl-C to stop.")
+
+    # Phase 3: create skills/history/ and baseline v001 snapshots if not done yet,
+    # so the very first skill_5 rewrite has a known-good baseline to roll back to.
+    history_dir = os.path.join(ROOT, "skills", "history")
+    os.makedirs(history_dir, exist_ok=True)
+    for sk in ["skill_0_orchestrator", "skill_1_research", "skill_2_execution",
+               "skill_3_midweek", "skill_4_postmortem", "skill_4b_victory",
+               "skill_5_strategy_rewriter", "skill_6_pattern_detector"]:
+        v001_path = os.path.join(history_dir, f"{sk}_v001.md")
+        skill_path = os.path.join(ROOT, "skills", f"{sk}.md")
+        if not os.path.exists(v001_path) and os.path.exists(skill_path):
+            shutil.copy(skill_path, v001_path)
+            print(f"  [baseline] {sk}_v001.md created")
 
     if not is_market_open():
         now = datetime.now(ET)
