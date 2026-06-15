@@ -136,10 +136,12 @@ skills/
   skill_4b_victory.md           win analyst
   skill_5_strategy_rewriter.md  rewrites strategy.json + skills after every trade
   skill_6_pattern_detector.md   quarterly systemic review
+  history/                      versioned skill-file snapshots — rollback anytime
 strategy/
   strategy.json                 config + learned state (versioned)
   history/                      snapshot on every change — rollback anytime
-research/                       weekend_picks / midweek_review / agent run logs
+research/                       weekend_picks / midweek_review / agent runs / skill5_run logs
+                                + strategy_rewrite_queue.md (rewrite work queue)
 postmortems/                    postmortem_NNN.md / victory_NNN.md
 agent.py                        core loop, scheduling, skip logic, MCP wiring
 signals.py                      ribbon computation, TEMA 13/21/55 + EMA 8 (Yahoo or local CSV)
@@ -148,8 +150,16 @@ trade_log.json                  open positions, closed trades, learning links
 
 ## The learning loop
 
-After every close: loss → skill_4, win → skill_4b. Then skill_5 updates `strategy.json`
-and any skill that needs improving. Source weights update after every trade; confidence
-scores are calibrated against real outcomes. A core rule changes only after 3+ similar
-outcomes. Every change is versioned in `strategy/history/` — rollback = swap a snapshot.
-Quarterly, skill_6 reads all postmortems at once for the biggest strategic pivots.
+After every close: loss → skill_4, win → skill_4b. Each close also appends an entry to
+`research/strategy_rewrite_queue.md`. At the end of each cycle, `process_strategy_rewrite_queue()`
+pulls one un-done entry and runs **skill_5**, which updates `strategy.json` and any skill that
+needs improving. The model runs headless with no file-write tool, so `agent.py` parses skill_5's
+output text and applies the edits itself (the last fenced ```json block becomes the new
+`strategy.json`; `## SKILL FILE UPDATE` blocks rewrite skill files). One entry per cycle, and the
+whole step is isolated in try/except so a bad rewrite can never crash the trading loop.
+
+Source weights update after every trade; confidence scores are calibrated against real outcomes.
+A core rule changes only after 3+ similar outcomes. Every change is versioned for rollback —
+strategy snapshots in `strategy/history/`, skill-file snapshots in `skills/history/` (`version_skill_file()`
+snapshots a skill before each edit, a baseline `v001` of every skill is written on first run, and
+`rollback_skill()` restores any version). Rollback = swap a snapshot back. Quarterly, skill_6 reads all postmortems at once for the biggest strategic pivots.

@@ -44,6 +44,7 @@ SIGNAL_INTERVAL=1d python3 signals.py SPY    # daily-chart mode
 6. **Deterministic forced exits (`force_sell`).** The hard must-sell set — stop-loss alerts + held names in ribbon SELL state — is computed in Python from pre-turn signals. After the main turn + broker read, any must-sell name **still held at the broker** (and without a sell order already placed this cycle) gets its own tight single-instruction `claude -p` sell call on Opus (`force_sell`), which places the market order and self-confirms via `get_equity_orders`. This removes the dependency on the chatty execution turn for the single most critical action. `sell_orders_today` from the broker read prevents double-selling a name the main turn already has a working order for; forced sells are gated to `is_market_open()`.
 7. `adopt_untracked_positions()` runs inside `process_cycle_state()` against the **broker snapshot**: any account-held position not already in `open_positions` (manually entered, or entered before the agent started) is adopted at the broker's average cost. This covers all held positions in the stop-loss monitor and learning loop, not only agent-opened ones.
 8. After reconciliation, if any hard forced exit is **still held at the broker** (both the main turn and `force_sell` failed to fill), a `WARNING` is printed, `notify_operator()` fires an **out-of-band alert** (see `ALERT_WEBHOOK_URL`), and the alert re-fires next cycle — manual sell may be required. The same out-of-band alert fires from the model-failure early-return path when `claude -p` is unavailable (session/usage limit) while a forced exit is pending. `notify_operator()` is a direct stdlib HTTP POST — it deliberately does **not** route through `claude -p` (that's exactly what's down in the session-limit case) and never raises (an alerting failure can't break the trading loop).
+9. **Strategy-rewrite processing (Phase 3, `process_strategy_rewrite_queue`).** At the very end of the cycle — after `process_cycle_state()` and all broker reconciliation — the first un-`[DONE]` entry in `research/strategy_rewrite_queue.md` is handed to skill_5, and its output text is parsed and applied by Python (see [Strategy rewrite processing](#strategy-rewrite-processing-process_strategy_rewrite_queue)). At most one entry per cycle, fully wrapped in try/except so a rewrite failure can never crash the trading loop.
 
 #### Startup behaviour when market is closed
 
@@ -98,7 +99,7 @@ Eight role-based markdown prompts loaded as the `system` context for each agent 
 - `skill_3_midweek.md` — Wednesday position review, writes `research/midweek_review_*.md`
 - `skill_4_postmortem.md` — fires on LOSS; writes `postmortems/postmortem_NNN.md`
 - `skill_4b_victory.md` — fires on WIN; writes `postmortems/victory_NNN.md`
-- `skill_5_strategy_rewriter.md` — updates `strategy/strategy.json` and skill files after every trade
+- `skill_5_strategy_rewriter.md` — updates `strategy/strategy.json` and skill files after every trade; invoked by `process_strategy_rewrite_queue()` (Phase 3), which applies its edits from the model's output text
 - `skill_6_pattern_detector.md` — quarterly systemic review across all postmortems
 
 Phase routing in `agent.py:active_skill()`:
@@ -162,9 +163,23 @@ Triggered by `run_post_trade_pipeline()` after every position close:
 1. `trigger_postmortem()` or `trigger_victory_analysis()` — runs the model with web search, writes structured markdown + machine-readable `verdicts` JSON to `postmortems/`. Stop-loss exits always route to `trigger_postmortem()` and include additional focus questions (what caused the drawdown, whether an EMA SELL was missed before the stop hit).
 2. `update_source_weights()` — credits/debits sources based on `verdicts.sources` accuracy flags.
 3. `update_monthly_progress()` — recomputes current return vs. 100% monthly goal.
-4. `flag_strategy_rewrite()` — appends a line to `research/strategy_rewrite_queue.md` for skill_5.
+4. `flag_strategy_rewrite()` — appends a line to `research/strategy_rewrite_queue.md`; the next cycle, `process_strategy_rewrite_queue()` consumes it (see [Strategy rewrite processing](#strategy-rewrite-processing-process_strategy_rewrite_queue)).
 
 Stop-loss forced exits are tagged `stop_loss: true` in the trade record so the pattern detector (skill_6) can identify systemic drawdown patterns over time.
+
+### Strategy rewrite processing (`process_strategy_rewrite_queue()`)
+
+Phase 2 only **queues** rewrites; Phase 3's `process_strategy_rewrite_queue()` is what consumes them. It runs at the **end of every `run_agent()` cycle**, after `process_cycle_state()` and all broker reconciliation, wrapped in try/except so a rewrite failure can never crash the trading loop. Each cycle it processes **at most one** un-`[DONE]` entry from `research/strategy_rewrite_queue.md`:
+
+1. Loads skill_5 + the current `strategy.json` + all postmortems/victories + the full trade log + the current text of all 8 skill files, and runs skill_5 headless on `MODEL` (Opus, no web).
+2. The headless model has **no file-write tool**, so `agent.py` parses skill_5's output text and applies it itself: the **last fenced ```json block** replaces `strategy/strategy.json` (snapshotting the prior version into `strategy/history/strategy_v{N}.json` first, same convention as `snapshot_strategy()`), and every `## SKILL FILE UPDATE: <name> … ## END SKILL FILE UPDATE` block rewrites that skill file through `version_skill_file()`.
+3. Writes the raw skill_5 output to `research/skill5_run_*.md` for audit, then marks the queue entry `[DONE <timestamp>]`.
+
+The one-entry-per-cycle limit ensures a single bad rewrite can't stall the loop, and an unknown skill name in an update block is logged and skipped rather than crashing. `skill_5_strategy_rewriter.md` documents the exact output contract (strategy.json as a trailing fenced json block with a bumped `version`; complete-file — not diff — skill blocks; the json block after any skill blocks; never rewrite skill_5 itself).
+
+### Skill-file versioning (`version_skill_file()` / `rollback_skill()`)
+
+Skill-file edits get the same rollback safety that `snapshot_strategy()` gives `strategy.json`. Before any skill rewrite, `version_skill_file()` copies the current file to `skills/history/{skill_name}_v{NNN}.md` (zero-padded; next number = count of existing snapshots for that skill + 1). On startup `main()` writes a **baseline `v001`** snapshot of all 8 skills (if not already present) so the very first rewrite is reversible. `rollback_skill(skill_name, version)` restores a snapshot — it is a manual operator tool, **never called automatically**. Both functions return a bool and never raise (a versioning failure must not break the loop).
 
 ## Key constraints (enforced at every level)
 
