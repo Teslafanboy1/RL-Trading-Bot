@@ -13,6 +13,34 @@ week during market hours.
   `reason="stop_loss"` so the learning loop records it as a forced exit.
 - After the forced sell, note that cash will be unsettled for T+1.
 
+## Pre-buy gate (HARD BLOCK — check before any BUY logic below)
+Every buy MUST clear ALL of these or it is skipped and logged. These enforce the
+existing confidence-band floor as a real pre-trade gate (a confidence-55 CAT buy
+with empty thesis on 2026-06-09 — T0002 — lost on a 2-hour round-trip precisely
+because none of this was enforced):
+- **Confidence ≥ 60.** Below 60 is below the trade floor (strategy.json
+  `min_confidence_to_trade`). Never buy a sub-60 name, regardless of EMA signal.
+- **Non-empty thesis.** If you cannot state a one-sentence thesis, do not trade —
+  a bare EMA trigger with no documented reasoning is not a setup.
+- **At least one named source** in `sources_used`. No documented source → no trade.
+- **Not over-extended (post-catalyst / chase filter — LR002).** Do NOT open a new
+  position in a name that is already extended, UNLESS a FRESH red(55) ENTER_LONG
+  crossover is printing right now with clear ribbon separation. "Extended" means
+  any of:
+    - up >10% on the entry day (buying the catalyst-day print), OR
+    - up >25% over the trailing ~10 sessions, OR
+    - within 5 sessions of an earnings/catalyst spike-and-fade.
+  A stale HOLD read or a bare "price above all 4 EMAs" read does NOT qualify as a
+  fresh crossover — wait for a pullback to the ribbon or an actual new cross. This
+  pattern round-tripped T0002 (CAT, post-spike chop), T0004 (CLOV, bought the
+  +14% catalyst-day close at +98% YTD) and T0006 (AI, post-earnings spike-and-fade)
+  to breakeven/loss. NOTE: the **widest EMA spread in the universe is an
+  over-extension warning, not strength** — let it CAP confidence, never treat it
+  as a buy confirmation (CLOV's 14.8% spread was the most over-extended name, not
+  the strongest).
+- Record `confidence_score`, `thesis`, and `sources_used` on the trade. A trade
+  logged with an empty thesis or empty sources is a defect, not a trade.
+
 ## Before every BUY
 - Your candidate list comes from **LATEST WEEKEND RESEARCH** in the system prompt.
   Only buy symbols that appear there with a qualifying confidence score; do not

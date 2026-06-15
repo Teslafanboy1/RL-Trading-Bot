@@ -1,7 +1,7 @@
 {
-  "version": 3,
+  "version": 10,
   "goal": "100% monthly portfolio return",
-  "last_updated": "2026-06-12",
+  "last_updated": "2026-06-15",
   "account": {
     "type": "true_cash",
     "settlement": "T+1",
@@ -31,16 +31,16 @@
       "macro": "Fed calendar earnings calendar"
     },
     "source_weights": {
-      "news": 0.3,
-      "social": 0.2,
-      "fundamental": 0.35,
-      "macro": 0.15
+      "news": 0.377,
+      "social": 0.1685,
+      "fundamental": 0.3281,
+      "macro": 0.1264
     },
     "source_performance": {
       "news": {
-        "wins": 1,
+        "wins": 2,
         "losses": 1,
-        "accuracy": 0.5
+        "accuracy": 0.6667
       },
       "social": {
         "wins": 0,
@@ -48,9 +48,9 @@
         "accuracy": 0
       },
       "fundamental": {
-        "wins": 0,
-        "losses": 1,
-        "accuracy": 0.0
+        "wins": 2,
+        "losses": 2,
+        "accuracy": 0.5
       },
       "macro": {
         "wins": 0,
@@ -80,10 +80,10 @@
   "progress_tracking": {
     "monthly_goal": "100%",
     "month_start_value": 100.17,
-    "current_value": 101.106,
-    "current_return": "0.9%",
+    "current_value": 103.7973,
+    "current_return": "3.6%",
     "on_track": false,
-    "required_weekly_return": 40.77,
+    "required_weekly_return": 93.01,
     "_note": "Updated 2026-06-10 after BTSG exit (+3.98%). HOOD and CLOV open. ~$35 cash to deploy June 11 (BTSG settles T+1)."
   },
   "risk_management": {
@@ -91,7 +91,69 @@
     "action": "sell_immediately",
     "note": "Hard stop: if any open position falls 10% below entry price, sell all shares at market immediately \u2014 overrides EMA signal and blackout windows."
   },
-  "learned_rules": [],
+  "learned_rules": [
+    {
+      "id": "LR001",
+      "rule": "Enforce the confidence-band floor as a hard pre-trade gate: never open a position with confidence_score < 60, empty thesis, or empty sources_used.",
+      "type": "enforcement_of_existing_rule",
+      "trade_ids": [
+        "T0002"
+      ],
+      "rationale": "T0002 (CAT) was opened at confidence 55 with empty thesis and sources \u2014 a direct violation of the existing 'below 60 \u2192 skip' band floor. The floor existed in strategy but was not enforced at execution time. Applied to skill_2_execution as a hard pre-buy gate. This is enforcement of an existing rule, not a new core rule, so the 3+ outcome bar does not apply.",
+      "date": "2026-06-15"
+    },
+    {
+      "id": "LR002",
+      "rule": "Post-extension / post-catalyst entry filter: do not open a new position in an already-extended name (up >10% on the entry day, OR up >25% over the trailing ~10 sessions, OR within 5 sessions of an earnings/catalyst spike-and-fade) UNLESS a fresh red(55) ENTER_LONG crossover prints with clear ribbon separation. A stale HOLD or bare 'price above all 4 EMAs' read does not qualify. The widest EMA spread in the universe is an over-extension warning that caps confidence, never a buy confirmation. Wait for a pullback to the ribbon or a fresh cross.",
+      "type": "entry_filter_applied",
+      "trade_ids": [
+        "T0002",
+        "T0004",
+        "T0006"
+      ],
+      "rationale": "Three independent breakeven/loss round-trips all share the same root cause \u2014 chasing an already-extended move. T0002 (CAT) bought post-spike chop (+4.33% Jun 2 / -3.68% Jun 5). T0004 (CLOV) bought the closing print of a +14% catalyst day at +98% YTD, with the 'widest EMA spread in universe (14.8%)' misread as strength when it was max over-extension. T0006 (AI) bought a post-earnings spike-and-fade within 5 sessions of the Jun 3 print on a stale 'above all EMAs' read. This meets the 3+ similar-outcome bar, so P001's one-confirmation-bar intent is generalized and applied to skill_2_execution's pre-buy gate (an execution entry filter, not a change to the core red(55) buy/sell definition). source_weights unchanged \u2014 the failures were entry-location, not source, errors.",
+      "date": "2026-06-15"
+    }
+  ],
+  "proposals_pending_confirmation": [
+    {
+      "id": "P001",
+      "proposal": "For names that moved >3% in any of the prior 3 sessions, require the EMA buy signal to persist for one confirmation bar before entry (anti-whipsaw filter).",
+      "type": "core_ema_filter",
+      "trade_ids": [
+        "T0002",
+        "T0004",
+        "T0006"
+      ],
+      "status": "RESOLVED_GENERALIZED_INTO_LR002",
+      "rationale": "Originally proposed on T0002 alone. With T0004 and T0006 adding two more chased-extension round-trips, the 3+ bar is met. Rather than apply the narrow one-confirmation-bar mechanic verbatim, the intent is generalized into LR002 (post-extension/post-catalyst entry filter) as an execution-layer gate. Marked resolved.",
+      "date": "2026-06-15"
+    },
+    {
+      "id": "P002",
+      "proposal": "Exit-price integrity: sanity-check every recorded exit_price against the broker's last/quote at exit time, and capture exit_price from the actual broker sell-fill average price for EMA/forced exits \u2014 never default it to entry_price. If a close's exit_price equals entry_price exactly (or deviates >2% from the broker quote), do not book it; flag for reconciliation.",
+      "type": "code_fix_agent_py",
+      "trade_ids": [
+        "T0003",
+        "T0004",
+        "T0006"
+      ],
+      "status": "FLAGGED_FOR_OPERATOR_REVIEW_REQUIRES_CODE_CHANGE",
+      "rationale": "T0003 (HOOD), T0004 (CLOV) and T0006 (AI) all booked exit_price == entry_price to the penny while the broker market was materially higher (HOOD ~$93 vs the $89.01 exit). This is a HIGH-priority data-integrity defect in agent.py's exit path (exit price appears to default to entry price rather than read the broker fill), which silently caps all upside on winning theses. It cannot be fixed from a skill file or strategy.json \u2014 it requires a code change to the EMA/forced-exit booking logic. Flagged, not applied. Until fixed, do NOT treat these three flat closes as confidence-calibration evidence (see confidence_accuracy notes).",
+      "date": "2026-06-15"
+    },
+    {
+      "id": "P003",
+      "proposal": "Require \u22652 independent sources in agreement before any new entry clears 60 confidence; single-source theses cap at 59 (skip). Additionally hard-cap below 60 any candidate whose most recent reported quarter shows YoY revenue decline >25%.",
+      "type": "core_confidence_rule",
+      "trade_ids": [
+        "T0006"
+      ],
+      "status": "PROPOSED_NOT_APPLIED",
+      "rationale": "T0006 (AI) was a single-source (fundamental-only) 62-confidence entry on a name with ~52% YoY revenue decline and -21% YTD. Plausible, but only one clean case so far (HUM/T0007 is the other single-source name but closed at breakeven, not a clear loss). Core confidence-gating change \u2014 needs 3+ similar single-source / declining-revenue losses before applying. Re-evaluate when another single-source loss prints.",
+      "date": "2026-06-15"
+    }
+  ],
   "confidence_accuracy": [
     {
       "trade_id": "T0001",
@@ -100,6 +162,38 @@
       "outcome": "WIN",
       "pnl_pct": 3.98,
       "note": "adopted_position \u2014 exclude from calibration. Win was market drift, not thesis. Exit driven by news (KKR secondary). Not representative of 68-band accuracy."
+    },
+    {
+      "trade_id": "T0002",
+      "symbol": "CAT",
+      "confidence_at_entry": 55,
+      "outcome": "LOSS",
+      "pnl_pct": -0.62,
+      "note": "Sub-floor entry (55 < 60) with empty thesis/sources \u2014 should never have been opened. Exclude from band calibration; it is a process defect, not a calibration data point. Drove LR001 and (with T0004/T0006) LR002."
+    },
+    {
+      "trade_id": "T0003",
+      "symbol": "HOOD",
+      "confidence_at_entry": 83,
+      "outcome": "LOSS",
+      "pnl_pct": 0.0,
+      "note": "EXCLUDE from calibration \u2014 not a thesis miss. Thesis was correct (stock rose ~5-8% to ~$93). Booked flat because exit_price == entry_price == 89.01 while the broker market was ~$93: an exit-price-integrity artifact (P002), not a mis-scored confidence. Treating this as 'confidence too high' would teach the wrong lesson."
+    },
+    {
+      "trade_id": "T0004",
+      "symbol": "CLOV",
+      "confidence_at_entry": 80,
+      "outcome": "LOSS",
+      "pnl_pct": 0.0,
+      "note": "Mixed: (a) exit booked flat ($4.89==$4.89) is partly the P002 exit-price defect, but (b) confidence was genuinely inflated \u2014 should have been ~58. Bought the close of a +14% catalyst day at +98% YTD; the 'widest spread in universe (14.8%)' was misread as strength when it was over-extension. Drove LR002. Use only the entry-timing lesson for calibration, not the flat exit price."
+    },
+    {
+      "trade_id": "T0006",
+      "symbol": "AI",
+      "confidence_at_entry": 62,
+      "outcome": "LOSS",
+      "pnl_pct": 0.0,
+      "note": "Confidence genuinely inflated \u2014 should have been ~40 (below floor). Single-source (fundamental-only), ~52% YoY revenue decline, -21% YTD, chased a post-earnings spike-and-fade on a stale 'above all EMAs' read. Drove LR002 and P003. Flat exit price also touched by the P002 defect."
     }
   ],
   "version_history": [
@@ -115,6 +209,65 @@
       "change": "Indicator corrected to match the operator's chart: 13/21/55 lines are TEMA, 8 stays plain EMA. Plain-EMA ribbon held CLOV through a 2-day fade the chart flagged SELL on Jun 11 11:30 ET at ~$4.875 (breakeven). SELL state on a held position now triggers exit directly (not just the EXIT edge).",
       "trade_ids": [
         "T0004"
+      ]
+    },
+    {
+      "version": 4,
+      "date": "2026-06-15",
+      "change": "T0002 (CAT) postmortem: added LR001 \u2014 hard pre-buy gate enforcing the existing confidence-60 floor + non-empty thesis/sources, applied to skill_2_execution. No source-weight changes (all source verdicts were 'na'). Logged P001 (one-confirmation-bar filter for recently-moved names) as a proposal only \u2014 core EMA change needs 3+ outcomes. Added T0002 to confidence_accuracy as an excluded process defect.",
+      "trade_ids": [
+        "T0002"
+      ]
+    },
+    {
+      "version": 5,
+      "date": "2026-06-15",
+      "change": "source-weight rebalance after trade T0006",
+      "trade_ids": [
+        "T0006"
+      ]
+    },
+    {
+      "version": 6,
+      "date": "2026-06-15",
+      "change": "Cross-trade review (CAT/HOOD/CLOV/AI postmortems + BTSG victory). Promoted P001 to LR002 \u2014 a post-extension/post-catalyst entry filter \u2014 now that T0002/T0004/T0006 give 3 similar chased-extension round-trips; applied to skill_2_execution's pre-buy gate (execution entry filter, NOT a change to the core red(55) buy/sell rule). Added P002: HIGH-priority exit-price-integrity defect (T0003/T0004/T0006 all booked exit_price==entry_price while the broker market was higher) \u2014 flagged for operator, requires an agent.py code fix, NOT applied here. Added P003: single-source/declining-revenue confidence cap, proposed only (1 clean case). Added HOOD/CLOV/AI to confidence_accuracy with notes distinguishing the exit-price artifact from genuine confidence inflation. source_weights/source_performance left unchanged (this cycle's verdicts already credited in v5; failures were entry-location, not source, errors).",
+      "trade_ids": [
+        "T0002",
+        "T0003",
+        "T0004",
+        "T0006"
+      ]
+    },
+    {
+      "version": 7,
+      "date": "2026-06-15",
+      "change": "source-weight rebalance after trade T0007",
+      "trade_ids": [
+        "T0007"
+      ]
+    },
+    {
+      "version": 8,
+      "date": "2026-06-15",
+      "change": "No-op audit bump. skill_5 re-triggered on the T0002 (CAT) queue entry (already carried two [DONE] stamps \u2014 a re-process, not new evidence). Re-reviewed postmortem_001.md against current state: every lesson it justifies is already applied (LR001 conf-floor/thesis/sources gate; LR002 post-extension filter; T0002 logged in confidence_accuracy as an excluded process defect). All source verdicts for T0002 were 'na' \u2014 no source_performance/source_weights movement. No core-rule changes (conservatism bar already satisfied in v4/v6). No skill-file edits. Strategy content unchanged from v7.",
+      "trade_ids": [
+        "T0002"
+      ]
+    },
+    {
+      "version": 9,
+      "date": "2026-06-15",
+      "change": "source-weight rebalance after trade T0005",
+      "trade_ids": [
+        "T0005"
+      ]
+    },
+    {
+      "version": 10,
+      "date": "2026-06-15",
+      "change": "No-op audit bump. skill_5 re-triggered a FOURTH time on the same T0002 (CAT) queue entry (already carried three [DONE] stamps \u2014 a re-process, not new evidence). Re-reviewed postmortem_001.md against current state: all lessons it justifies remain applied (LR001 conf-floor/thesis/sources gate; LR002 post-extension filter; T0002 excluded process defect in confidence_accuracy). No new trades reference CAT, so no change to the evidence base. All T0002 source verdicts were 'na' \u2014 no source_performance/source_weights movement. No core-rule changes, no skill-file edits. Strategy content unchanged from v9.",
+      "trade_ids": [
+        "T0002"
       ]
     }
   ]
