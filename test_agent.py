@@ -156,28 +156,15 @@ class TestEMAComputation(unittest.TestCase):
         for length in (8, 13, 21, 55):
             self.assertEqual(len(sig_module.ema(closes, length)), 100)
 
-    def test_tema_constant_series_equals_constant(self):
-        closes = [100.0] * 200
-        self.assertAlmostEqual(sig_module.tema(closes, 55)[-1], 100.0, places=6)
-
-    def test_tema_kills_lag_on_linear_ramp(self):
-        """TEMA's defining property: near-zero lag on a steady trend. On a
-        200-bar ramp ending at 299, TEMA(55) sits on the price while a plain
-        EMA(55) lags tens of points behind — the exact difference that made
-        the plain-EMA ribbon disagree with the TradingView chart."""
-        ramp = [100.0 + i for i in range(200)]
-        self.assertAlmostEqual(sig_module.tema(ramp, 55)[-1], ramp[-1], delta=1.0)
-        self.assertLess(sig_module.ema(ramp, 55)[-1], ramp[-1] - 20.0)
-
     def test_upward_impulse_red_lowest(self):
-        """After a recent breakout, red TEMA(55) is still rising from the base
-        and must be the lowest line (BUY zone)."""
+        """After a recent breakout, the slow red EMA(55) is still rising from
+        the base and must be the lowest line (BUY zone)."""
         lines = sig_module.compute_lines(_uptrend(120))
         self.assertLess(lines["red"], min(lines["blue"], lines["green"], lines["yellow"]))
 
     def test_downward_impulse_red_highest(self):
-        """After a recent breakdown, red TEMA(55) is still up at the base and
-        must be the highest line (SELL zone)."""
+        """After a recent breakdown, the slow red EMA(55) is still up at the
+        base and must be the highest line (SELL zone)."""
         lines = sig_module.compute_lines(_downtrend(120))
         self.assertGreater(lines["red"], max(lines["blue"], lines["green"], lines["yellow"]))
 
@@ -233,23 +220,26 @@ class TestSignalClassification(unittest.TestCase):
         lines = sig_module.compute_lines(_flat(120))
         self.assertEqual(sig_module.classify_signal(lines), "NEUTRAL")
 
-    def test_runup_then_fade_sells_on_tema_not_on_plain_ema(self):
-        """Regression for the 2026-06-12 CLOV bug: after a sharp rally and a
-        shallow 2-day fade, the TEMA ribbon (the chart the strategy is read
-        from) flips red-on-top = SELL, while a plain-EMA ribbon still reads
-        red-on-bottom = BUY because the plain EMA(55) never caught up to the
-        rally. The bot computed plain EMA and held through the entire fade."""
+    def test_runup_then_shallow_fade_stays_buy_plain_ema(self):
+        """Guards against reintroducing TEMA. The ribbon is FOUR PLAIN EMAs —
+        the chart's "TEMA"-shorttitled "Three Moving Averages [AdventTrading]"
+        script is `ema()` x3 (verified from its Pine source), not triple-EMA.
+        After a sharp rally and a shallow fade, the slow EMA(55) is still
+        climbing from the base and stays the LOWEST line, so the signal
+        correctly remains BUY — matching the chart, which holds the position.
+        A 2026-06-12 change swapped lag-reducing TEMA in here; it OVERSHOT,
+        lifting red on top of the ribbon, flipped this to a false SELL, and
+        force-liquidated the whole book on 2026-06-15."""
         base = [3.95] * 200
         rally = [3.95 + 1.10 * (i / 25.0) for i in range(1, 26)]
         fade = [5.05 - 0.47 * (i / 20.0) for i in range(1, 21)]
         shape = base + rally + fade
 
-        tema_lines = sig_module.compute_lines(shape)
-        self.assertEqual(sig_module.classify_signal(tema_lines), "SELL")
-
-        plain_ema_lines = {name: sig_module.ema(shape, length)[-1]
-                           for name, length in sig_module.LENGTHS.items()}
-        self.assertEqual(sig_module.classify_signal(plain_ema_lines), "BUY")
+        lines = sig_module.compute_lines(shape)
+        self.assertEqual(sig_module.classify_signal(lines), "BUY")
+        # red(55) must stay the lowest line (clean fan) — never lifted on top.
+        self.assertLess(lines["red"],
+                        min(lines["blue"], lines["green"], lines["yellow"]))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

@@ -1,7 +1,7 @@
 {
-  "version": 3,
+  "version": 6,
   "goal": "100% monthly portfolio return",
-  "last_updated": "2026-06-12",
+  "last_updated": "2026-06-16",
   "account": {
     "type": "true_cash",
     "settlement": "T+1",
@@ -10,17 +10,17 @@
     "cash_reserve": 0.1
   },
   "ema_strategy": {
-    "_lengths_note": "Lengths are always 8/13/21/55 in BARS at the active chart interval (SIGNAL_INTERVAL): 55 bars = 55 half-hours on a 30m chart, 55 days on a 1d chart. Lengths never change; only the bar interval does. Smoothing: the three slow lines (13/21/55) are TEMA (triple EMA) and the 8 is a plain EMA \u2014 matching the TradingView chart the strategy is read from ('TEMA 13 21 55' + 'EMA 8'). A plain-EMA 55 line lags far behind the chart and reads BUY long after the chart reads SELL.",
+    "_lengths_note": "Lengths are always 8/13/21/55 in BARS at the active chart interval (SIGNAL_INTERVAL): 55 bars = 55 half-hours on a 30m chart, 55 days on a 1d chart. Lengths never change; only the bar interval does. Smoothing: ALL FOUR lines are PLAIN EMA \u2014 matching the operator's chart, whose 'Three Moving Averages [AdventTrading]' indicator has shorttitle 'TEMA' but computes ema() x3 (verified from its Pine source 2026-06-15), plus a separate built-in EMA(8). DO NOT use TEMA (triple EMA) here: it overshoots in rallies, lifts the slow lines on top, and inverted BUY into SELL \u2014 force-liquidating the book on 2026-06-15.",
     "lengths_in_bars": {
       "red": 55,
       "green": 13,
       "yellow": 21,
       "blue": 8
     },
-    "buy_signal": "red TEMA(55) crosses below ALL of EMA(8)/TEMA(13)/TEMA(21) \u2014 becomes lowest line",
-    "sell_signal": "red TEMA(55) crosses above ALL of EMA(8)/TEMA(13)/TEMA(21) \u2014 becomes highest line. For a HELD position, SELL state itself (red on top) triggers the sell even if the cross happened on an earlier bar (no fresh EXIT transition required).",
-    "hold_rule": "when red TEMA(55) is above all 3 \u2014 do nothing, stock is downtrending",
-    "wait_rule": "when red TEMA(55) is below all 3 \u2014 hold position"
+    "buy_signal": "red EMA(55) crosses below ALL of EMA(8)/EMA(13)/EMA(21) \u2014 becomes lowest line",
+    "sell_signal": "red EMA(55) crosses above ALL of EMA(8)/EMA(13)/EMA(21) \u2014 becomes highest line. For a HELD position, SELL state itself (red on top) triggers the sell even if the cross happened on an earlier bar (no fresh EXIT transition required).",
+    "hold_rule": "when red EMA(55) is above all 3 \u2014 do nothing, stock is downtrending",
+    "wait_rule": "when red EMA(55) is below all 3 \u2014 hold position"
   },
   "research": {
     "sources": {
@@ -31,9 +31,9 @@
       "macro": "Fed calendar earnings calendar"
     },
     "source_weights": {
-      "news": 0.3,
+      "news": 0.35,
       "social": 0.2,
-      "fundamental": 0.35,
+      "fundamental": 0.3,
       "macro": 0.15
     },
     "source_performance": {
@@ -80,10 +80,10 @@
   "progress_tracking": {
     "monthly_goal": "100%",
     "month_start_value": 100.17,
-    "current_value": 101.106,
-    "current_return": "0.9%",
+    "current_value": 103.3268,
+    "current_return": "3.2%",
     "on_track": false,
-    "required_weekly_return": 40.77,
+    "required_weekly_return": 93.89,
     "_note": "Updated 2026-06-10 after BTSG exit (+3.98%). HOOD and CLOV open. ~$35 cash to deploy June 11 (BTSG settles T+1)."
   },
   "risk_management": {
@@ -91,7 +91,31 @@
     "action": "sell_immediately",
     "note": "Hard stop: if any open position falls 10% below entry price, sell all shares at market immediately \u2014 overrides EMA signal and blackout windows."
   },
-  "learned_rules": [],
+  "learned_rules": [
+    {
+      "id": "LR001",
+      "added": "2026-06-16",
+      "rule": "Enforce the confidence floor and reasoning-documentation at execution time, not just in research. A BUY is rejected unless confidence >= 60 (min_confidence_to_trade) AND both thesis and sources_used are non-empty.",
+      "rationale": "T0002 (CAT) was entered at confidence 55 with empty thesis and empty sources_used \u2014 a sub-60, no-reasoning entry that the band table already prohibited but nothing enforced at the point of trade. Round-tripped to a -0.62% breakeven-ish loss in ~2 hours.",
+      "type": "enforcement_of_existing_rule_not_new_core_rule",
+      "applied_in": "skill_2_execution pre-trade entry gate",
+      "trade_ids": [
+        "T0002"
+      ]
+    }
+  ],
+  "observations_pending_confirmation": [
+    {
+      "id": "OBS001",
+      "observed": "2026-06-16",
+      "pattern": "Low-beta 'diversifier/stability' positions admitted near the 60-65 band floor (e.g. T0007 HUM at 62) are prone to breakeven mechanical whipsaw exits on a 1h ribbon SELL state while the underlying thesis is intact or improving.",
+      "candidate_rule": "For low-beta sub-65-confidence stability positions, consider not force-exiting on a raw 1h ribbon SELL unless re-scored confidence also falls below 60.",
+      "status": "NOT APPLIED \u2014 single LOW-priority occurrence (T0007). Weakening the held-position SELL-state exit is a core exit-rule change requiring 3+ similar outcomes. Tracking only.",
+      "trade_ids": [
+        "T0007"
+      ]
+    }
+  ],
   "confidence_accuracy": [
     {
       "trade_id": "T0001",
@@ -100,6 +124,14 @@
       "outcome": "WIN",
       "pnl_pct": 3.98,
       "note": "adopted_position \u2014 exclude from calibration. Win was market drift, not thesis. Exit driven by news (KKR secondary). Not representative of 68-band accuracy."
+    },
+    {
+      "trade_id": "T0002",
+      "symbol": "CAT",
+      "confidence_at_entry": 55,
+      "outcome": "LOSS",
+      "pnl_pct": -0.62,
+      "note": "Sub-60 entry with empty thesis/sources \u2014 should never have been opened. Excluded from band calibration (below the trade floor); retained as the justification for the LR001 execution gate."
     }
   ],
   "version_history": [
@@ -112,9 +144,38 @@
     {
       "version": 3,
       "date": "2026-06-12",
-      "change": "Indicator corrected to match the operator's chart: 13/21/55 lines are TEMA, 8 stays plain EMA. Plain-EMA ribbon held CLOV through a 2-day fade the chart flagged SELL on Jun 11 11:30 ET at ~$4.875 (breakeven). SELL state on a held position now triggers exit directly (not just the EXIT edge).",
+      "change": "Indicator corrected to match the operator's chart: 13/21/55 lines are TEMA, 8 stays plain EMA. Plain-EMA ribbon held CLOV through a 2-day fade the chart flagged SELL on Jun 11 11:30 ET at ~$4.875 (breakeven). SELL state on a held position now triggers exit directly (not just the EXIT edge). [REVERTED in v4 \u2014 the 'chart is TEMA' premise was a misread; see v4.]",
       "trade_ids": [
         "T0004"
+      ]
+    },
+    {
+      "version": 4,
+      "date": "2026-06-15",
+      "change": "REVERTED the v3 TEMA change. The operator's 'Three Moving Averages [AdventTrading]' indicator has shorttitle 'TEMA' but its Pine source computes ema() x3 \u2014 PLAIN EMA, not triple-EMA. The v3 TEMA form overshot in a rally, lifted the slow lines on top of the fast ones, inverted BUY into SELL, and force-liquidated the entire book (HOOD/CLOV/AI/HUM/AMAT) at the open. signals.py reverted to four plain EMAs (8/13/21/55); tema() deleted. Verified live: all five names read BUY/HOLD, matching the chart.",
+      "trade_ids": [
+        "T0003",
+        "T0004",
+        "T0006",
+        "T0007",
+        "T0005"
+      ]
+    },
+    {
+      "version": 5,
+      "date": "2026-06-16",
+      "change": "skill_5 review of T0002 (CAT LOSS) postmortem_001. Added LR001: an explicit pre-trade entry gate in skill_2_execution enforcing the EXISTING min_confidence_to_trade=60 floor plus non-empty thesis/sources_used at execution time \u2014 CAT was opened at confidence 55 with no thesis, which the band table already prohibited but nothing enforced. This enforces an existing rule, it does not add a new core rule. Recorded HUM (T0007) low-beta breakeven-whipsaw as observations_pending_confirmation (NOT applied \u2014 single LOW-priority case; weakening the held-position SELL-state exit needs 3+ similar outcomes). No source-weight changes (min_trades_before_weight_shift not met; pipeline already credits source_performance from verdict blocks). Added T0002 to confidence_accuracy.",
+      "trade_ids": [
+        "T0002",
+        "T0007"
+      ]
+    },
+    {
+      "version": 6,
+      "date": "2026-06-16",
+      "change": "source-weight rebalance after trade T0010",
+      "trade_ids": [
+        "T0010"
       ]
     }
   ]

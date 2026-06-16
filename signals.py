@@ -5,12 +5,22 @@ Computes the 4-line ribbon from REAL closes and classifies the BUY / SELL /
 NEUTRAL state, so the agent acts on a COMPUTED signal instead of eyeballing it.
 Pure standard library — no pip dependencies, no database.
 
-Lines — MUST match the TradingView chart the strategy is read from, which is
-"TEMA 13 21 55" + "EMA 8" (NOT a plain-EMA ribbon):
-  blue = EMA(8)   green = TEMA(13)   yellow = TEMA(21)   red = TEMA(55)
-TEMA tracks price with far less lag than a plain EMA, so the red(55) line rolls
-over and crosses on top of the ribbon days earlier in a run-up-then-fade. A
-plain EMA(55) here reads BUY long after the chart reads SELL.
+Lines — MUST match the TradingView chart the strategy is read from. That chart
+carries two indicators, and BOTH are PLAIN EMAs (verified from their Pine source):
+  - "Three Moving Averages [AdventTrading]" — shorttitle "TEMA" but the code is
+    `out = ema(src, len)` x3 (NOT triple-EMA); user lengths 13/21/55, source close.
+  - "Moving Average Exponential" — EMA(8), source close (its SMA-5 smoothing
+    sub-line is display.none, so the visible blue line is the raw EMA(8)).
+So the ribbon is FOUR plain EMAs:
+  blue = EMA(8)   green = EMA(13)   yellow = EMA(21)   red = EMA(55)
+red(55) is the SLOWEST line and lags BELOW the others in an uptrend (clean fan);
+when it is the lowest line the uptrend is confirmed = BUY.
+
+DO NOT use TEMA here. A prior change (2026-06-12) mis-read the "TEMA" shorttitle
+and switched green/yellow/red to triple-EMA; that lag-reducing form OVERSHOOTS in
+a rally, lifting the slow lines on top of the fast ones, which inverted a clear
+BUY into a SELL and force-liquidated the whole book on 2026-06-15. The chart was
+plain EMA all along.
 
 Signal (matches strategy.json):
   BUY  = red is the LOWEST line  (uptrend confirmed)
@@ -61,8 +71,8 @@ def _ssl_context():
 
 LENGTHS = {"blue": 8, "green": 13, "yellow": 21, "red": 55}
 MIN_BARS = 60        # below this, refuse to emit a signal
-WARMUP_OK = 165      # at/above this the 55-line is well-seeded (TEMA's triple
-                     # EMA cascade carries seed bias ~3x longer than a plain EMA)
+WARMUP_OK = 165      # at/above this the 55-line is well-seeded (~3x the longest
+                     # length is enough for a plain EMA to forget its seed)
 
 # Bar interval the EMA is computed on — MUST match the chart you read signals off.
 #   1-month chart -> "1h" (default)   1-week chart -> "30m" or "15m"   daily -> "1d"
@@ -71,6 +81,13 @@ _RANGE_BY_INTERVAL = {"1d": "1y", "1h": "3mo", "30m": "1mo",
                       "15m": "1mo", "5m": "5d", "1m": "5d"}
 INTERVAL = os.environ.get("SIGNAL_INTERVAL", "1h")
 RANGE = os.environ.get("SIGNAL_RANGE") or _RANGE_BY_INTERVAL.get(INTERVAL, "3mo")
+
+# Include pre/post-market bars to match the operator's chart, whose "ETH"
+# (extended trading hours) toggle is ON. With regular-hours-only data the EMA(55)
+# read ~2.8pt below the chart on 2026-06-15 (93.5 vs 95.66); with extended hours
+# all four lines match the chart within ~0.2pt. Set SIGNAL_EXTENDED_HOURS=0 to
+# revert to regular hours only (e.g. if the chart's ETH toggle is turned off).
+INCLUDE_PREPOST = os.environ.get("SIGNAL_EXTENDED_HOURS", "1") != "0"
 
 
 # ----------------------------------------------------------------- indicators
@@ -85,17 +102,10 @@ def ema(values, length):
     return out
 
 
-def tema(values, length):
-    """Triple EMA: 3*e1 - 3*e2 + e3 where e2=EMA(e1), e3=EMA(e2). Same length
-    as input. Matches TradingView's TEMA indicator (much lower lag than EMA)."""
-    e1 = ema(values, length)
-    e2 = ema(e1, length)
-    e3 = ema(e2, length)
-    return [3 * a - 3 * b + c for a, b, c in zip(e1, e2, e3)]
-
-
-# blue(8) is a plain EMA; the three slow lines are TEMA — same as the chart.
-SMOOTHER = {"blue": ema, "green": tema, "yellow": tema, "red": tema}
+# All four lines are PLAIN EMAs — same as the chart's two indicators (see module
+# docstring). The slow red(55) line therefore lags below the fast lines in an
+# uptrend, giving the clean fan the BUY/SELL classification depends on.
+SMOOTHER = {"blue": ema, "green": ema, "yellow": ema, "red": ema}
 
 
 def compute_lines(closes):
@@ -145,9 +155,12 @@ def _read_local_csv(symbol):
 
 
 def _fetch_yahoo(symbol, interval, rng, timeout=20):
-    """Closes at any interval from Yahoo's free chart API (stdlib JSON, no key)."""
+    """Closes at any interval from Yahoo's free chart API (stdlib JSON, no key).
+    includePrePost matches the chart's ETH (extended-hours) setting — see
+    INCLUDE_PREPOST."""
     url = (f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-           f"?range={rng}&interval={interval}")
+           f"?range={rng}&interval={interval}"
+           f"&includePrePost={'true' if INCLUDE_PREPOST else 'false'}")
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 trading-agent/1.0"})
     data = None
     try:

@@ -825,7 +825,7 @@ def process_strategy_rewrite_queue():
     target_idx = None
     target_line = None
     for i, line in enumerate(lines):
-        if line.startswith("- ") and "[DONE]" not in line:
+        if line.startswith("- ") and "[DONE" not in line:
             target_idx = i
             target_line = line.strip()
             break

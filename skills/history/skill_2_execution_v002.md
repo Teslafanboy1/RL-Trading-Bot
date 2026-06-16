@@ -13,29 +13,10 @@ week during market hours.
   `reason="stop_loss"` so the learning loop records it as a forced exit.
 - After the forced sell, note that cash will be unsettled for T+1.
 
-## Pre-trade entry gate (HARD — reject before any other buy logic)
-Before evaluating any candidate for a BUY, every one of these must be true or the
-buy is rejected and the reason logged. This gate enforces the allocation-band
-floor and reasoning-documentation rules that already exist in strategy.json — it
-exists because trade T0002 (CAT, 2026-06-09) was entered at confidence 55 with an
-empty thesis and no sources_used, a sub-60 / no-reasoning entry that should never
-have been opened:
-- **Confidence ≥ 60.** A candidate scored below the `min_confidence_to_trade`
-  floor (60) is NEVER bought, regardless of EMA signal strength. Below 60 →
-  watchlist only.
-- **Documented thesis.** The `thesis` field must be non-empty — a specific,
-  source-backed reason for the trade. A bare EMA trigger with no recorded thesis
-  is not a trade.
-- **Documented sources.** `sources_used` must list at least one source that drove
-  the thesis. No documented source → no trade.
-If any of these fail, skip the candidate and log which gate it failed.
-
 ## Before every BUY
 - Your candidate list comes from **LATEST WEEKEND RESEARCH** in the system prompt.
   Only buy symbols that appear there with a qualifying confidence score; do not
   invent new candidates during market hours.
-- Confirm the candidate passes the **Pre-trade entry gate** above (confidence ≥ 60,
-  non-empty thesis, non-empty sources_used).
 - Check the Robinhood MCP for the SETTLED cash balance. Never buy with unsettled
   funds (T+1).
 - Confirm the EMA signal is still valid: the 55 (red) has crossed below ALL of

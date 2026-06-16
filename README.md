@@ -12,11 +12,12 @@ stocks with real money, plus web search for news / Reddit / RSS.
 
 ## The ribbon strategy (core buy/sell signal)
 
-Four lines matching the TradingView chart the strategy is read from — **TEMA 13/21/55 + EMA 8**:
-blue = EMA(8), green = TEMA(13), yellow = TEMA(21), red = TEMA(55). Lengths are measured in
+Four **plain EMA** lines matching the TradingView chart the strategy is read from:
+blue = EMA(8), green = EMA(13), yellow = EMA(21), red = EMA(55). Lengths are measured in
 **bars** at the active chart interval (`SIGNAL_INTERVAL`): on a 30m chart, 55 bars = 55
-half-hours. TEMA (triple EMA) tracks price with far less lag than a plain EMA — a plain-EMA
-55 line reads BUY long after the chart reads SELL.
+half-hours. (The chart's "Three Moving Averages [AdventTrading]" indicator is labeled
+"TEMA" but its Pine source computes plain `ema()` — do **not** use triple-EMA here; it
+overshoots in rallies and inverts the signal, which liquidated the book on 2026-06-15.)
 
 - **BUY**  — the 55 (red) crosses below ALL of 8/13/21 and becomes the LOWEST line.
 - **SELL** — the 55 (red) crosses above ALL of 8/13/21 and becomes the HIGHEST line.
@@ -28,7 +29,7 @@ half-hours. TEMA (triple EMA) tracks price with far less lag than a plain EMA �
 
 Three independent sell triggers — any one fires a sell:
 
-1. **Ribbon EXIT** — the 55 (red TEMA) sits above all of 8/13/21: SELL state on a held
+1. **Ribbon EXIT** — the 55 (red EMA) sits above all of 8/13/21: SELL state on a held
    position sells immediately, whether the cross happened this bar or an earlier one.
 2. **Stop-loss** — position falls ≥10% below entry price. Hard rule, overrides everything.
 3. **Thesis break / confidence decay** — intraday news check finds a thesis-breaking event
@@ -144,7 +145,7 @@ research/                       weekend_picks / midweek_review / agent runs / sk
                                 + strategy_rewrite_queue.md (rewrite work queue)
 postmortems/                    postmortem_NNN.md / victory_NNN.md
 agent.py                        core loop, scheduling, skip logic, MCP wiring
-signals.py                      ribbon computation, TEMA 13/21/55 + EMA 8 (Yahoo or local CSV)
+signals.py                      ribbon computation, plain EMA 8/13/21/55 (Yahoo or local CSV)
 trade_log.json                  open positions, closed trades, learning links
 ```
 
