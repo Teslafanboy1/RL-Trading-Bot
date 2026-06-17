@@ -1,5 +1,5 @@
 {
-  "version": 6,
+  "version": 8,
   "goal": "100% monthly portfolio return",
   "last_updated": "2026-06-16",
   "account": {
@@ -114,6 +114,16 @@
       "trade_ids": [
         "T0007"
       ]
+    },
+    {
+      "id": "OBS002",
+      "observed": "2026-06-16",
+      "pattern": "Leveraged (>=2x daily-reset) ETFs entered intraday on a multi-day-old momentum/macro signal are exposed to severe whipsaw: a ~4% adverse move in the underlying becomes a double-digit loss on a 3x fund. T0010 (SOXL, 3x semis) was opened at the open near the morning high on a 5-day-stale 'momentum bullish Jun 11' thesis and lost -11.84% in ~2h on a mean-reverting tape.",
+      "candidate_rule": "For >=2x leveraged ETFs: (a) apply a leverage-adjusted stop (~5-6% on a 3x \u2248 10% single-name risk), (b) require same-day signal confirmation \u2014 no entry on a signal older than ~2 trading days, and (c) apply a fixed confidence penalty (~-10 pts) vs cash equities.",
+      "status": "NOT APPLIED \u2014 single occurrence (T0010). These are core risk-rule changes (stop threshold, signal-staleness gate, scoring penalty) requiring 3+ similar outcomes. Tracking only.",
+      "trade_ids": [
+        "T0010"
+      ]
     }
   ],
   "confidence_accuracy": [
@@ -132,6 +142,14 @@
       "outcome": "LOSS",
       "pnl_pct": -0.62,
       "note": "Sub-60 entry with empty thesis/sources \u2014 should never have been opened. Excluded from band calibration (below the trade floor); retained as the justification for the LR001 execution gate."
+    },
+    {
+      "trade_id": "T0010",
+      "symbol": "SOXL",
+      "confidence_at_entry": 78,
+      "outcome": "LOSS",
+      "pnl_pct": -11.84,
+      "note": "3x leveraged ETF chased intraday on a 5-day-stale momentum signal; caught the intraday reversal. Predicted 78, should have been ~58 per postmortem_003 \u2014 the 75-89 band over-scored a leveraged daily-reset product. Single occurrence; feeds OBS002, not a band recalibration yet."
     }
   ],
   "version_history": [
@@ -176,6 +194,23 @@
       "change": "source-weight rebalance after trade T0010",
       "trade_ids": [
         "T0010"
+      ]
+    },
+    {
+      "version": 7,
+      "date": "2026-06-16",
+      "change": "Re-fire of the T0002 queue entry. CONFIRMED no further changes for T0002 \u2014 its lesson is already fully applied as LR001 (v5); did not re-add it or rewrite any skill file (avoiding re-process churn). While reviewing all analyses, logged OBS002: leveraged (>=2x daily-reset) ETFs chased intraday on a multi-day-stale signal (T0010 SOXL, -11.84%) need a leverage-adjusted stop, a signal-staleness gate, and a confidence penalty \u2014 NOT APPLIED (single occurrence; these are core risk-rule changes requiring 3+ similar outcomes). Added T0010 to confidence_accuracy (predicted 78, should have been ~58). No source-weight changes.",
+      "trade_ids": [
+        "T0002",
+        "T0010"
+      ]
+    },
+    {
+      "version": 8,
+      "date": "2026-06-16",
+      "change": "Re-fire of the already-processed T0002 queue entry (8th [DONE] mark). NO-OP review: re-read all postmortems and victories; confirmed no new evidence meets the 3+ similar-outcome bar for any core change. T0002 lesson remains fully applied as LR001 (v5) \u2014 not re-added. OBS001 (HUM low-beta whipsaw) and OBS002 (SOXL leveraged-ETF whipsaw) remain single-occurrence and stay NOT APPLIED. No source-weight change (min_trades_before_weight_shift=5 not met; source_performance already credited via the verdicts pipeline). No skill-file rewrites \u2014 editing on a re-fire would only churn. Version bump and this audit note only.",
+      "trade_ids": [
+        "T0002"
       ]
     }
   ]
