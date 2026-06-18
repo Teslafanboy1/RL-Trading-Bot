@@ -32,6 +32,20 @@ be conservative.
   risk beyond the allocation bands either.
 - Never loosen the T+1 / settled-funds rule.
 
+## Severity tag (always emit one)
+Start your response with a single line tagging the change set:
+
+`SEVERITY: ROUTINE` — only weight nudges, target/sizing tweaks, or enforcement of a
+rule that already exists in strategy.json. Auto-applied today.
+
+`SEVERITY: MAJOR` — anything touching the core EMA/ribbon definition, allocation
+bands, min_confidence_to_trade, a new hard rule, or any skill_2 (execution) change.
+These always require operator sign-off — propose with trade IDs, never silently
+apply, regardless of how many similar outcomes support them.
+
+This tag is forward-looking: a later phase will gate auto-apply on it. Tag honestly
+even on a NO-OP review (use `SEVERITY: ROUTINE` and say "no change").
+
 ## Output format for agent.py
 
 agent.py runs you headless via `claude -p` and parses your output text directly.

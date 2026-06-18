@@ -171,6 +171,64 @@ def save_strategy(strategy):
     save_json("strategy/strategy.json", strategy)
 
 
+def record_change_event(kind, target, version, *, trade_ids=None, severity=None,
+                        summary=""):
+    """Append ONE structured line to logs/change_events.jsonl — the timestamped
+    audit trail of every strategy.json / skill-file version bump.
+
+    This is the INPUT Phase 4's fast-path regression detector reads: it correlates
+    trade losses against version bumps in a 48h window, and needs *whether a
+    strategy.json OR skill-file bump happened, and when*. Before this, strategy
+    bumps lived only as prose in version_history and skill bumps had no structured
+    record at all (just file snapshots) — the detector would have had nothing
+    machine-readable to query, and would launch with zero history. Recording it now
+    means the month of history exists before Phase 4 is built. Phase 5's detection-
+    latency metric also anchors on these timestamps.
+
+    NOTE: this only CAPTURES the events. The detector that consumes them, the
+    flagged-regression "major-changes log" it writes, and wiring this history into
+    the postmortem prompt are all Phase 4 build work — deliberately not done here.
+
+    Append-only, ONE file (not one-per-event), never raises (a logging failure must
+    not break the trading or learning loop).
+
+    kind     — "strategy" | "skill"
+    target   — "strategy.json" or the skill name (e.g. "skill_2_execution")
+    version  — the NEW version number after the bump
+    severity — "ROUTINE" | "MAJOR" | None (from skill_5's SEVERITY tag when known)
+    """
+    try:
+        d = os.path.join(ROOT, "logs")
+        os.makedirs(d, exist_ok=True)
+        evt = {"timestamp": now_iso(), "kind": kind, "target": target,
+               "version": version, "trade_ids": trade_ids or [],
+               "severity": severity, "summary": (summary or "")[:300]}
+        with open(os.path.join(d, "change_events.jsonl"), "a") as f:
+            f.write(json.dumps(evt) + "\n")
+    except Exception as e:
+        print(f"  [change-log] failed to record {kind} change event: {e}")
+
+
+def append_audit_log(name, title, body):
+    """Append a human-readable audit entry to a single monthly rolling log
+    (logs/{name}_YYYY-MM.md) instead of writing one .md file per event.
+
+    The bot never reads these back (verified: only weekend_picks / midweek_review /
+    the rewrite queue are re-read) — they are a pure human audit trail, and the
+    old one-file-per-cycle scheme produced 135+ agent_run_*.md files that just
+    piled up in research/. One file per month keeps the full audit while keeping
+    the folder clean. Never raises."""
+    try:
+        d = os.path.join(ROOT, "logs")
+        os.makedirs(d, exist_ok=True)
+        month = datetime.now(ET).strftime("%Y-%m")
+        path = os.path.join(d, f"{name}_{month}.md")
+        with open(path, "a") as f:
+            f.write(f"\n\n{'='*78}\n## {title}\n{'='*78}\n\n{body}\n")
+    except Exception as e:
+        print(f"  [audit-log] failed to append {name} entry: {e}")
+
+
 def snapshot_strategy(strategy, reason, trade_ids):
     """Version-bump + copy the prior strategy.json into strategy/history/."""
     old_v = strategy.get("version", 1)
@@ -182,7 +240,45 @@ def snapshot_strategy(strategy, reason, trade_ids):
     strategy["last_updated"] = date.today().isoformat()
     strategy.setdefault("version_history", []).append(
         {"version": strategy["version"], "date": date.today().isoformat(),
+         # Full ISO timestamp (not just the date) so Phase 4's fast-path regression
+         # detector can resolve the "3+ losses within 48h of a version bump" window.
+         "timestamp": now_iso(),
          "change": reason, "trade_ids": trade_ids})
+    # Structured event for Phase 4's detector. snapshot_strategy() is only used for
+    # auto-applied minor changes (e.g. source-weight rebalance), so severity=ROUTINE.
+    record_change_event("strategy", "strategy.json", strategy["version"],
+                        trade_ids=trade_ids, severity="ROUTINE", summary=reason)
+
+
+def strategy_for_prompt():
+    """strategy.json as a string for READ-ONLY prompt consumers (the execution,
+    research, and midweek cycles) with the heavy, audit-only `version_history`
+    array dropped.
+
+    Why: version_history is ~half of strategy.json (8.7KB of 18.7KB at v13) and is
+    pure historical audit — the model never needs it to make a trading or research
+    decision, yet the raw file rode along in EVERY cycle's system prompt, growing
+    without bound (the skill_5 re-fire churn appended a ~500-word essay per NO-OP
+    review). This trims that weight from every cycle while changing NOTHING the
+    model acts on.
+
+    The full file stays on disk: skill_5 (which must REWRITE strategy.json and
+    therefore has to see every field) loads the complete file, NOT this view, and
+    Phase 4's regression detector will read the complete version_history from disk
+    too. This only changes what read-only consumers are shown, never what is
+    stored. Falls back to the raw file text if the JSON can't be parsed."""
+    s = load_strategy()
+    if not s:
+        return load_file("strategy/strategy.json")
+    s = dict(s)
+    vh = s.pop("version_history", [])
+    if vh:
+        latest = vh[-1]
+        s["version_history_note"] = (
+            f"[{len(vh)} version_history entries elided from this prompt to save "
+            f"tokens; full audit history is on disk in strategy/strategy.json. "
+            f"Latest: v{latest.get('version')} on {latest.get('date')}.]")
+    return json.dumps(s, indent=2)
 
 
 def load_postmortems():
@@ -755,7 +851,8 @@ def run_post_trade_pipeline(log, trade):
 # ================================================================ PHASE 3
 # Close the learning loop: actually PROCESS the strategy_rewrite_queue (skill_5),
 # and version skill-file edits so a bad rewrite can be rolled back.
-def version_skill_file(skill_name, new_content):
+def version_skill_file(skill_name, new_content, *, reason="", trade_ids=None,
+                       severity=None):
     """Archive the current skill file into skills/history/ before overwriting it
     with new_content. Mirrors snapshot_strategy() for skill files so a bad skill_5
     rewrite is always reversible.
@@ -763,7 +860,13 @@ def version_skill_file(skill_name, new_content):
     Naming: skills/history/{skill_name}_v{NNN}.md (zero-padded 3 digits); the
     version number is (count of existing history files for this skill) + 1.
     Returns True on success, False on any error (never raises — a versioning
-    failure must not crash the rewrite loop)."""
+    failure must not crash the rewrite loop).
+
+    reason/trade_ids/severity are recorded to logs/change_events.jsonl so Phase 4's
+    regression detector can see WHEN/WHY/from-which-trade a skill changed — until
+    now a skill bump left only a content snapshot with no structured record (the
+    blind spot the TEMA incident slipped through). Optional + keyword-only so
+    existing callers keep working."""
     try:
         skill_path = os.path.join(ROOT, "skills", f"{skill_name}.md")
         history_dir = os.path.join(ROOT, "skills", "history")
@@ -784,6 +887,12 @@ def version_skill_file(skill_name, new_content):
             f.write(new_content)
 
         print(f"  [version] {skill_name} -> v{version:03d} (history saved)")
+        # Structured event for Phase 4 (skill-file bumps were previously invisible
+        # to any detector). A skill_2 (execution) change is MAJOR by definition;
+        # otherwise fall back to the tag skill_5 supplied.
+        sev = severity or ("MAJOR" if skill_name == "skill_2_execution" else None)
+        record_change_event("skill", skill_name, version, trade_ids=trade_ids,
+                            severity=sev, summary=reason)
         return True
     except Exception as e:
         print(f"  [version] ERROR versioning {skill_name}: {e}")
@@ -810,6 +919,51 @@ def rollback_skill(skill_name, version):
     except Exception as e:
         print(f"  [rollback] ERROR: {e}")
         return False
+
+
+def _compact_trade_log_for_rewrite(log, focus_trade_id=None):
+    """Compact trade-log view for the skill_5 prompt: the rolling summary + open
+    positions + a one-line-per-trade closed history, plus the FULL record of the
+    trade under review. Replaces dumping the entire trade_log.json, which grows
+    without bound — skill_5 needs the cross-trade pattern (symbol/outcome/pnl/
+    confidence/stop_loss per close), not every field of every closed trade."""
+    closed = log.get("trades", [])
+    rows = [{"id": t.get("id"), "symbol": t.get("symbol"),
+             "outcome": t.get("outcome"), "pnl_pct": t.get("pnl_pct"),
+             "confidence_score": t.get("confidence_score"),
+             "stop_loss": t.get("stop_loss", False),
+             "entry_date": t.get("entry_date"), "exit_date": t.get("exit_date")}
+            for t in closed]
+    view = {"summary": log.get("summary", {}),
+            "open_positions": log.get("open_positions", []),
+            "closed_trades_compact": rows}
+    focus = next((t for t in closed if t.get("id") == focus_trade_id), None)
+    if focus:
+        view["focus_trade_full"] = focus
+    return json.dumps(view, indent=2)
+
+
+def _postmortems_for_rewrite(analysis_file):
+    """The referenced analysis in full + a filename index of the others, instead of
+    concatenating every postmortem/victory (which grew on every close). skill_5
+    reviews the ONE referenced outcome; cross-trade pattern detection is served by
+    closed_trades_compact and strategy.confidence_accuracy, so the others only need
+    to be named, not pasted in full. (skill_5 is headless with no file tool, so the
+    index is a pointer for the audit trail, not something it can open mid-run.)"""
+    d = os.path.join(ROOT, "postmortems")
+    if not os.path.isdir(d):
+        return ""
+    files = sorted(f for f in os.listdir(d) if f.endswith(".md"))
+    out = []
+    if analysis_file and os.path.exists(os.path.join(d, analysis_file)):
+        out.append(f"=== REFERENCED ANALYSIS ({analysis_file}) — full text ===\n"
+                   + load_file(f"postmortems/{analysis_file}"))
+    idx = [f"  - {f}" for f in files if f != analysis_file]
+    if idx:
+        out.append("=== OTHER ANALYSES ON FILE (filenames only; their outcomes are "
+                   "in closed_trades_compact and strategy.confidence_accuracy) ===\n"
+                   + "\n".join(idx))
+    return "\n\n".join(out)
 
 
 def process_strategy_rewrite_queue():
@@ -856,12 +1010,23 @@ def process_strategy_rewrite_queue():
 
     print(f"  [skill_5] processing rewrite queue entry: {target_line[:80]}")
 
+    # The trade under review — used to slim the prompt to the relevant context.
+    analysis_file = analysis_match.group(1) if analysis_match else None
+    tid_match = re.search(r"\|\s*(T\d+)\b", target_line)
+    focus_trade_id = tid_match.group(1) if tid_match else None
+
     try:
-        # Build full context for skill_5
+        # strategy.json is sent IN FULL — skill_5 must REWRITE it and therefore has
+        # to see every field (incl. version_history) to echo it back complete. The
+        # skill files are sent in full too, so skill_5 keeps the ability to rewrite
+        # any of them. Postmortems and the trade log are slimmed: the referenced
+        # analysis in full + an index of the rest, and a compact trade-log view +
+        # the focus trade in full. Both used to be dumped whole and grew on every
+        # close, while most of that bulk was irrelevant to reviewing one outcome.
         skill5 = load_file("skills/skill_5_strategy_rewriter.md")
         strategy = load_file("strategy/strategy.json")
-        postmortems = load_postmortems()
-        trade_log = json.dumps(load_trade_log(), indent=2)
+        postmortems = _postmortems_for_rewrite(analysis_file)
+        trade_log = _compact_trade_log_for_rewrite(load_trade_log(), focus_trade_id)
 
         # Load all current skill file contents for skill_5 to rewrite
         skill_contents = {}
@@ -872,13 +1037,13 @@ def process_strategy_rewrite_queue():
 
         user = f"""A trade closed and requires strategy review. Queue entry: {target_line}
 
-Current strategy.json:
+Current strategy.json (COMPLETE — preserve every field when you rewrite it):
 {strategy}
 
-All postmortems and victory analyses:
+Postmortem / victory analyses (referenced one in full; others indexed):
 {postmortems}
 
-Full trade log:
+Trade log (compact: summary + open positions + closed-trade history; focus trade in full):
 {trade_log}
 
 Current skill file contents:
@@ -906,6 +1071,12 @@ Your job:
             print(f"  [skill_5] model call failed: {text[:100]}")
             return
 
+        # Severity tag skill_5 emits (forward-compat for Phase 5; recorded into the
+        # change-event log so Phase 4 can see ROUTINE vs MAJOR per bump).
+        sev_match = re.search(r"SEVERITY:\s*(ROUTINE|MAJOR)", text, re.IGNORECASE)
+        severity = sev_match.group(1).upper() if sev_match else None
+        review_trades = [focus_trade_id] if focus_trade_id else []
+
         # Parse and apply strategy.json updates
         new_strategy = extract_last_json_block(text)
         if new_strategy and isinstance(new_strategy, dict) and "version" in new_strategy:
@@ -917,7 +1088,12 @@ Your job:
             if os.path.exists(src):
                 shutil.copy(src, dst)
             save_json("strategy/strategy.json", new_strategy)
-            print(f"  [skill_5] strategy.json updated v{old_v} -> v{new_strategy.get('version', old_v+1)}")
+            new_v = new_strategy.get("version", old_v + 1)
+            print(f"  [skill_5] strategy.json updated v{old_v} -> v{new_v}")
+            # This path bypasses snapshot_strategy(), so record the change event here.
+            record_change_event("strategy", "strategy.json", new_v,
+                                trade_ids=review_trades, severity=severity,
+                                summary=f"skill_5 review of {target_line[:120]}")
 
         # Parse and apply skill file updates
         skill_updates = re.findall(
@@ -927,22 +1103,24 @@ Your job:
         for skill_name, new_content in skill_updates:
             skill_path = os.path.join(ROOT, "skills", f"{skill_name}.md")
             if os.path.exists(skill_path):
-                version_skill_file(skill_name, new_content.strip())
+                version_skill_file(skill_name, new_content.strip(),
+                                   reason=f"skill_5 review of {target_line[:120]}",
+                                   trade_ids=review_trades, severity=severity)
                 print(f"  [skill_5] skill updated: {skill_name}")
             else:
                 print(f"  [skill_5] WARNING: unknown skill name in update block: {skill_name}")
 
-        # Save raw output for audit trail
+        # Audit trail -> single monthly rolling log (was one skill5_run_*.md per run)
         stamp = datetime.now(ET).strftime("%Y-%m-%d_%H%M")
-        with open(os.path.join(ROOT, "research", f"skill5_run_{stamp}.md"), "w") as f:
-            f.write(f"# skill_5 run {stamp}\nQueue entry: {target_line}\n\n{text}\n")
+        append_audit_log("skill5", f"skill_5 run {stamp} (severity={severity})",
+                         f"Queue entry: {target_line}\n\n{text}")
 
         # Mark entry as DONE
         lines[target_idx] = lines[target_idx].rstrip() + f" [DONE {now_iso()}]\n"
         with open(queue_path, "w") as f:
             f.writelines(lines)
 
-        print(f"  [skill_5] queue entry marked [DONE]")
+        print("  [skill_5] queue entry marked [DONE]")
 
     except Exception as e:
         print(f"  [skill_5] ERROR processing rewrite queue: {e} — skipping this entry")
@@ -1165,7 +1343,9 @@ def _format_ema_sell_block(raw_sigs, log):
 
 def run_agent():
     log = load_trade_log()
-    strategy_text = load_file("strategy/strategy.json")
+    # Lean view (version_history elided) for the read-only cycle prompt; the full
+    # file stays on disk for skill_5 and Phase 4. See strategy_for_prompt().
+    strategy_text = strategy_for_prompt()
     skill, task = active_skill()
     syms = watchlist_symbols(log)
 
@@ -1299,9 +1479,9 @@ EXECUTION RULES:
     stamp = datetime.now(ET).strftime("%Y-%m-%d_%H%M")
     print(f"  tokens: in={usage['input_tokens']} out={usage['output_tokens']} cost=${usage['cost_usd']:.4f}")
 
-    # write the human-readable run record
-    with open(os.path.join(ROOT, "research", f"agent_run_{stamp}.md"), "w") as f:
-        f.write(f"# Agent run {stamp} — task={task}\n\n{text}\n")
+    # Human-readable run record -> single monthly rolling log (was one
+    # research/agent_run_*.md per cycle; 135+ piled up and nothing ever read them).
+    append_audit_log("runs", f"Agent run {stamp} — task={task}", text)
 
     # If the primary model call FAILED (rc≠0 → error string, no footer), claude -p
     # is unavailable this cycle — the broker read and force_sell would fail too, so
@@ -1360,13 +1540,23 @@ EXECUTION RULES:
     footer_actions = footer.get("actions_taken", []) if isinstance(footer, dict) else []
 
     # must_sell was computed pre-turn (stop-loss + held names in ribbon SELL state).
-    broker_positions, sell_orders_today = read_broker_state()
+    # Off-hours runs (weekend/pre-market research, off-hours midweek fallback) can't
+    # open or close anything — orders don't fill while the market is closed — so the
+    # authoritative broker read (an extra Haiku MCP call) is pure waste there. Skip
+    # it when the market is closed; the next market-open cycle reconciles.
     exit_info = {}
-    if broker_positions is None:
+    market_open = is_market_open()
+    if not market_open:
+        broker_positions, sell_orders_today = None, set()
+        print(f"[{stamp}] off-hours run — skipping broker reconciliation "
+              "(market closed; no opens/closes possible).")
+    else:
+        broker_positions, sell_orders_today = read_broker_state()
+    if broker_positions is None and market_open:
         print(f"[{stamp}] WARNING: could not read authoritative broker state — "
               "skipping close detection this cycle (no phantom closes). Any "
               "alerts re-fire next cycle.")
-    else:
+    elif broker_positions is not None:
         # Deterministic forced exits: a hard must-sell still held at the broker,
         # with no working sell order this cycle, gets its own dedicated sell call.
         if must_sell and is_market_open():
@@ -1478,8 +1668,15 @@ def main():
     run_agent()
     while True:
         if not is_market_open():
-            print("Market just closed. Running end-of-day research once and exiting.")
-            run_agent()
+            # Do NOT run an end-of-day research cycle here. At close this routed to
+            # the research skill (Opus, ~$2.10) whose output was then DISCARDED:
+            # persist_phase_output() refuses to clobber the morning's picks file,
+            # so it only ever produced an unsaved_*.md + a warning. Tomorrow's picks
+            # come from the pre-market research run (the `w` startup path), so this
+            # run bought nothing but ~$44/mo of wasted Opus calls. Just stop.
+            print("Market just closed. Stopping for the day. (No end-of-day research "
+                  "run — its output was always discarded; tomorrow's picks come from "
+                  "the pre-market research cycle.)")
             return
         schedule.run_pending()
         time.sleep(1)

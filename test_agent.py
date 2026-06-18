@@ -1514,6 +1514,281 @@ class TestMiscHelpers(unittest.TestCase):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 16b — Prompt-slimming helpers (strategy_for_prompt + skill_5 context)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestStrategyForPrompt(TmpDirMixin):
+    """The lean strategy view injected into read-only cycle prompts must drop the
+    heavy version_history audit array WITHOUT touching the on-disk file (skill_5
+    and Phase 4 read the complete history from disk)."""
+
+    def _seed(self):
+        self.strategy["version_history"] = [
+            {"version": 1, "date": "2026-06-10", "change": "x" * 400, "trade_ids": ["T0001"]},
+            {"version": 2, "date": "2026-06-11", "change": "y" * 400, "trade_ids": ["T0002"]},
+        ]
+        self.strategy["ema_strategy"] = {"buy_signal": "red lowest"}
+        self._flush_strategy()
+
+    def test_drops_version_history_but_keeps_rules(self):
+        self._seed()
+        lean = json.loads(agent_module.strategy_for_prompt())
+        self.assertNotIn("version_history", lean)
+        self.assertEqual(lean["ema_strategy"], {"buy_signal": "red lowest"})
+        self.assertEqual(lean["risk_management"], self.strategy["risk_management"])
+
+    def test_leaves_breadcrumb_note(self):
+        self._seed()
+        lean = json.loads(agent_module.strategy_for_prompt())
+        self.assertIn("version_history_note", lean)
+        self.assertIn("2 version_history entries", lean["version_history_note"])
+
+    def test_on_disk_file_is_untouched(self):
+        self._seed()
+        agent_module.strategy_for_prompt()
+        on_disk = json.load(open(os.path.join(self.tmpdir, "strategy", "strategy.json")))
+        self.assertEqual(len(on_disk["version_history"]), 2)
+
+    def test_is_materially_smaller_than_full(self):
+        self._seed()
+        full = open(os.path.join(self.tmpdir, "strategy", "strategy.json")).read()
+        self.assertLess(len(agent_module.strategy_for_prompt()), len(full))
+
+    def test_missing_strategy_does_not_crash(self):
+        os.remove(os.path.join(self.tmpdir, "strategy", "strategy.json"))
+        self.assertIsInstance(agent_module.strategy_for_prompt(), str)
+
+
+class TestRewritePromptSlimming(TmpDirMixin):
+    """skill_5's per-close context: compact trade log + referenced-postmortem-only."""
+
+    def test_compact_trade_log_structure_and_focus(self):
+        self.tradelog["trades"] = [
+            {"id": "T0001", "symbol": "AAA", "outcome": "WIN", "pnl_pct": 5.0,
+             "confidence_score": 80, "thesis": "z" * 500},
+            {"id": "T0002", "symbol": "BBB", "outcome": "LOSS", "pnl_pct": -3.0,
+             "confidence_score": 62, "thesis": "q" * 500},
+        ]
+        self._flush_log()
+        view = json.loads(agent_module._compact_trade_log_for_rewrite(self.tradelog, "T0002"))
+        self.assertIn("summary", view)
+        self.assertIn("closed_trades_compact", view)
+        self.assertEqual(len(view["closed_trades_compact"]), 2)
+        # focus trade is included in full; non-focus trades are NOT dumped in full
+        self.assertEqual(view["focus_trade_full"]["id"], "T0002")
+        self.assertLess(len(agent_module._compact_trade_log_for_rewrite(self.tradelog, "T0002")),
+                        len(json.dumps(self.tradelog, indent=2)))
+
+    def test_compact_trade_log_unknown_focus_is_safe(self):
+        self._flush_log()
+        view = json.loads(agent_module._compact_trade_log_for_rewrite(self.tradelog, "T9999"))
+        self.assertNotIn("focus_trade_full", view)
+
+    def test_postmortems_referenced_full_others_indexed(self):
+        d = os.path.join(self.tmpdir, "postmortems")
+        for name, body in [("postmortem_001.md", "# CAT loss\nfull body here"),
+                           ("postmortem_002.md", "# CLOV loss\nother body"),
+                           ("victory_001.md", "# AMAT win\nwin body")]:
+            with open(os.path.join(d, name), "w") as f:
+                f.write(body)
+        out = agent_module._postmortems_for_rewrite("postmortem_001.md")
+        self.assertIn("REFERENCED ANALYSIS (postmortem_001.md)", out)
+        self.assertIn("full body here", out)            # referenced one: full text
+        self.assertIn("postmortem_002.md", out)         # others: named
+        self.assertNotIn("other body", out)             # but not pasted in full
+        self.assertIn("victory_001.md", out)
+
+    def test_postmortems_missing_reference_is_safe(self):
+        with open(os.path.join(self.tmpdir, "postmortems", "postmortem_001.md"), "w") as f:
+            f.write("# only one")
+        out = agent_module._postmortems_for_rewrite("nonexistent.md")
+        self.assertIsInstance(out, str)
+        self.assertIn("postmortem_001.md", out)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 16c — Change-event log (Phase 4 input) + rolling audit log
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestChangeEventLog(TmpDirMixin):
+    """logs/change_events.jsonl is the structured, timestamped record of every
+    strategy.json / skill-file version bump — the input Phase 4's regression
+    detector reads. Must capture both kinds, append-only, never raise."""
+
+    def _events(self):
+        path = os.path.join(self.tmpdir, "logs", "change_events.jsonl")
+        if not os.path.exists(path):
+            return []
+        return [json.loads(l) for l in open(path) if l.strip()]
+
+    def test_record_change_event_writes_structured_line(self):
+        agent_module.record_change_event("strategy", "strategy.json", 5,
+                                         trade_ids=["T0001"], severity="ROUTINE",
+                                         summary="weight rebalance")
+        evts = self._events()
+        self.assertEqual(len(evts), 1)
+        e = evts[0]
+        self.assertEqual(e["kind"], "strategy")
+        self.assertEqual(e["version"], 5)
+        self.assertEqual(e["trade_ids"], ["T0001"])
+        self.assertEqual(e["severity"], "ROUTINE")
+        self.assertIn("timestamp", e)
+
+    def test_record_change_event_is_append_only(self):
+        agent_module.record_change_event("strategy", "strategy.json", 5)
+        agent_module.record_change_event("skill", "skill_1_research", 2)
+        self.assertEqual(len(self._events()), 2)
+
+    def test_snapshot_strategy_records_routine_event(self):
+        self._flush_strategy()
+        agent_module.snapshot_strategy(self.strategy, "source-weight rebalance", ["T0003"])
+        evts = self._events()
+        self.assertTrue(any(e["kind"] == "strategy" and e["severity"] == "ROUTINE"
+                            for e in evts))
+
+    def test_version_skill_file_records_event(self):
+        with open(os.path.join(self.tmpdir, "skills", "skill_1_research.md"), "w") as f:
+            f.write("old content")
+        ok = agent_module.version_skill_file("skill_1_research", "new content",
+                                             reason="test", trade_ids=["T0004"])
+        self.assertTrue(ok)
+        evts = self._events()
+        self.assertTrue(any(e["kind"] == "skill" and e["target"] == "skill_1_research"
+                            for e in evts))
+
+    def test_execution_skill_change_tagged_major(self):
+        with open(os.path.join(self.tmpdir, "skills", "skill_2_execution.md"), "w") as f:
+            f.write("old exec")
+        agent_module.version_skill_file("skill_2_execution", "new exec")
+        evts = self._events()
+        exec_evt = next(e for e in evts if e["target"] == "skill_2_execution")
+        self.assertEqual(exec_evt["severity"], "MAJOR")
+
+    def test_record_change_event_never_raises(self):
+        # Even with a junk severity / weird args it must not throw.
+        try:
+            agent_module.record_change_event("skill", "x", None, summary=None or "")
+        except Exception as e:
+            self.fail(f"record_change_event raised: {e}")
+
+
+class TestRollingAuditLog(TmpDirMixin):
+    """append_audit_log replaces 135+ per-cycle agent_run_*.md files with one
+    monthly rolling log."""
+
+    def test_appends_to_single_monthly_file(self):
+        agent_module.append_audit_log("runs", "Run A", "body A")
+        agent_module.append_audit_log("runs", "Run B", "body B")
+        logs = os.listdir(os.path.join(self.tmpdir, "logs"))
+        runs = [f for f in logs if f.startswith("runs_") and f.endswith(".md")]
+        self.assertEqual(len(runs), 1)  # one file, not two
+        content = open(os.path.join(self.tmpdir, "logs", runs[0])).read()
+        self.assertIn("Run A", content)
+        self.assertIn("Run B", content)
+        self.assertIn("body A", content)
+
+    def test_never_raises(self):
+        try:
+            agent_module.append_audit_log("runs", "t", "b")
+        except Exception as e:
+            self.fail(f"append_audit_log raised: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 16d — run_agent off-hours gating + skill_5 apply path (integration)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestOffHoursBrokerGating(TmpDirMixin):
+    """run_agent() must skip the authoritative broker read when the market is
+    closed (no orders can fill) and still perform it when the market is open."""
+
+    def _mock_signals(self):
+        sig = {"ok": True, "state": "NEUTRAL", "transition": "NO_ACTION",
+               "last_close": 505.0, "lines": {"red": 1, "blue": 2, "green": 3, "yellow": 4}}
+        msig = MagicMock()
+        msig.signals_with_raw.return_value = ({"SPY": sig}, "SPY: NEUTRAL")
+        msig.signal_for.return_value = sig
+        return msig
+
+    def test_market_closed_skips_broker_read(self):
+        rbs = MagicMock(return_value=([], set()))
+        with patch.object(agent_module, "signals", self._mock_signals()), \
+             patch.object(agent_module, "is_market_open", return_value=False), \
+             patch.object(agent_module, "read_broker_state", rbs), \
+             patch.object(agent_module, "run_model",
+                          return_value=('ok\n```json\n{"cash":100,"positions":[],"actions_taken":[]}\n```',
+                                        agent_module._EMPTY_USAGE)), \
+             patch.object(agent_module, "process_strategy_rewrite_queue", lambda: None):
+            agent_module.run_agent()
+        self.assertEqual(rbs.call_count, 0)
+
+    def test_market_open_calls_broker_read(self):
+        # held position so market_hours_check does not smart-skip
+        self.tradelog["open_positions"] = [{"id": "T0009", "symbol": "SPY",
+            "entry_price": 500.0, "shares": 1.0, "entry_date": "2026-06-16T10:00:00-04:00",
+            "dollar_amount": 500.0}]
+        self._flush_log()
+        rbs = MagicMock(return_value=([{"symbol": "SPY", "shares": 1.0,
+                        "avg_price": 500.0, "last_price": 505.0}], set()))
+        with patch.object(agent_module, "signals", self._mock_signals()), \
+             patch.object(agent_module, "is_market_open", return_value=True), \
+             patch.object(agent_module, "read_broker_state", rbs), \
+             patch.object(agent_module, "run_model",
+                          return_value=('ok\n```json\n{"cash":100,"positions":[{"symbol":"SPY","shares":1.0,"avg_price":500.0,"last_price":505.0}],"actions_taken":[]}\n```',
+                                        agent_module._EMPTY_USAGE)), \
+             patch.object(agent_module, "process_strategy_rewrite_queue", lambda: None):
+            agent_module.run_agent()
+        self.assertGreaterEqual(rbs.call_count, 1)
+
+
+class TestSkill5ApplyPathIntegration(TmpDirMixin):
+    """process_strategy_rewrite_queue() must parse skill_5 output and apply
+    strategy.json + skill-file updates, record change events, and mark DONE."""
+
+    def test_full_apply_path(self):
+        with open(os.path.join(self.tmpdir, "research", "strategy_rewrite_queue.md"), "w") as f:
+            f.write("# queue\n\n- 2026-06-17T09:00:00-04:00 | T0002 CAT LOSS -0.62% | "
+                    "analysis: postmortem_001.md | skill_5 review\n")
+        with open(os.path.join(self.tmpdir, "postmortems", "postmortem_001.md"), "w") as f:
+            f.write("# CAT loss\nno thesis")
+        with open(os.path.join(self.tmpdir, "skills", "skill_2_execution.md"), "w") as f:
+            f.write("# skill_2_execution\noriginal")
+        new_strat = {"version": self.strategy["version"] + 1,
+                     "ema_strategy": {"buy_signal": "red lowest"},
+                     "risk_management": {"stop_loss_pct": 0.10},
+                     "research": self.strategy["research"], "progress_tracking": {},
+                     "version_history": [{"version": self.strategy["version"] + 1,
+                        "date": "2026-06-17", "change": "T0002 review", "trade_ids": ["T0002"]}]}
+        out = ("SEVERITY: MAJOR\n\nReviewed T0002.\n\n"
+               "## SKILL FILE UPDATE: skill_2_execution\n# skill_2_execution\nNEW RULES\n"
+               "## END SKILL FILE UPDATE\n\n```json\n" + json.dumps(new_strat) + "\n```\n")
+        with patch.object(agent_module, "run_model",
+                          return_value=(out, agent_module._EMPTY_USAGE)):
+            agent_module.process_strategy_rewrite_queue()
+
+        applied = json.load(open(os.path.join(self.tmpdir, "strategy", "strategy.json")))
+        self.assertEqual(applied["version"], self.strategy["version"] + 1)
+        self.assertIn("NEW RULES", open(os.path.join(self.tmpdir, "skills", "skill_2_execution.md")).read())
+        self.assertTrue(os.path.exists(os.path.join(self.tmpdir, "skills", "history", "skill_2_execution_v001.md")))
+        self.assertIn("[DONE", open(os.path.join(self.tmpdir, "research", "strategy_rewrite_queue.md")).read())
+        evt_path = os.path.join(self.tmpdir, "logs", "change_events.jsonl")
+        evts = [json.loads(l) for l in open(evt_path)] if os.path.exists(evt_path) else []
+        self.assertTrue(any(e["kind"] == "strategy" and e["severity"] == "MAJOR" for e in evts))
+        self.assertTrue(any(e["kind"] == "skill" and e["target"] == "skill_2_execution" for e in evts))
+
+    def test_missing_analysis_file_is_skipped_not_run(self):
+        with open(os.path.join(self.tmpdir, "research", "strategy_rewrite_queue.md"), "w") as f:
+            f.write("# queue\n\n- 2026-06-17T09:00:00-04:00 | T0099 X LOSS -1% | "
+                    "analysis: nonexistent.md | skill_5 review\n")
+        rm = MagicMock()
+        with patch.object(agent_module, "run_model", rm):
+            agent_module.process_strategy_rewrite_queue()
+        rm.assert_not_called()  # must NOT burn a model call on a missing analysis
+        self.assertIn("SKIPPED-missing-analysis",
+                      open(os.path.join(self.tmpdir, "research", "strategy_rewrite_queue.md")).read())
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # SECTION 17 — Token usage estimation (non-test, printed report)
 # ═══════════════════════════════════════════════════════════════════════════════
 
