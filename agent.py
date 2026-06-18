@@ -712,11 +712,18 @@ def update_monthly_progress(log):
 
 
 def flag_strategy_rewrite(trade):
-    """Queue a note so skill_5 reviews this outcome on its next cycle."""
+    """Queue a note so skill_5 reviews this outcome on its next cycle.
+    Each trade ID is queued at most once — dedup prevents phantom-close
+    or pipeline-replay from adding duplicate entries."""
+    path = os.path.join(ROOT, "research", "strategy_rewrite_queue.md")
+    if os.path.exists(path):
+        with open(path) as f:
+            existing = f.read()
+        if f"| {trade['id']} " in existing:
+            return  # already queued (pending or done)
     line = (f"- {now_iso()} | {trade['id']} "
             f"{trade['symbol']} {trade['outcome']} {trade['pnl_pct']}% | "
             f"analysis: {trade.get('analysis_file')} | skill_5 review\n")
-    path = os.path.join(ROOT, "research", "strategy_rewrite_queue.md")
     header = "" if os.path.exists(path) else "# Strategy rewrite queue (skill_5 reads this)\n\n"
     with open(path, "a") as f:
         f.write(header + line)
@@ -832,6 +839,20 @@ def process_strategy_rewrite_queue():
 
     if target_idx is None:
         return  # all processed
+
+    # Auto-skip entries whose referenced analysis file no longer exists —
+    # no point burning an Opus call on a postmortem that was quarantined or
+    # never written (e.g. phantom-close artifacts).
+    analysis_match = re.search(r"analysis: (\S+\.md)", target_line)
+    if analysis_match:
+        analysis_file = analysis_match.group(1)
+        analysis_path = os.path.join(ROOT, "postmortems", analysis_file)
+        if not os.path.exists(analysis_path):
+            print(f"  [skill_5] skipping entry (analysis file missing: {analysis_file}): {target_line[:60]}")
+            lines[target_idx] = lines[target_idx].rstrip() + f" [DONE {now_iso()} SKIPPED-missing-analysis]\n"
+            with open(queue_path, "w") as f:
+                f.writelines(lines)
+            return
 
     print(f"  [skill_5] processing rewrite queue entry: {target_line[:80]}")
 
