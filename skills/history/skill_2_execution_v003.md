@@ -8,9 +8,6 @@ week during market hours.
   A stop-loss triggers when a position's current price is ≤ 90% of its entry price
   (a 10% or greater loss). This is a hard rule — it overrides the EMA signal,
   blackout windows, and all other logic.
-- **Leveraged (≥2x daily-reset) ETFs use a TIGHTER stop** — base ÷ leverage (~3.3% on a
-  3x). The injected STOP-LOSS / RISK MODEL block already carries the per-symbol threshold;
-  act on the alert as given, do not relax it to the 10% base.
 - When a stop-loss triggers: sell ALL shares of that position at market price
   immediately via the Robinhood MCP. In `actions_taken` set `type="sell"` and
   `reason="stop_loss"` so the learning loop records it as a forced exit.
@@ -33,43 +30,12 @@ have been opened:
   the thesis. No documented source → no trade.
 If any of these fail, skip the candidate and log which gate it failed.
 
-## Quant-firm entry gates (LR002 + LR003 — HARD, reject before sizing)
-These encode the two trades that were **73% of all loss dollars** (SOXL 3x intraday chase
-−11.84%, AMD parabolic 52-week-high chase −4.99%). Apply to EVERY buy, weekend pick or
-intraweek redeploy alike.
-
-- **Overextension guard (LR003a).** Do NOT market-buy an extended name at the open: if the
-  candidate is up >100% over the trailing ~6 months OR within ~3% of its 52-week high,
-  require a pullback/consolidation entry near the base (the 55-EMA), or skip. The lagging
-  ribbon fires BUY at the exhaustion top — AMD was bought at a 52-week high and gapped −5%.
-- **Valuation-gap cap (LR003b).** If entry is >15% above consensus/modeled fair value, cap
-  confidence below 75 (it cannot size in the 75–89 or 90–100 band) regardless of the story.
-- **Insider/institutional distribution scan (LR003c).** Web-check for Form 144 / 13F / ARK
-  or large insider selling in the prior ~5 trading days. Material selling into strength
-  downgrades confidence and can break the thesis outright.
-- **Hard Fed/FOMC blackout (LR003d).** A scheduled FOMC decision within
-  `blackout_windows.fed_meeting_days` (3) days is a HARD reject for rate-sensitive,
-  high-multiple names (semis, high-beta tech) — not a soft score penalty. AMD was bought
-  the morning of a 2-day FOMC.
-- **Leveraged-ETF rules (LR002).** For any ≥2x daily-reset ETF (SOXL, TQQQ, FNGU, …):
-  −10 confidence penalty vs a comparable cash equity; **no entry on a signal older than 2
-  trading days** (a stale momentum read is exactly how SOXL was chased into the reversal);
-  the RISK MODEL block already sizes it down (÷ leverage) and tightens the stop — never
-  override those upward.
-
 ## Before every BUY
-- **Candidate sourcing — intraweek redeployment is ALLOWED (do not leave cash idle for days).**
-  Your primary candidates are the **LATEST WEEKEND RESEARCH** picks. But settled cash above the
-  10% reserve should not sit dead waiting on the next weekend run. If a qualifying setup exists,
-  you MAY redeploy intraweek into either (a) adding to an existing BUY-state winner up to its
-  risk-based size and sector cap, or (b) a new name from the research static universe (skill_1's
-  sector lists) that is in a clean confirmed BUY and clears EVERY gate here, the quant-firm entry
-  gates above, AND the factor caps — with a freshly documented thesis + sources. A new intraweek
-  name is held to the SAME bar as a weekend pick, never a lower one. If nothing clears the bar,
-  holding cash is the correct action — idle cash beats a forced trade.
+- Your candidate list comes from **LATEST WEEKEND RESEARCH** in the system prompt.
+  Only buy symbols that appear there with a qualifying confidence score; do not
+  invent new candidates during market hours.
 - Confirm the candidate passes the **Pre-trade entry gate** above (confidence ≥ 60,
-  non-empty thesis, non-empty sources_used) **and the quant-firm entry gates** (overextension,
-  valuation-gap, insider-distribution, hard Fed blackout, leveraged-ETF rules).
+  non-empty thesis, non-empty sources_used).
 - Check the Robinhood MCP for the SETTLED cash balance. Never buy with unsettled
   funds (T+1).
 - Confirm the EMA signal is still valid: the 55 (red) has crossed below ALL of
@@ -78,19 +44,10 @@ intraweek redeploy alike.
   (quick web check). If the thesis is broken, skip and log the reason.
 - Check SPY health: is the overall market healthy? If SPY's own EMA signal is in
   a downtrend, lower confidence or skip.
-- Check blackout windows: earnings within 5 days → skip; Fed/FOMC within 3 days → HARD
-  reject for rate-sensitive high-multiple names (see LR003d), soft caution otherwise.
-- **Size with the injected RISK MODEL block, not the old flat bands.** It gives the
-  deterministic max size (% of equity) per candidate — risk-based (risk_per_trade ÷ stop),
-  leverage-adjusted, capped by the confidence band. Buy AT OR BELOW that size, NEVER above;
-  the band is a ceiling, not a target. Keep the 10% cash reserve.
-- **Respect the sector/factor caps.** The RISK MODEL block shows current per-sector exposure
-  vs the cap (max_sector_pct ~40%; max 2 names/sector; leveraged ETFs counted at leverage). A
-  buy that would push its sector over the cap, or add a 3rd name to a full sector, is sized
-  down or skipped — do NOT rebuild the all-semis book that the SOXL/AMD/AMAT cluster and the
-  TEMA liquidation both punished.
-- If all clear → execute the buy via the Robinhood MCP at the risk-based size, recording the
-  confidence score, thesis, and sources.
+- Check blackout windows: earnings within 5 days or Fed within 3 days -> skip.
+- If all clear -> execute the buy via the Robinhood MCP, using the dollar
+  allocation and confidence score from the weekend research (and the capital bands
+  in strategy.json). Keep the 10% reserve; max 30% in one name.
 - If invalidated -> skip and log the reason.
 - If **LATEST MIDWEEK REVIEW** is present and flags a redeploy candidate, treat
   that candidate as your next buy target once cash settles.

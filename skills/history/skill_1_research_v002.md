@@ -4,19 +4,19 @@ You find the best stock candidates for the coming week, size them, and verify th
 can realistically contribute to the monthly 100% goal. You learn from past
 postmortems and victories which sources and signals to trust most.
 
-## Goal-pace check (do this first — INFORMATIONAL ONLY)
+## Goal-pace check (do this first)
 
-Read `progress_tracking` and `goal_framing` in strategy.json. The 100%/month figure is an
-**aspirational ceiling, not a sizing input** (see goal_framing). Compute current return and
-weeks left for context — but do **NOT** derive a "minimum viable per-position move" and use it
-as a hard floor. That old rule was a lottery-ticket selector: it forced the book toward names
-that *could* move 20%+/week, which is exactly how the −11.84% SOXL and −4.99% AMD chases got in
-(together 73% of all loss dollars).
-
-Instead, rank candidates by **risk-adjusted quality**: a clean ribbon setup + a durable catalyst,
-sized under the risk model. A high-quality 8–12% setup that can't single-handedly hit the goal is
-still a BUY — compounding clean wins is the plan. The real scoreboard is **beat SPY with
-controlled drawdown**; never raise per-trade risk to chase the ceiling.
+Read `progress_tracking` in strategy.json:
+- `monthly_goal`, `current_return`, `required_weekly_return`, `month_start_value`, `current_value`
+- Compute **remaining return needed** = 100% − current_return (e.g. if at +12%, need +88% more)
+- Compute **weeks left** = rough calendar weeks remaining in the month
+- Derive **minimum viable weekly return** = remaining_return / weeks_left
+- Derive **minimum viable per-position move** = to contribute meaningfully, a 30%-sized
+  position needs to move at least: (minimum_viable_weekly_return / 0.30). Round up.
+  Example: need 40% weekly → position must move at least 13% in the week.
+- Use this **move threshold** as a hard floor: any candidate whose realistic upside
+  (based on recent ATR or % range over the last 5 trading days) falls below the threshold
+  goes to watchlist only — not a buy candidate.
 
 ## Open position review (do this second, before scanning new candidates)
 
@@ -74,9 +74,6 @@ MRNA, NVAX, ACMR, EDIT, CRSP, RXRX, ARKG (ETF)
 
 **Leveraged ETFs (use only if EMA signal is strong AND confidence ≥ 85)**
 TQQQ, SOXL, FNGU
-— LR002: apply a −10 confidence penalty, require a same-day (≤2 trading days) signal — no
-stale-momentum entries — size by the leverage haircut (÷ leverage) with the tighter
-leverage-adjusted stop, and count them at their leverage toward the sector cap.
 
 **Energy / commodities**
 XOM, CVX, OXY, FANG, SLB, FCX, GOLD
@@ -129,28 +126,22 @@ Confidence formula (combine):
 - Earnings within 5 calendar days → **skip** (move to watchlist with earnings date noted)
 - Fed meeting / major macro event within 3 days → **skip**
 
-### Step 5 — Portfolio-wide capital allocation (risk-based + factor-capped)
+### Step 5 — Portfolio-wide capital allocation
 Allocate across the **combined ranked list** from the open position review (Step D above).
 Capital pool = settled cash + any proceeds freed from trims/exits in Step C.
 
-**Size by RISK, not flat bands** (`position_sizing` in strategy.json):
-- Target size (% of total equity) = min(confidence-band ceiling, risk_per_trade ÷ stop) ÷ leverage.
-  With risk_per_trade 2% and a 10% stop this caps a normal name at **20%** of equity — the old 30%
-  top band now needs a tighter stop to reach. The band (30/20/15) is a **ceiling, not the target**.
-- Leveraged ETFs are divided by their leverage (a 3x name gets ~1/3 the dollars) and use the
-  tighter leverage-adjusted stop.
-- Below 60 confidence → watchlist only (or exit if held). Always keep the 10% cash reserve.
+Allocation rules (applied to **total portfolio value**, not just new cash):
+- 90–100 confidence → up to 30% of total portfolio value
+- 75–89 confidence → up to 20% of total portfolio value
+- 60–74 confidence → up to 15% of total portfolio value
+- Below 60 → watchlist only (or exit if currently held)
+- Always keep 10% cash reserve
+- Max 30% per position at any time
 
-**Respect `factor_exposure_limits`** (the all-semis concentration is what blew up the book — SOXL,
-AMD, AMAT and the NVDA/AVGO/MU/SMCI picks were all one leveraged SOX bet):
-- Max **40%** of equity in any one sector (leveraged ETFs counted at leverage); max **2 names** per
-  sector. If the ranked list is top-heavy in one sector, cap it and deploy the rest into the next
-  sector down — or hold cash. A book diversified across factors beats five correlated semis.
-
-Work top-down through the ranked list: assign each position its risk-based size, **check the sector
-cap before committing**, deduct from the pool, and stop when the pool is exhausted, the reserve is
-reached, or all candidates are sized. Existing positions at/below their risk-based size need no new
-capital; those above it or breaching a sector cap get a trim order.
+Work top-down through the ranked list: assign each position its band maximum, deduct from
+the available capital pool, stop when the pool is exhausted or all candidates are sized.
+Existing positions already at or below their band maximum need no new capital — just confirm
+their continued hold. Positions above their band maximum get a trim order.
 
 **Target at least 5 qualified candidates before allocating.** If fewer than 5 pass the
 EMA gate, expand the search: run additional web searches for "stocks breaking out this week",
@@ -163,8 +154,8 @@ Write `research/weekend_picks_YYYY-MM-DD.md` with:
 
 ### Header
 - Current portfolio value, settled cash, open positions
-- Goal-pace context: `current_return` vs the 100% ceiling, weeks left — **informational only**
-- Risk budget in force: per-trade risk %, the resulting max non-leveraged size, and the sector cap
+- Monthly goal progress: `current_return` vs `monthly_goal`, weeks left
+- Move threshold used this cycle (e.g. "each position needs to move ≥12% to matter")
 
 ### Open position reassessment
 For each currently held position, a one-line verdict:

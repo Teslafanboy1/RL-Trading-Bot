@@ -421,6 +421,24 @@ def weekend_pick_symbols():
     return re.findall(r"###\s+#\d+\s+—\s+(\w+)\b", text)
 
 
+def weekend_pick_confidences():
+    """{SYMBOL: confidence} parsed from the latest weekend_picks_*.md headings
+    '### #N — SYMBOL (...) | Confidence: XX/100'. Lets the deterministic risk
+    block size each pending pick without re-deriving its confidence."""
+    d = os.path.join(ROOT, "research")
+    if not os.path.isdir(d):
+        return {}
+    picks = sorted(f for f in os.listdir(d) if f.startswith("weekend_picks_"))
+    if not picks:
+        return {}
+    text = load_file(f"research/{picks[-1]}")
+    out = {}
+    for m in re.finditer(
+            r"###\s+#\d+\s+—\s+(\w+)\b.*?[Cc]onfidence[:\s]*?(\d{1,3})\s*/\s*100", text):
+        out[m.group(1).upper()] = int(m.group(2))
+    return out
+
+
 def watchlist_symbols(log):
     """SPY + open positions + WATCHLIST env + latest weekend picks, de-duped."""
     syms = (["SPY"] + [p["symbol"] for p in log.get("open_positions", [])]
@@ -443,20 +461,143 @@ def computed_signals(symbols):
         return f"(signal computation error: {e} — treat EMA signals as unknown this cycle.)"
 
 
+# ---------------------------------------------------------------- risk model (Phase A)
+# Deterministic, quant-firm risk sizing. The risk-critical math (how big, how
+# correlated, how tight the stop) lives in Python — NOT in a prompt — so the model
+# can't oversize the way it did on SOXL (3x, full band -> -11.84%) and AMD (parabolic
+# chase -> -4.99%); those two = 73% of all loss dollars. All read strategy/strategy.json
+# (position_sizing + factor_exposure_limits, added v18) and degrade to safe no-ops if
+# those blocks are absent (older strategy files / minimal test fixtures).
+def _ps(strategy):
+    return strategy.get("position_sizing", {}) or {}
+
+
+def leverage_factor(symbol, strategy):
+    """Daily-reset leverage multiple for a symbol (1.0 if not a leveraged ETF)."""
+    lf = _ps(strategy).get("leverage_factors", {})
+    try:
+        return float(lf.get((symbol or "").upper(), 1) or 1)
+    except (TypeError, ValueError):
+        return 1.0
+
+
+def effective_stop_pct(symbol, strategy):
+    """Stop-loss distance for a symbol: the base stop, tightened for leveraged
+    ETFs to base/leverage (e.g. ~3.3% on a 3x). TIGHTER only, never looser — a
+    pure safety improvement that gates the >=2x daily-reset whipsaw (LR002)."""
+    rm = strategy.get("risk_management", {})
+    base = rm.get("stop_loss_pct", DEFAULT_STOP_LOSS_PCT)
+    if not rm.get("leverage_adjusted_stop"):
+        return base
+    lf = leverage_factor(symbol, strategy)
+    return round(base / lf, 4) if lf > 1 else base
+
+
+def _band_ceiling(confidence, strategy):
+    """Per-confidence max position fraction (a CEILING, not the target)."""
+    bc = _ps(strategy).get("band_ceilings", {})
+    if confidence is None:
+        return 0.0
+    try:
+        c = float(confidence)
+    except (TypeError, ValueError):
+        return 0.0
+    if c >= 90:
+        return float(bc.get("90_to_100", 0.30))
+    if c >= 75:
+        return float(bc.get("75_to_89", 0.20))
+    if c >= 60:
+        return float(bc.get("60_to_74", 0.15))
+    return float(bc.get("below_60", 0.0))
+
+
+def position_size_pct(confidence, symbol, strategy):
+    """Risk-based target size as a fraction of TOTAL equity.
+
+        size = min(band_ceiling, risk_per_trade / base_stop) / leverage_factor
+
+    capped at max_single_position; 0.0 below the 60 confidence floor. The
+    confidence band is a ceiling; the 2%-risk / 10%-stop budget is the binding
+    global cap (so the old 30% top band is now effectively 20% for a normal name);
+    leveraged names are divided down so a 3x ETF gets ~1/3 the dollars. Returns
+    the band ceiling unchanged if position_sizing is absent (old strategy)."""
+    ps = _ps(strategy)
+    band = _band_ceiling(confidence, strategy)
+    if band <= 0:
+        return 0.0
+    if not ps:
+        return band
+    risk = ps.get("risk_per_trade_pct", 0.02)
+    base_stop = strategy.get("risk_management", {}).get("stop_loss_pct", DEFAULT_STOP_LOSS_PCT)
+    risk_cap = (risk / base_stop) if base_stop else band
+    lf = leverage_factor(symbol, strategy)
+    raw = min(band, risk_cap) / (lf if lf > 0 else 1)
+    return round(min(raw, ps.get("max_single_position", 0.30)), 4)
+
+
+def sector_for(symbol, strategy):
+    """Sector bucket for a symbol from factor_exposure_limits, or 'other'."""
+    buckets = strategy.get("factor_exposure_limits", {}).get("sector_buckets", {})
+    u = (symbol or "").upper()
+    for name, syms in buckets.items():
+        if u in syms:
+            return name
+    return "other"
+
+
+def sector_exposure(positions, strategy, total_equity=None):
+    """Current per-sector weight, leveraged ETFs counted at their leverage (a 3x
+    semis ETF eats 3x its dollar weight of the semis cap). positions =
+    [{symbol, market_value}]. Returns {sector: {pct, names, count}} and
+    '_total_equity'. The guard against the 'whole book is one bet' failure
+    (SOXL+AMD+AMAT were all semis).
+
+    total_equity is the denominator — the FULL account value INCLUDING cash, so a
+    sector cap means '% of the whole account'. If None, falls back to the sum of
+    position market values (i.e. % of invested capital), which is only meaningful
+    when fully invested — pass the account total whenever it's known, otherwise two
+    positions always sum to ~100% and every sector falsely reads over-cap."""
+    fl = strategy.get("factor_exposure_limits", {})
+    count_lev = fl.get("leveraged_etf_counts_at_leverage", True)
+    vals = []
+    for p in positions:
+        sym = p.get("symbol")
+        mv = float(p.get("market_value") or 0)
+        if sym and mv > 0:
+            vals.append((sym, mv))
+    invested = sum(mv for _, mv in vals)
+    denom = total_equity if (total_equity and total_equity > 0) else invested
+    out = {}
+    for sym, mv in vals:
+        sec = sector_for(sym, strategy)
+        eff = mv * (leverage_factor(sym, strategy) if count_lev else 1)
+        d = out.setdefault(sec, {"_w": 0.0, "names": [], "count": 0})
+        d["_w"] += eff
+        d["names"].append(sym)
+        d["count"] += 1
+    for d in out.values():
+        d["pct"] = round(d.pop("_w") / denom, 4) if denom else 0.0
+    out["_total_equity"] = round(denom, 2)
+    return out
+
+
 def check_stop_loss_alerts(log):
     """Compare open positions against the hard stop-loss threshold using the
     latest close from signals.py. Returns a list of triggered positions so
-    the agent prompt can order immediate sells before any other logic runs."""
+    the agent prompt can order immediate sells before any other logic runs.
+
+    The threshold is per-symbol (effective_stop_pct): leveraged ETFs get a
+    tighter stop than the base 10%."""
     if not signals:
         return []
     strategy = load_strategy()
-    pct = strategy.get("risk_management", {}).get("stop_loss_pct", DEFAULT_STOP_LOSS_PCT)
     alerts = []
     for pos in log.get("open_positions", []):
         symbol = pos["symbol"]
         entry = float(pos.get("entry_price") or 0)
         if entry <= 0:
             continue
+        pct = effective_stop_pct(symbol, strategy)
         try:
             sig = signals.signal_for(symbol)
         except Exception:
@@ -802,8 +943,8 @@ def update_monthly_progress(log):
     save_trade_log(log)
 
     if not on_track:
-        print(f"  BEHIND ON MONTHLY GOAL ({monthly_return:.1f}% vs target pace) — "
-              "raise min confidence next scan.")
+        print(f"  Behind goal pace ({monthly_return:.1f}%). Per goal_framing this is "
+              "INFORMATIONAL — do NOT raise per-trade risk to chase the 100% ceiling.")
     return on_track
 
 
@@ -1341,11 +1482,103 @@ def _format_ema_sell_block(raw_sigs, log):
     )
 
 
+def _format_risk_block(raw_sigs, log, strategy):
+    """Never-raise wrapper around _risk_block_impl — this string is concatenated
+    straight into the prompt, so a formatting failure must degrade to '' rather than
+    crash the trading cycle (same defensive contract as the rest of the loop)."""
+    try:
+        return _risk_block_impl(raw_sigs, log, strategy)
+    except Exception as e:
+        print(f"  [risk-block] skipped (non-fatal): {e}")
+        return ""
+
+
+def _risk_block_impl(raw_sigs, log, strategy):
+    """Deterministic RISK MODEL block injected into the prompt (Phase A): per-
+    candidate risk-based max size, leverage flags, and current sector exposure vs
+    the factor caps. The model must size AT OR BELOW these — the risk-critical math
+    is computed here, not left to the model. Returns '' if position_sizing is absent
+    (older strategy / minimal fixture) so nothing changes for those."""
+    ps = strategy.get("position_sizing")
+    if not ps:
+        return ""
+    rm = strategy.get("risk_management", {})
+    base_stop = rm.get("stop_loss_pct", DEFAULT_STOP_LOSS_PCT)
+    risk = ps.get("risk_per_trade_pct", 0.02)
+
+    held = log.get("open_positions", [])
+    held_syms = {p["symbol"] for p in held}
+    mv_positions = []
+    for p in held:
+        sym = p["symbol"]
+        last = (raw_sigs.get(sym, {}) or {}).get("last_close")
+        mv = (float(p.get("shares") or 0) * float(last)) if last else float(p.get("dollar_amount") or 0)
+        mv_positions.append({"symbol": sym, "market_value": mv})
+    # Denominator = full account value (positions + cash), so a sector cap means
+    # '% of the whole account'. current_value tracks the account total; fall back to
+    # invested if it isn't larger (e.g. minimal fixtures).
+    invested = sum(p["market_value"] for p in mv_positions)
+    total_acct = float(log.get("summary", {}).get("current_value") or 0)
+    total_equity = total_acct if total_acct > invested else invested
+    exp = sector_exposure(mv_positions, strategy, total_equity=total_equity)
+
+    fl = strategy.get("factor_exposure_limits", {})
+    cap = fl.get("max_sector_pct", 0.40)
+    maxn = fl.get("max_positions_per_sector", 2)
+
+    out = ["RISK MODEL (deterministic — Phase A; size AT OR BELOW these, NEVER above):"]
+    out.append(
+        f"  Sizing is RISK-BASED: risk {risk*100:.0f}% of equity / {base_stop*100:.0f}% stop "
+        f"=> max {min(0.30, risk/base_stop)*100:.0f}% of equity per NON-leveraged name "
+        f"(the confidence band is a ceiling, not the target). Leveraged ETFs are divided by "
+        f"their leverage AND get a tighter stop.")
+
+    confs = weekend_pick_confidences()
+    rows = []
+    for sym, s in raw_sigs.items():
+        if not s.get("ok"):
+            continue
+        if not (s.get("state") == "BUY" or s.get("transition") == "ENTER_LONG"):
+            continue
+        conf = next((p.get("confidence_score") for p in held if p["symbol"] == sym), None)
+        if conf is None:
+            conf = confs.get(sym)
+        if conf is None:
+            continue  # unknown confidence -> model scores + sizes via the formula above
+        pct = position_size_pct(conf, sym, strategy)
+        lf = leverage_factor(sym, strategy)
+        tag = (f"  [{lf:g}x leveraged -> 1/{lf:g} size, stop {effective_stop_pct(sym, strategy)*100:.1f}%]"
+               if lf > 1 else "")
+        held_tag = " (HELD)" if sym in held_syms else ""
+        rows.append(f"    {sym}{held_tag}: conf {conf} -> size <= {pct*100:.1f}% of equity{tag}")
+    if rows:
+        out.append("  Max size per BUY/ENTER_LONG candidate with a known confidence:")
+        out += rows
+
+    out.append(
+        f"  SECTOR CAP = {cap*100:.0f}% of equity per sector (leveraged ETFs counted at "
+        f"leverage), max {maxn} names/sector. Current exposure:")
+    sectors = [k for k in exp if k != "_total_equity"]
+    if sectors:
+        for sec in sorted(sectors):
+            d = exp[sec]
+            breach = d["pct"] >= cap or d["count"] >= maxn
+            flag = "  <-- AT/OVER CAP: do NOT add to this sector" if breach else ""
+            out.append(f"    {sec}: {d['pct']*100:.0f}% ({', '.join(d['names'])}){flag}")
+    else:
+        out.append("    (no open positions)")
+    out.append(
+        "  Before ANY buy: confirm the new position keeps its sector <= the cap and "
+        "<= max names/sector; if it would breach, size down or skip.")
+    return "\n".join(out) + "\n\n"
+
+
 def run_agent():
     log = load_trade_log()
     # Lean view (version_history elided) for the read-only cycle prompt; the full
     # file stays on disk for skill_5 and Phase 4. See strategy_for_prompt().
     strategy_text = strategy_for_prompt()
+    strategy = load_strategy()  # dict form for the deterministic risk/sizing block
     skill, task = active_skill()
     syms = watchlist_symbols(log)
 
@@ -1435,6 +1668,7 @@ EXECUTION RULES:
         f"Task: {task}\nTime (ET): {datetime.now(ET):%Y-%m-%d %H:%M} ({datetime.now(ET):%A})\n\n"
         + _format_stop_loss_block(stop_loss_alerts)
         + _format_ema_sell_block(raw_sigs, log)
+        + _format_risk_block(raw_sigs, log, strategy)
         + "COMPUTED EMA SIGNALS (authoritative — computed from real closes at the "
         "configured bar interval; use these as the BUY/SELL gate, do NOT eyeball. "
         "'INSUFFICIENT_DATA' = unknown, do not trade that name):\n"

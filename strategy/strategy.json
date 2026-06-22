@@ -1,7 +1,7 @@
 {
-  "version": 8,
+  "version": 18,
   "goal": "100% monthly portfolio return",
-  "last_updated": "2026-06-16",
+  "last_updated": "2026-06-22",
   "account": {
     "type": "true_cash",
     "settlement": "T+1",
@@ -31,16 +31,16 @@
       "macro": "Fed calendar earnings calendar"
     },
     "source_weights": {
-      "news": 0.35,
+      "news": 0.4,
       "social": 0.2,
-      "fundamental": 0.3,
+      "fundamental": 0.25,
       "macro": 0.15
     },
     "source_performance": {
       "news": {
         "wins": 1,
-        "losses": 1,
-        "accuracy": 0.5
+        "losses": 2,
+        "accuracy": 0.3333
       },
       "social": {
         "wins": 0,
@@ -49,7 +49,7 @@
       },
       "fundamental": {
         "wins": 0,
-        "losses": 1,
+        "losses": 2,
         "accuracy": 0.0
       },
       "macro": {
@@ -71,7 +71,8 @@
     "75_to_89_confidence": 0.2,
     "60_to_74_confidence": 0.15,
     "cash_reserve": 0.1,
-    "max_single_position": 0.3
+    "max_single_position": 0.3,
+    "_superseded_by": "position_sizing (v18) - risk-based sizing replaces the flat % bands; these percents now act only as per-confidence CEILINGS via position_sizing.band_ceilings"
   },
   "blackout_windows": {
     "earnings_days": 5,
@@ -80,16 +81,18 @@
   "progress_tracking": {
     "monthly_goal": "100%",
     "month_start_value": 100.17,
-    "current_value": 103.3268,
-    "current_return": "3.2%",
+    "current_value": 102.2787,
+    "current_return": "2.1%",
     "on_track": false,
-    "required_weekly_return": 93.89,
-    "_note": "Updated 2026-06-10 after BTSG exit (+3.98%). HOOD and CLOV open. ~$35 cash to deploy June 11 (BTSG settles T+1)."
+    "required_weekly_return": 95.88,
+    "_note": "2026-06-22 (Phase A): goal reframed - see goal_framing. 100%/mo is an aspirational ceiling; the operating mandate is risk-adjusted compounding under position_sizing + factor_exposure_limits. required_weekly_return is INFORMATIONAL, not a sizing input - never raise per-trade risk to chase it."
   },
   "risk_management": {
     "stop_loss_pct": 0.1,
     "action": "sell_immediately",
-    "note": "Hard stop: if any open position falls 10% below entry price, sell all shares at market immediately \u2014 overrides EMA signal and blackout windows."
+    "note": "Hard stop: if any open position falls 10% below entry price, sell all shares at market immediately \u2014 overrides EMA signal and blackout windows.",
+    "leverage_adjusted_stop": true,
+    "leverage_adjusted_stop_note": "For >=2x daily-reset ETFs the effective stop = round(stop_loss_pct / leverage_factor, 4) (e.g. ~0.0333 on a 3x). Tighter only, never looser. Enforced in agent.py:effective_stop_pct() + check_stop_loss_alerts(). See LR002."
   },
   "learned_rules": [
     {
@@ -102,15 +105,39 @@
       "trade_ids": [
         "T0002"
       ]
+    },
+    {
+      "id": "LR002",
+      "added": "2026-06-22",
+      "rule": "Leveraged (>=2x daily-reset) ETFs: (a) leverage-adjusted stop = round(stop_loss_pct / leverage_factor, 4) (~0.0333 on a 3x); (b) NO entry on a signal older than 2 trading days (staleness gate); (c) -10 confidence penalty vs a cash equity; (d) sized by the leverage haircut so a 3x name gets ~1/3 the dollars of a comparable single name; (e) counts at its leverage toward the sector cap.",
+      "rationale": "T0010 SOXL -11.84% in ~2h: a 3x semis ETF chased intraday on a 5-day-stale momentum signal at full band size with a normal 10% stop that slipped. Promoted from OBS002 by operator directive 2026-06-22 (Phase A) ahead of the 3-occurrence bar - these are standard risk priors, not a finding to rediscover via repeated 12% losses.",
+      "type": "operator_directed_prior",
+      "applied_in": "agent.py position_size_pct/effective_stop_pct/sector_exposure + skill_1/skill_2",
+      "trade_ids": [
+        "T0010"
+      ]
+    },
+    {
+      "id": "LR003",
+      "added": "2026-06-22",
+      "rule": "Entry-quality gates for cash equities (enforced pre-trade in skill_2): (a) OVEREXTENSION GUARD - flag any candidate up >100% over the trailing ~6mo OR within ~3% of its 52-week high; require a pullback/consolidation entry, not a market-on-open chase; (b) VALUATION-GAP CAP - entry >15% above consensus/modeled fair value caps confidence below the 75 band; (c) INSIDER/INSTITUTIONAL DISTRIBUTION SCAN - material Form 144 / 13F / ARK selling in the prior ~5 trading days downgrades confidence; (d) HARD Fed/FOMC blackout - fed_meeting_days (3) is a HARD pre-trade reject, not a soft -3 score, for rate-sensitive high-multiple names.",
+      "rationale": "T0008 AMD -4.99%: conf-80 market-on-open chase of a parabolic name (+130% YTD, 52wk high, ~21% over ~$450 fair value) into ~$159M/90d insider+ARK distribution and a known hawkish 6/16-6/17 FOMC; should-have-been ~52. Promoted from OBS004 by operator directive 2026-06-22 (Phase A) ahead of the 3-occurrence bar.",
+      "type": "operator_directed_prior",
+      "applied_in": "skill_2 pre-trade gate + skill_1 scoring",
+      "trade_ids": [
+        "T0008",
+        "T0010",
+        "T0005"
+      ]
     }
   ],
   "observations_pending_confirmation": [
     {
       "id": "OBS001",
       "observed": "2026-06-16",
-      "pattern": "Low-beta 'diversifier/stability' positions admitted near the 60-65 band floor (e.g. T0007 HUM at 62) are prone to breakeven mechanical whipsaw exits on a 1h ribbon SELL state while the underlying thesis is intact or improving.",
-      "candidate_rule": "For low-beta sub-65-confidence stability positions, consider not force-exiting on a raw 1h ribbon SELL unless re-scored confidence also falls below 60.",
-      "status": "NOT APPLIED \u2014 single LOW-priority occurrence (T0007). Weakening the held-position SELL-state exit is a core exit-rule change requiring 3+ similar outcomes. Tracking only.",
+      "pattern": "Low-beta 'diversifier/stability' positions admitted near the 60-65 band floor (e.g. T0007 HUM at 62) are prone to breakeven mechanical whipsaw exits on a 1h ribbon SELL state while the underlying thesis is intact or improving. Confirmed in detail by postmortem_005.md: HUM was flushed at breakeven on a 1h ribbon flip while Humana was rallying on reaffirmed FY2026 guidance and Bernstein/Mizuho target raises.",
+      "candidate_rule": "For low-beta sub-65-confidence stability positions, consider not force-exiting on a raw 1h ribbon SELL unless re-scored confidence also falls below 60; and de-prioritize admitting such marginal low-beta 'stability' buys at the band floor under a 100%/mo goal, where a 15% allocation that round-trips to breakeven is dead capital.",
+      "status": "NOT APPLIED \u2014 single occurrence (T0007). Weakening the held-position SELL-state exit is a core exit-rule change requiring 3+ similar outcomes. Tracking only. Watch T0011 (CAT, open low-beta position flagged for whipsaw monitoring) as a potential occurrence #2.",
       "trade_ids": [
         "T0007"
       ]
@@ -120,9 +147,31 @@
       "observed": "2026-06-16",
       "pattern": "Leveraged (>=2x daily-reset) ETFs entered intraday on a multi-day-old momentum/macro signal are exposed to severe whipsaw: a ~4% adverse move in the underlying becomes a double-digit loss on a 3x fund. T0010 (SOXL, 3x semis) was opened at the open near the morning high on a 5-day-stale 'momentum bullish Jun 11' thesis and lost -11.84% in ~2h on a mean-reverting tape.",
       "candidate_rule": "For >=2x leveraged ETFs: (a) apply a leverage-adjusted stop (~5-6% on a 3x \u2248 10% single-name risk), (b) require same-day signal confirmation \u2014 no entry on a signal older than ~2 trading days, and (c) apply a fixed confidence penalty (~-10 pts) vs cash equities.",
-      "status": "NOT APPLIED \u2014 single occurrence (T0010). These are core risk-rule changes (stop threshold, signal-staleness gate, scoring penalty) requiring 3+ similar outcomes. Tracking only.",
+      "status": "APPLIED 2026-06-22 as LR002 (operator-directed Phase A prior, ahead of the 3-occurrence bar). Original tracking note: NOT APPLIED \u2014 single occurrence (T0010). These are core risk-rule changes (stop threshold, signal-staleness gate, scoring penalty) requiring 3+ similar outcomes. Tracking only. NOTE (v16 re-fire review): the only other semi loss since, T0008 (AMD -4.99%), is a cash equity \u2014 NOT a leveraged daily-reset ETF \u2014 so it does NOT corroborate this leveraged-ETF pattern; OBS002 remains a single occurrence. (v17: T0008 is instead logged under OBS004 as an overextension/valuation chase; it shares the 'chased an extended semi at the morning high' surface trait with T0010 but the mechanism differs \u2014 leverage decay vs. overvaluation mean-reversion.)",
       "trade_ids": [
         "T0010"
+      ]
+    },
+    {
+      "id": "OBS003",
+      "observed": "2026-06-18",
+      "pattern": "Dated tier-1 analyst target hikes coinciding with an EMA reversal act as BOTH entry confirmation and an exit roadmap. T0005 (AMAT WIN +9.31%, victory_002.md): Barclays raised its target to $590 from $500 on the entry day (Jun 11) and Cantor set $650 on Jun 10; the stock ran into that analyst-target cluster and was exited at ~$589.63 \u2014 essentially the Barclays level. The win was confirmed process, not luck (AI-capex supercycle + dated $500M Singapore campus opening Jun 9). Secondary note: the entry was a mid-rally chase on the +8% session, not the clean 55-crosses-all-3 base near the reversal \u2014 the strong, dated news catalyst bailed it out, but a base entry would have captured materially more.",
+      "candidate_rule": "When a candidate has a dated tier-1 analyst target hike (<=~2 trading days old) that coincides with a fresh EMA reversal, (a) treat the cluster of published targets as a concrete exit roadmap rather than holding for a raw EMA EXIT, and (b) still prefer the 55-crosses-all-3 base entry over a mid-rally chase even when the catalyst is strong.",
+      "status": "NOT APPLIED \u2014 single occurrence (T0005). Encoding an analyst-target-based exit or a base-entry-preference rule into skill_1/skill_2 is a behavioral change requiring 3+ similar outcomes. Tracking only \u2014 watch for occurrence #2. (v17: the base-entry-preference half of (b) now also appears in OBS004 \u2014 see the chase-the-extended-high theme cross-referenced there.)",
+      "trade_ids": [
+        "T0005"
+      ]
+    },
+    {
+      "id": "OBS004",
+      "observed": "2026-06-19",
+      "pattern": "High-confidence (75-89 band) BUYs placed market-on-open into a parabolic, overextended cash equity at a local/52-week high are exposed to sharp mean-reversion that the lagging ribbon cannot protect against \u2014 the EMA fires BUY at the exhaustion top while price is already breaking shorter-term support. T0008 (AMD, conf 80, -4.99%, postmortem_004.md): entered 2026-06-16 at the open at $544.79 \u2014 +130% YTD, at a 52-week high, ~21% above ~$450 modeled fair value \u2014 into ~$159M/90d of insider+ARK distribution (ARK 141K shares Jun 15, CEO Su 125K, CTO Form 144) and a known hawkish 6/16-6/17 FOMC; rolled over immediately and gapped down to a ~5% overnight loss. postmortem_004 scores should-have-been ~52, not 80.",
+      "candidate_rule": "From postmortem_004: (a) OVEREXTENSION GUARD \u2014 flag candidates up >~100% over trailing ~6mo or within ~3% of the 52-week high; require a pullback/consolidation entry, not a market-on-open chase at the high. (b) VALUATION-GAP CHECK \u2014 entry price >15% above consensus/modeled fair value caps confidence below the 75-89 band regardless of the growth narrative. (c) INSIDER/INSTITUTIONAL DISTRIBUTION SCAN \u2014 screen Form 144 / 13F / ARK sales in the prior ~5 trading days; material selling into strength downgrades confidence. (d) ENFORCE the EXISTING <=3-day Fed/FOMC blackout (blackout_windows.fed_meeting_days=3) as a HARD pre-trade gate on rate-sensitive high-multiple semis \u2014 AMD was bought the morning of a 2-day FOMC.",
+      "status": "APPLIED 2026-06-22 as LR003 (operator-directed Phase A prior, ahead of the 3-occurrence bar). Original tracking note: NOT APPLIED \u2014 single primary occurrence (T0008). All four proposals are core entry/scoring rules, and (a)-(c) plus the hard-gate form of (d) would be skill_2 (execution) edits, which are MAJOR and require operator sign-off + 3+ similar outcomes. Tracking only. RELATED (distinct, not yet corroborating): T0010 (SOXL, -11.84%) was the same-day chase of an extended semi at the morning high, but as a 3x leveraged daily-reset ETF its mechanism is leverage decay (feeds OBS002, not this); T0005 (AMAT WIN) per OBS003 was also a mid-rally chase rather than the clean 55-crosses-all-3 base. The cross-cutting theme \u2014 chasing extended momentum at/near a local high instead of entering at the clean base \u2014 is now visible across T0008/T0010/T0005; if a 3rd clean LOSS from an open-chase at an extended high appears, apply the overextension guard + base-entry preference. NOTE: (d) is enforcement of an EXISTING strategy.json rule, but elevating it to a hard skill_2 gate is still a skill_2 change (MAJOR) \u2014 proposed, not applied.",
+      "trade_ids": [
+        "T0008",
+        "T0010",
+        "T0005"
       ]
     }
   ],
@@ -144,14 +193,218 @@
       "note": "Sub-60 entry with empty thesis/sources \u2014 should never have been opened. Excluded from band calibration (below the trade floor); retained as the justification for the LR001 execution gate."
     },
     {
+      "trade_id": "T0003",
+      "symbol": "HOOD",
+      "confidence_at_entry": 83,
+      "outcome": "WIN",
+      "pnl_pct": 11.04,
+      "note": "EXCLUDE from calibration. Same class as T0004/T0006: the EXIT was an ERRONEOUS forced liquidation caused by the v3 TEMA-overshoot signal bug (BUY inverted to SELL), corrected in v4 (signals.py reverted to four plain EMAs; tema() deleted; HOOD now reads BUY/HOLD). The queue entry's 'LOSS 0.0%' is the stale pre-correction record; the corrected broker fill was $98.84 = +11.04% WIN (order 6a2ffc3b). The referenced postmortem_002.md is the quarantined bogus postmortem. The 83-confidence entry thesis (S&P 500 inclusion, index-fund buying, 5 upgrades) never failed; the gain was real market move but the exit timing was bug-forced, so neither the entry score nor the exit is calibration-representative."
+    },
+    {
+      "trade_id": "T0004",
+      "symbol": "CLOV",
+      "confidence_at_entry": 80,
+      "outcome": "LOSS",
+      "pnl_pct": -3.48,
+      "note": "EXCLUDE from calibration. Not a genuine thesis or signal-quality loss \u2014 the exit was an ERRONEOUS forced liquidation caused by the v3 TEMA-overshoot signal bug (BUY inverted to SELL), corrected in v4 (signals.py reverted to plain EMA). The referenced postmortem_002.md is the quarantined bogus postmortem. The 80-confidence entry thesis (4.5-star Medicare ruling, widest EMA spread) never failed; the position was force-sold by a bug, not by the strategy."
+    },
+    {
+      "trade_id": "T0006",
+      "symbol": "AI",
+      "confidence_at_entry": 62,
+      "outcome": "LOSS",
+      "pnl_pct": -0.99,
+      "note": "EXCLUDE from calibration. Same class as T0004: not a genuine thesis or signal-quality loss \u2014 the exit was an ERRONEOUS forced liquidation caused by the v3 TEMA-overshoot signal bug (BUY inverted to SELL), corrected in v4 (signals.py reverted to four plain EMAs; tema() deleted). EMA fix now reads AI as BUY/HOLD. The referenced queue entry (-2.38% / postmortem_003.md) is stale: the corrected broker fill was $11.00 = -0.99%, and the original bogus postmortem_004.md is quarantined. The 62-band entry thesis never failed; the position was force-sold by a bug, not by the strategy."
+    },
+    {
+      "trade_id": "T0007",
+      "symbol": "HUM",
+      "confidence_at_entry": 62,
+      "outcome": "LOSS",
+      "pnl_pct": -0.04,
+      "note": "Breakeven mechanical exit (-$0.0054, rounding noise), not a thesis or scoring failure. Low-beta defensive diversifier admitted at the 62 band floor purely for 'stability'; flushed on a 1h ribbon SELL state at the 2026-06-15 open while the fundamental thesis was IMPROVING (reaffirmed FY2026 guidance >=$9.00 adj EPS, Bernstein->$425, Mizuho->$390). Predicted 62, should have been ~62 \u2014 entry scoring correctly flagged this as marginal; the real failure was admitting a marginal low-beta name at all under a 100%/mo goal, then round-tripping it to breakeven (portfolio-construction/exit-policy issue, feeds OBS001, not a band recalibration). Excluded from band calibration as a near-zero mechanical exit. See postmortem_005.md."
+    },
+    {
       "trade_id": "T0010",
       "symbol": "SOXL",
       "confidence_at_entry": 78,
       "outcome": "LOSS",
       "pnl_pct": -11.84,
       "note": "3x leveraged ETF chased intraday on a 5-day-stale momentum signal; caught the intraday reversal. Predicted 78, should have been ~58 per postmortem_003 \u2014 the 75-89 band over-scored a leveraged daily-reset product. Single occurrence; feeds OBS002, not a band recalibration yet."
+    },
+    {
+      "trade_id": "T0005",
+      "symbol": "AMAT",
+      "confidence_at_entry": 65,
+      "outcome": "WIN",
+      "pnl_pct": 9.31,
+      "note": "CALIBRATION-REPRESENTATIVE 60-74 band win (not adopted, not bug-forced, not a mechanical breakeven) \u2014 one of the few clean datapoints in this table. Entered at 65, capped down from ~70 by prudent risk flags (insider selling Jun 5 + GF overvaluation). Exited +9.31% into the analyst-target cluster (Barclays $590 on entry day, Cantor $650). Predicted 65, justified ~70 \u2014 slightly UNDER-confident, but the cap was correct given the information at entry; the win validates the process (dated tier-1 target hikes + AI-capex thesis + EMA reversal). One win does not move the 60-74 band; recorded as a positive calibration anchor and the basis for OBS003 (analyst-target-cluster as exit roadmap). See victory_002.md."
+    },
+    {
+      "trade_id": "T0008",
+      "symbol": "AMD",
+      "confidence_at_entry": 80,
+      "outcome": "LOSS",
+      "pnl_pct": -4.99,
+      "note": "GENUINE 75-89-band entry-scoring miss (unlike the bug-driven T0003/T0004/T0006 exits, and unlike the breakeven-mechanical T0007). Overextension/valuation-gap chase: entered 2026-06-16 at the open at $544.79 \u2014 AMD +130% YTD, at a 52-week high, ~21% above ~$450 modeled fair value \u2014 into ~$159M/90d of insider+ARK distribution (ARK 141K shares Jun 15, CEO Su 125K, CTO Form 144) and a known hawkish 6/16-6/17 FOMC; ribbon fired BUY at the exhaustion top while price broke the 20-day EMA same session (whipsaw). Predicted 80, should have been ~52 per postmortem_004: the 80 captured thesis quality (OpenAI/Meta/EPYC, Barclays $665) but ignored overextension, the valuation gap, insider distribution, and scheduled macro risk \u2014 all knowable at entry. SINGLE occurrence of this pattern \u2014 feeds OBS004, not a band recalibration. See postmortem_004.md."
     }
   ],
+  "goal_framing": {
+    "aspirational_ceiling": "100%/month",
+    "operating_mandate": "Maximize risk-adjusted compounding subject to hard risk limits (position_sizing + factor_exposure_limits + risk_management). The 100%/mo figure is an aspirational CEILING, never a license to oversize, chase, or use leverage to 'catch up'. Return is the OUTPUT of edge under risk control, not an input that justifies risk. Set the risk limits; let return follow.",
+    "rationale": "100%/mo compounds to ~4096x/yr - beyond any sustained record (Renaissance Medallion ~66%/yr net). Every time the bot reached for the goal it lost: SOXL 3x intraday chase -11.84% and AMD parabolic-high chase -4.99% are together 73% of all loss dollars, while the patient trades (HOOD/CAT held, AMAT +9.31%) made money. Clean-sample expectancy was -1.64%/trade; the counterfactual where vol-adjusted sizing shrinks SOXL to ~1/3 and the overextension gate blocks AMD flips realized P&L from +$2.11 to +$4.40.",
+    "directed_by": "operator, 2026-06-22 (Phase A)"
+  },
+  "position_sizing": {
+    "_note": "Quant-firm risk-based sizing. Positions are sized by RISK, not a flat confidence-band percent, so leveraged/high-vol names auto-shrink (the SOXL/AMD failure mode). Computed deterministically in agent.py:position_size_pct() and injected into the prompt; the model applies the suggested size, NEVER a larger one. The confidence band is a hard CEILING, not the target.",
+    "model": "risk_budget_leverage_adjusted",
+    "risk_per_trade_pct": 0.02,
+    "_risk_per_trade_note": "Fraction of TOTAL equity put at risk per position = size_pct * stop_distance. With the 0.10 base stop this caps any single non-leveraged position at risk/stop = 0.02/0.10 = 0.20 (20%) of equity - which supersedes the old 30% top band: a 30% slug would need a <6.7% stop. To risk more, tighten the stop, don't just size up.",
+    "leverage_factors": {
+      "_note": "Daily-reset leverage multiple. A name's size is divided by this factor (3x ETF => 1/3 the dollars) AND its stop tightens to base_stop/factor (see risk_management.leverage_adjusted_stop). Anything not listed = 1.0.",
+      "SOXL": 3,
+      "SOXS": 3,
+      "TQQQ": 3,
+      "SQQQ": 3,
+      "FNGU": 3,
+      "FNGD": 3,
+      "SPXL": 3,
+      "UPRO": 3,
+      "TNA": 3,
+      "TZA": 3,
+      "TECL": 3,
+      "LABU": 3,
+      "UVXY": 2,
+      "SSO": 2,
+      "QLD": 2
+    },
+    "band_ceilings": {
+      "90_to_100": 0.3,
+      "75_to_89": 0.2,
+      "60_to_74": 0.15,
+      "below_60": 0.0
+    },
+    "max_single_position": 0.3,
+    "cash_reserve": 0.1,
+    "min_trade_usd": 1.0
+  },
+  "factor_exposure_limits": {
+    "_note": "Prevents the 'whole book is one bet' failure: SOXL+AMD+AMAT and the NVDA/AVGO/MU/SMCI picks are ALL semis = one leveraged SOX position; the TEMA liquidation also hit the entire correlated book at once. agent.py:sector_exposure() computes current per-sector weight (leveraged ETFs counted at leverage) and injects it; skill_1/skill_2 must not exceed the caps.",
+    "max_sector_pct": 0.4,
+    "max_positions_per_sector": 2,
+    "leveraged_etf_counts_at_leverage": true,
+    "sector_buckets": {
+      "semis_ai_hardware": [
+        "NVDA",
+        "AMD",
+        "SMCI",
+        "ARM",
+        "AVGO",
+        "MRVL",
+        "MU",
+        "QCOM",
+        "INTC",
+        "TSM",
+        "LRCX",
+        "AMAT",
+        "KLAC",
+        "ON",
+        "SOXL",
+        "SOXS",
+        "SOXX",
+        "SMH"
+      ],
+      "software_ai": [
+        "META",
+        "MSFT",
+        "GOOGL",
+        "PLTR",
+        "SNOW",
+        "NET",
+        "DDOG",
+        "CRWD",
+        "MDB",
+        "GTLB",
+        "AI",
+        "BBAI",
+        "SOUN"
+      ],
+      "fintech_crypto": [
+        "COIN",
+        "HOOD",
+        "MSTR",
+        "SOFI",
+        "UPST",
+        "AFRM",
+        "SQ",
+        "PYPL"
+      ],
+      "biotech": [
+        "MRNA",
+        "NVAX",
+        "ACMR",
+        "EDIT",
+        "CRSP",
+        "RXRX",
+        "ARKG",
+        "LABU"
+      ],
+      "energy": [
+        "XOM",
+        "CVX",
+        "OXY",
+        "FANG",
+        "SLB",
+        "FCX",
+        "GOLD"
+      ],
+      "industrials": [
+        "CAT",
+        "DE",
+        "HON",
+        "GE"
+      ],
+      "healthcare": [
+        "HUM",
+        "UNH",
+        "CVS",
+        "CI",
+        "CNC",
+        "CLOV"
+      ],
+      "broad_market_leveraged": [
+        "TQQQ",
+        "SQQQ",
+        "SPXL",
+        "UPRO",
+        "FNGU",
+        "TNA"
+      ]
+    }
+  },
+  "expectancy": {
+    "_note": "Honest edge accounting. Headline win_rate is contaminated by 3 TEMA-bug forced exits (T0003/T0004/T0006). Tracked so sizing can adapt as the sample grows; do NOT recalibrate confidence bands on n<10.",
+    "all_trades": {
+      "n": 9,
+      "wins": 3,
+      "losses": 6,
+      "win_rate": 0.333,
+      "net_pnl_usd": 2.11
+    },
+    "clean_sample": {
+      "_def": "non-adopted, non-TEMA-bug-exit: T0002 CAT, T0005 AMAT, T0007 HUM, T0008 AMD, T0010 SOXL",
+      "n": 5,
+      "wins": 1,
+      "win_rate": 0.2,
+      "avg_win_pct": 9.31,
+      "avg_loss_pct": -4.37,
+      "expectancy_pct": -1.64,
+      "loss_concentration": "SOXL+AMD = -$2.91 = 73% of all loss dollars",
+      "phase_a_counterfactual": "leverage-adjusted sizing (SOXL ~1/3) + overextension gate (AMD blocked) => net P&L +$2.11 -> +$4.40 (2.1x), clean expectancy flips positive."
+    },
+    "min_sample_before_band_recalibration": 10,
+    "last_updated": "2026-06-22"
+  },
   "version_history": [
     {
       "version": 1,
@@ -210,6 +463,91 @@
       "date": "2026-06-16",
       "change": "Re-fire of the already-processed T0002 queue entry (8th [DONE] mark). NO-OP review: re-read all postmortems and victories; confirmed no new evidence meets the 3+ similar-outcome bar for any core change. T0002 lesson remains fully applied as LR001 (v5) \u2014 not re-added. OBS001 (HUM low-beta whipsaw) and OBS002 (SOXL leveraged-ETF whipsaw) remain single-occurrence and stay NOT APPLIED. No source-weight change (min_trades_before_weight_shift=5 not met; source_performance already credited via the verdicts pipeline). No skill-file rewrites \u2014 editing on a re-fire would only churn. Version bump and this audit note only.",
       "trade_ids": [
+        "T0002"
+      ]
+    },
+    {
+      "version": 9,
+      "date": "2026-06-17",
+      "change": "skill_5 review of the T0004 (CLOV LOSS) queue entry referencing postmortem_002.md. NO-OP review. The CLOV exit was NOT a strategy or signal-quality failure: it was an ERRONEOUS forced liquidation caused by the v3 TEMA-overshoot bug (BUY inverted to SELL), already root-caused and corrected in v4 (signals.py reverted to four plain EMAs; tema() deleted). The referenced postmortem_002.md is the quarantined bogus postmortem. No genuine lesson to extract \u2014 the actual lesson (never use TEMA here) is already fully applied in ema_strategy._lengths_note and v3/v4 history. Added T0004 to confidence_accuracy flagged EXCLUDE-from-calibration (bug-driven exit, 80-confidence entry thesis never failed). No core rule change (nothing meets the 3+ bar). OBS001 and OBS002 remain single-occurrence and NOT APPLIED. No source-weight change (all sources na for this exit; min_trades_before_weight_shift not met). No skill-file rewrites \u2014 editing on a bug-driven erroneous-exit re-fire would only churn.",
+      "trade_ids": [
+        "T0004"
+      ]
+    },
+    {
+      "version": 10,
+      "date": "2026-06-17",
+      "change": "source-weight rebalance after trade T0008",
+      "trade_ids": [
+        "T0008"
+      ]
+    },
+    {
+      "version": 11,
+      "date": "2026-06-17",
+      "change": "skill_5 review of the T0006 (AI LOSS) queue entry referencing postmortem_003.md. NO-OP review \u2014 same class as the v9 T0004 review. The AI exit was NOT a strategy or signal-quality failure: it was an ERRONEOUS forced liquidation caused by the v3 TEMA-overshoot bug (BUY inverted to SELL), already root-caused and corrected in v4 (signals.py reverted to four plain EMAs; tema() deleted; AI now reads BUY/HOLD). The queue entry is stale: it cites '-2.38% / postmortem_003.md', but the corrected broker fill was $11.00 = -0.99%, and postmortem_003.md now belongs to SOXL/T0010 (the original AI postmortem_004.md was the quarantined bogus one). No genuine lesson to extract \u2014 the real lesson (never use TEMA here) is already fully applied in ema_strategy._lengths_note and v3/v4 history. Added T0006 to confidence_accuracy flagged EXCLUDE-from-calibration (bug-driven exit, 62-band entry thesis never failed). No core rule change (nothing meets the 3+ bar). OBS001 and OBS002 remain single-occurrence and NOT APPLIED. No source-weight change (this was a bug-driven exit; AI's only source 'fundamental' is na here; min_trades_before_weight_shift not met). No skill-file rewrites \u2014 editing on a bug-driven erroneous-exit re-fire would only churn.",
+      "trade_ids": [
+        "T0006"
+      ]
+    },
+    {
+      "version": 12,
+      "date": "2026-06-17",
+      "change": "skill_5 review of the T0003 (HOOD) queue entry referencing postmortem_002.md. NO-OP review \u2014 same class as the v9 (T0004) and v11 (T0006) reviews. The queue entry's 'HOOD LOSS 0.0%' is the STALE pre-correction record. T0003 was corrected on 2026-06-15 to the real broker fill ($98.84 = +11.04% WIN, order 6a2ffc3b); the EXIT itself was an ERRONEOUS forced liquidation caused by the v3 TEMA-overshoot bug (BUY inverted to SELL), already root-caused and corrected in v4 (signals.py reverted to four plain EMAs; tema() deleted; HOOD now reads BUY/HOLD). The referenced postmortem_002.md is the quarantined bogus postmortem. No genuine lesson to extract \u2014 the real lesson (never use TEMA here) is already fully applied in ema_strategy._lengths_note and v3/v4 history. Added T0003 to confidence_accuracy flagged EXCLUDE-from-calibration (bug-forced exit; 83-confidence entry thesis never failed; the +11.04% gain was a real move but exit timing was bug-driven, so it is not calibration-representative). No core rule change (nothing meets the 3+ bar). OBS001 and OBS002 remain single-occurrence and NOT APPLIED. No source-weight change (bug-driven exit; entry sources never failed; min_trades_before_weight_shift not met). No skill-file rewrites \u2014 editing on a bug-driven erroneous-exit re-fire would only churn.",
+      "trade_ids": [
+        "T0003"
+      ]
+    },
+    {
+      "version": 13,
+      "date": "2026-06-17",
+      "change": "Re-fire of the already-processed T0004 (CLOV LOSS) queue entry \u2014 same class as the v9 review of this exact trade. NO-OP review: re-read all postmortems and victories; confirmed no new evidence meets the 3+ similar-outcome bar for any core change. The CLOV exit was an ERRONEOUS forced liquidation caused by the v3 TEMA-overshoot bug (BUY inverted to SELL), already root-caused and corrected in v4; the referenced postmortem_002.md is the quarantined bogus postmortem. The real lesson (never use TEMA here) remains fully applied in ema_strategy._lengths_note and v3/v4 history, and T0004 is already in confidence_accuracy flagged EXCLUDE-from-calibration (entry thesis never failed) \u2014 not re-added. OBS001 (HUM low-beta whipsaw) and OBS002 (SOXL leveraged-ETF whipsaw) remain single-occurrence and stay NOT APPLIED. No source-weight change (bug-driven exit; entry sources never failed; min_trades_before_weight_shift=5 not met; source_performance already credited via the verdicts pipeline). No skill-file rewrites \u2014 editing on a re-fire would only churn. Version bump and this audit note only.",
+      "trade_ids": [
+        "T0004"
+      ]
+    },
+    {
+      "version": 14,
+      "date": "2026-06-18",
+      "change": "skill_5 review of the T0007 (HUM LOSS -0.04%) queue entry referencing postmortem_005.md. NO-OP on core rules. HUM was a breakeven mechanical exit (-$0.0054, rounding noise): a low-beta defensive diversifier admitted at the 62 band floor purely for 'stability', flushed on a 1h ribbon SELL state at the 2026-06-15 open while its fundamental thesis was IMPROVING (reaffirmed FY2026 guidance >=$9.00 adj EPS, Bernstein->$425, Mizuho->$390). The lesson (low-beta sub-65 'stability' names whipsaw to breakeven on a 1h ribbon, and shouldn't be admitted at the floor under a 100%/mo goal) was already captured in v5 as OBS001 and remains a SINGLE occurrence (T0007) \u2014 the postmortem's proposals (don't force-exit low-beta names on a raw ribbon SELL; de-prioritize marginal low-beta buys) both touch the core held-position SELL-state exit / sizing policy and require 3+ similar outcomes, so OBS001 stays NOT APPLIED / tracking only (watch open position T0011 CAT as a potential occurrence #2). Updated OBS001's pattern/candidate_rule text with the postmortem_005 detail. Added T0007 to confidence_accuracy (predicted 62, should-have-been ~62: entry scoring correctly flagged it as marginal; the failure was admitting the marginal low-beta name at all then exiting at breakeven \u2014 a portfolio-construction/exit-policy issue, not a scoring miss; excluded from band calibration as a near-zero mechanical exit). No source-weight change (fundamental was accurate but na for a mechanical exit; min_trades_before_weight_shift=5 not met; source_performance already credited via the verdicts pipeline). OBS002 (SOXL leveraged-ETF whipsaw) remains single-occurrence and NOT APPLIED. No skill-file rewrites \u2014 editing on a single breakeven mechanical exit whose lesson is already tracked would only churn. Version bump, OBS001 text refresh, and the T0007 calibration record only.",
+      "trade_ids": [
+        "T0007"
+      ]
+    },
+    {
+      "version": 15,
+      "date": "2026-06-18",
+      "change": "skill_5 review of the T0005 (AMAT WIN +9.31%) queue entry referencing victory_002.md. NO-OP on all core rules \u2014 a single clean win is well below the 3+ similar-outcome bar for any EMA/band/sizing/min_confidence change, and a clean win has nothing to correct. The win was confirmed process, not luck: dated tier-1 analyst target hikes (Barclays $590 on entry day Jun 11, Cantor $650 Jun 10) coinciding with an EMA reversal, plus the AI-capex supercycle thesis and the dated $500M Singapore campus opening Jun 9; exited into the analyst-target cluster at ~$589.63. Logged OBS003 (analyst-target-cluster as both entry confirmation and exit roadmap; plus the note that the entry was a mid-rally chase rather than the clean 55-crosses-all-3 base) \u2014 NOT APPLIED, single occurrence (T0005), tracking only. Added T0005 to confidence_accuracy as a CALIBRATION-REPRESENTATIVE 60-74 band win (predicted 65, justified ~70 \u2014 slightly under-confident, but the cap from insider-selling/overvaluation flags was correct on the information at entry); one win does not move the band. No source-weight change (verdicts credit news+fundamental accurate, but source_performance is already credited via the verdicts pipeline and min_trades_before_weight_shift=5 is not met \u2014 a manual edit would double-count). OBS001 and OBS002 remain single-occurrence and NOT APPLIED. No skill-file rewrites \u2014 editing off one clean win risks overfitting the research/execution prompts. Version bump, OBS003 entry, and the T0005 calibration record only.",
+      "trade_ids": [
+        "T0005"
+      ]
+    },
+    {
+      "version": 16,
+      "date": "2026-06-18",
+      "change": "Re-fire of the already-processed T0010 (SOXL LOSS -11.84%) queue entry referencing postmortem_003.md \u2014 first reviewed at v6 (source-weight rebalance) and v7 (OBS002 logged + T0010 added to confidence_accuracy). NO-OP review: re-read postmortem_003.md and all other analyses; confirmed no new evidence meets the 3+ similar-outcome bar for any core change. The SOXL lesson (leveraged >=2x daily-reset ETFs chased intraday on a multi-day-stale momentum signal need a leverage-adjusted stop, a signal-staleness gate, and a confidence penalty) is already fully captured as OBS002, and all three proposals are core risk-rule changes requiring 3+ similar outcomes. OBS002 remains a SINGLE occurrence (T0010): the only other semi loss since, T0008 (AMD -4.99%), is a cash equity \u2014 NOT a leveraged daily-reset ETF \u2014 so it does not corroborate the leveraged-ETF whipsaw pattern; OBS002 stays NOT APPLIED / tracking only. Added a clarifying note to OBS002 recording that T0008 does not count toward it. T0010 is already in confidence_accuracy (predicted 78, should-have-been ~58) \u2014 not re-added. OBS001 and OBS003 remain single-occurrence and NOT APPLIED. No source-weight change (postmortem tagged macro inaccurate, but source_performance is already credited via the verdicts pipeline and min_trades_before_weight_shift=5 is not met \u2014 a manual edit would double-count). No skill-file rewrites \u2014 editing on a re-fire of a single-occurrence loss would only churn the prompts. Version bump, OBS002 note refresh, and this audit entry only.",
+      "trade_ids": [
+        "T0010"
+      ]
+    },
+    {
+      "version": 17,
+      "date": "2026-06-19",
+      "change": "skill_5 review of the T0008 (AMD LOSS -4.99%) queue entry referencing postmortem_004.md. NO-OP on all core rules. AMD is the first GENUINE 75-89-band entry-scoring miss in the book (unlike the bug-driven T0003/T0004/T0006 exits and the breakeven-mechanical T0007): a confidence-80 market-on-open chase of a parabolic, overextended name \u2014 +130% YTD, at a 52-week high, ~21% above ~$450 modeled fair value \u2014 into ~$159M/90d of insider+ARK distribution and a known hawkish 6/16-6/17 FOMC; postmortem_004 scores should-have-been ~52. Logged the lesson as OBS004 (overextension guard, valuation-gap confidence cap, insider-distribution scan, and hard enforcement of the EXISTING <=3-day Fed blackout on high-multiple semis) \u2014 NOT APPLIED: all four are core entry/scoring rules, and (a)-(c) plus the hard-gate form of (d) are skill_2 (execution) edits, which are MAJOR and require operator sign-off + 3+ similar outcomes. SINGLE primary occurrence (T0008); T0010 (SOXL) is the same-day extended-semi chase but is a leveraged daily-reset ETF (mechanism = leverage decay, feeds OBS002), and the AMAT win (OBS003) was also a mid-rally chase \u2014 so the 'chase the extended high instead of the clean base' theme is now visible across T0008/T0010/T0005 and is flagged to apply on a 3rd clean open-chase loss. Added T0008 to confidence_accuracy (predicted 80, should-have-been ~52). No source-weight change: the verdicts pipeline already credited postmortem_004's news+fundamental 'inaccurate' tags into source_performance (v10 'source-weight rebalance after trade T0008'), and min_trades_before_weight_shift=5 is not met \u2014 a manual edit would double-count. OBS001/OBS002/OBS003 remain single-occurrence and NOT APPLIED. No skill-file rewrites \u2014 a single overextension loss is below the 3+ bar and any applicable skill_2 edit is MAJOR; editing now would overfit. Version bump, OBS004 entry, and the T0008 calibration record only.",
+      "trade_ids": [
+        "T0008"
+      ]
+    },
+    {
+      "version": 18,
+      "date": "2026-06-22",
+      "timestamp": "2026-06-22T14:11:31-04:00",
+      "change": "Phase A (operator-directed quant-firm risk overhaul). Added (1) risk-based position_sizing (risk_per_trade 0.02, leverage-adjusted; supersedes flat bands - leveraged names auto-shrink to ~1/3, the 30% top band is now capped at 20% by the 2%-risk/10%-stop budget); (2) factor_exposure_limits (max 40%/sector, leveraged ETFs counted at leverage, max 2 names/sector) to stop the all-semis concentration; (3) leverage_adjusted_stop in risk_management; (4) promoted OBS002->LR002 (leveraged-ETF rules) and OBS004->LR003 (overextension / valuation-gap / insider-distribution / hard Fed blackout) to APPLIED as operator-directed priors ahead of the 3-occurrence bar; (5) expectancy block (clean-sample expectancy -1.64%/trade; SOXL+AMD = 73% of loss dollars); (6) goal_framing reframing 100%/mo as an aspirational ceiling, operating mandate = risk-adjusted compounding. Counterfactual: these take realized net from +$2.11 to +$4.40 with no other trade changed. Operator sign-off satisfies the MAJOR / skill_2 change bar.",
+      "trade_ids": [
+        "T0008",
+        "T0010",
+        "T0007",
+        "T0005",
         "T0002"
       ]
     }

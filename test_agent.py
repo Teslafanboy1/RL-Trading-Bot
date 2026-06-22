@@ -75,8 +75,26 @@ class TmpDirMixin(unittest.TestCase):
             "min_trades_before_weight_shift": 5,
             "min_confidence_to_trade": 60,
         },
-        "risk_management": {"stop_loss_pct": 0.10},
+        "risk_management": {"stop_loss_pct": 0.10, "leverage_adjusted_stop": True},
         "capital_allocation": {"max_single_position": 0.30},
+        "position_sizing": {
+            "model": "risk_budget_leverage_adjusted",
+            "risk_per_trade_pct": 0.02,
+            "leverage_factors": {"SOXL": 3, "TQQQ": 3, "SQQQ": 3, "SSO": 2},
+            "band_ceilings": {"90_to_100": 0.30, "75_to_89": 0.20,
+                              "60_to_74": 0.15, "below_60": 0.0},
+            "max_single_position": 0.30,
+            "cash_reserve": 0.10,
+        },
+        "factor_exposure_limits": {
+            "max_sector_pct": 0.40,
+            "max_positions_per_sector": 2,
+            "leveraged_etf_counts_at_leverage": True,
+            "sector_buckets": {
+                "semis_ai_hardware": ["NVDA", "AMD", "AMAT", "SOXL"],
+                "fintech_crypto": ["HOOD", "COIN"],
+            },
+        },
         "progress_tracking": {"month_start_value": 100.0},
         "version_history": [],
     }
@@ -454,6 +472,130 @@ class TestStopLossAlerts(TmpDirMixin):
             alerts = agent_module.check_stop_loss_alerts(log)
         self.assertEqual(len(alerts), 1)
         self.assertEqual(alerts[0]["symbol"], "A")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 5b — Risk model (Phase A): sizing, leverage stop, factor exposure
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestRiskModel(TmpDirMixin):
+
+    def _strat(self):
+        self._flush_strategy()
+        return agent_module.load_strategy()
+
+    # ── leverage_factor / effective_stop_pct ────────────────────────────────
+    def test_leverage_factor(self):
+        s = self._strat()
+        self.assertEqual(agent_module.leverage_factor("SOXL", s), 3.0)
+        self.assertEqual(agent_module.leverage_factor("soxl", s), 3.0)  # case-insensitive
+        self.assertEqual(agent_module.leverage_factor("AAPL", s), 1.0)  # unlisted -> 1
+
+    def test_effective_stop_leveraged_is_tighter(self):
+        s = self._strat()
+        self.assertAlmostEqual(agent_module.effective_stop_pct("SOXL", s), 0.0333, places=4)
+        self.assertAlmostEqual(agent_module.effective_stop_pct("AMD", s), 0.10, places=4)
+
+    def test_effective_stop_disabled_falls_back_to_base(self):
+        self.strategy["risk_management"]["leverage_adjusted_stop"] = False
+        s = self._strat()
+        self.assertAlmostEqual(agent_module.effective_stop_pct("SOXL", s), 0.10, places=4)
+
+    # ── position_size_pct ───────────────────────────────────────────────────
+    def test_size_normal_capped_by_risk_budget(self):
+        """conf 95 normal name -> 20% (risk/stop budget), NOT the 30% band."""
+        s = self._strat()
+        self.assertAlmostEqual(agent_module.position_size_pct(95, "NVDA", s), 0.20, places=4)
+
+    def test_size_band_floor(self):
+        s = self._strat()
+        self.assertAlmostEqual(agent_module.position_size_pct(65, "AMD", s), 0.15, places=4)
+
+    def test_size_below_confidence_floor_is_zero(self):
+        s = self._strat()
+        self.assertEqual(agent_module.position_size_pct(55, "AMD", s), 0.0)
+
+    def test_size_leveraged_haircut(self):
+        """SOXL (3x) at conf 78 -> 20% / 3 = 6.67%."""
+        s = self._strat()
+        self.assertAlmostEqual(agent_module.position_size_pct(78, "SOXL", s), 0.0667, places=3)
+
+    def test_size_missing_position_sizing_returns_band(self):
+        """Old strategy without position_sizing -> falls back to the band ceiling."""
+        strat = {"risk_management": {"stop_loss_pct": 0.10}}
+        self.assertAlmostEqual(agent_module.position_size_pct(80, "AMD", strat), 0.20, places=4)
+
+    # ── sector_for / sector_exposure ────────────────────────────────────────
+    def test_sector_for(self):
+        s = self._strat()
+        self.assertEqual(agent_module.sector_for("AMD", s), "semis_ai_hardware")
+        self.assertEqual(agent_module.sector_for("HOOD", s), "fintech_crypto")
+        self.assertEqual(agent_module.sector_for("ZZZZ", s), "other")
+
+    def test_sector_exposure_counts_leverage(self):
+        """A 3x ETF eats 3x its dollar weight of the sector cap."""
+        s = self._strat()
+        # $10 SOXL (3x) + $20 AMD = $30 book; semis weighted = 10*3 + 20 = 50; 50/30 = 1.667
+        book = [{"symbol": "SOXL", "market_value": 10.0},
+                {"symbol": "AMD", "market_value": 20.0}]
+        exp = agent_module.sector_exposure(book, s)
+        self.assertEqual(exp["_total_equity"], 30.0)
+        self.assertAlmostEqual(exp["semis_ai_hardware"]["pct"], 1.6667, places=3)
+        self.assertEqual(exp["semis_ai_hardware"]["count"], 2)
+
+    def test_sector_exposure_empty(self):
+        s = self._strat()
+        exp = agent_module.sector_exposure([], s)
+        self.assertEqual(exp["_total_equity"], 0.0)
+
+    def test_sector_exposure_total_equity_denominator(self):
+        """With an explicit account total (incl. cash), weight is % of the ACCOUNT,
+        not % of invested capital — else two positions always read ~100%/sector."""
+        s = self._strat()
+        book = [{"symbol": "AMD", "market_value": 20.0}]
+        exp = agent_module.sector_exposure(book, s, total_equity=100.0)
+        self.assertEqual(exp["_total_equity"], 100.0)
+        self.assertAlmostEqual(exp["semis_ai_hardware"]["pct"], 0.20, places=4)
+
+    # ── check_stop_loss_alerts integration: leveraged stop is honored ────────
+    def test_stop_loss_honors_leveraged_stop(self):
+        self._flush_strategy()
+
+        def run(sym, last):
+            log = {"open_positions": [self._open_pos(sym, 100.0)], "_state": {}}
+            with patch.object(agent_module.signals, "signal_for",
+                              return_value={"ok": True, "last_close": last}):
+                return agent_module.check_stop_loss_alerts(log)
+
+        self.assertEqual(len(run("SOXL", 96.0)), 1)  # -4% past the 3.3% leveraged stop
+        self.assertEqual(run("SOXL", 98.0), [])       # -2% inside the leveraged stop
+        self.assertEqual(run("AMD", 96.0), [])         # -4% inside the 10% base stop
+
+    # ── weekend_pick_confidences ────────────────────────────────────────────
+    def test_weekend_pick_confidences_parses(self):
+        path = os.path.join(self.tmpdir, "research", "weekend_picks_2026-06-22.md")
+        with open(path, "w") as f:
+            f.write("### #1 — AMAT (Applied Materials) | Confidence: 70/100\nbody\n"
+                    "### #2 — NVDA (NVIDIA) | Confidence: 72/100\n")
+        self.assertEqual(agent_module.weekend_pick_confidences(),
+                         {"AMAT": 70, "NVDA": 72})
+
+    # ── _format_risk_block ──────────────────────────────────────────────────
+    def test_risk_block_has_sizes_and_sectors(self):
+        s = self._strat()
+        log = {"open_positions": [self._open_pos("AMD", 100.0, shares=0.2)],  # conf 75, $20 mv
+               "summary": {"current_value": 100.0}}
+        raw = {"AMD": {"ok": True, "state": "BUY", "last_close": 100.0}}
+        block = agent_module._format_risk_block(raw, log, s)
+        self.assertIn("RISK MODEL", block)
+        self.assertIn("semis_ai_hardware", block)
+        self.assertIn("20%", block)            # $20 AMD / $100 account, not 100%
+        self.assertIn("size <= 20.0%", block)  # held AMD conf 75 -> 20% band cap
+
+    def test_risk_block_empty_without_position_sizing(self):
+        strat = {"risk_management": {"stop_loss_pct": 0.10}}
+        block = agent_module._format_risk_block({}, {"open_positions": []}, strat)
+        self.assertEqual(block, "")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
