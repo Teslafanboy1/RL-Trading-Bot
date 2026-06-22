@@ -58,6 +58,9 @@ RH_READ = [_RH + t for t in ("get_accounts", "get_portfolio", "get_equity_positi
            "get_equity_orders", "get_equity_quotes", "get_equity_tradability",
            "search", "get_watchlists", "get_watchlist_items", "review_equity_order")]
 RH_WRITE = [_RH + "place_equity_order", _RH + "cancel_equity_order"]
+# Option READ tools for the Phase B shadow pass (read-only — never place_option_order).
+RH_OPTION_READ = [_RH + t for t in ("get_option_chains", "get_option_quotes",
+                  "get_option_instruments", "get_option_positions")]
 
 
 def notify_operator(subject, body):
@@ -100,6 +103,11 @@ try:
     import signals  # real EMA signal layer (optional; agent degrades if absent)
 except Exception:
     signals = None
+
+try:
+    import options_shadow  # Phase B paper-options engine (optional; agent degrades if absent)
+except Exception:
+    options_shadow = None
 
 DEFAULT_STOP_LOSS_PCT = 0.10  # hard 10% drawdown limit
 
@@ -304,7 +312,7 @@ _EMPTY_USAGE = {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0}
 
 
 def run_model(system, user, *, mcp=False, web=False, timeout=600, model=None,
-              read_only=False, allow_write=False):
+              read_only=False, allow_write=False, extra_tools=None):
     """One agent turn via the `claude` CLI. Returns (text, usage_dict).
 
     usage_dict keys: input_tokens, output_tokens, cost_usd.
@@ -322,6 +330,8 @@ def run_model(system, user, *, mcp=False, web=False, timeout=600, model=None,
             tools += RH_WRITE
     if web:
         tools += ["WebSearch", "WebFetch"]
+    if extra_tools:
+        tools += list(extra_tools)
     # Skill/Task/Agent are explicitly disallowed: user-level skills (e.g. the
     # trading-agent-* skills) leak into the -p context, and the model has tried
     # to "launch" one instead of doing the work inline — the invocation is
@@ -1381,6 +1391,135 @@ def force_sell(symbol, shares, reason):
     return bool(block.get("placed")), fp
 
 
+# ---------------- Phase B: shadow (paper) options ----------------
+def select_shadow_contract(underlying, underlying_price, cfg):
+    """Read-only MCP call: find the ~ATM call in the configured DTE window for the
+    underlying and return its current quote. Returns a contract dict or None. Uses
+    read_only + option READ tools only — it can NEVER place an option order."""
+    sel = cfg.get("selection", {})
+    today = datetime.now(ET).strftime("%Y-%m-%d")
+    system = ("You are a READ-ONLY options data tool. Use only the MCP option/equity "
+              "read tools. Never place, modify, or cancel any order.")
+    user = (
+        f"For underlying {underlying} (spot ~{underlying_price}) in account {ACCOUNT_NUMBER}:\n"
+        f"Find the CALL closest to at-the-money (strike nearest spot) expiring "
+        f"{sel.get('target_dte_min', 30)}-{sel.get('target_dte_max', 45)} calendar days "
+        f"from today ({today}). Use get_option_chains / get_option_quotes.\n"
+        "Output ONLY one fenced ```json block, no prose:\n"
+        '{"type":"call","strike":<float>,"expiry":"YYYY-MM-DD","bid":<float>,"ask":<float>,'
+        '"underlying_price":<float>}\n'
+        'If no such liquid contract exists, output {"type":null}.'
+    )
+    text, _ = run_model(system, user, mcp=True, read_only=True,
+                        extra_tools=RH_OPTION_READ, model=CHECK_MODEL, timeout=240)
+    block = extract_last_json_block(text)
+    if not (block and isinstance(block, dict) and block.get("type")):
+        return None
+    return block
+
+
+def read_shadow_quote(shadow):
+    """Read-only MCP call: current bid for an exact option contract (the price you'd
+    sell at). Returns the bid float or None if the read fails."""
+    system = ("You are a READ-ONLY options data tool. Use only MCP option read tools. "
+              "Never place, modify, or cancel any order.")
+    user = (
+        f"In account {ACCOUNT_NUMBER}, get the CURRENT bid for this option:\n"
+        f"underlying={shadow['underlying']} type={shadow['type']} strike={shadow['strike']} "
+        f"expiry={shadow['expiry']}. Use get_option_quotes.\n"
+        'Output ONLY one fenced ```json block: {"bid":<float>,"ask":<float>}'
+    )
+    text, _ = run_model(system, user, mcp=True, read_only=True,
+                        extra_tools=RH_OPTION_READ, model=CHECK_MODEL, timeout=180)
+    block = extract_last_json_block(text) or {}
+    try:
+        return float(block["bid"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def process_options_shadow(raw_sigs, log):
+    """Phase B shadow (paper) options pass — fully isolated, READ-ONLY, never trades.
+    Runs at the end of an ACTIVE market-hours cycle: marks/closes open shadows on the
+    same exit discipline as the equity book, and opens new shadows on qualified BUY
+    signals — all using REAL option quotes so the spread/IV-crush cost is captured.
+
+    NOTE: only runs on cycles where the model was called (a smart-skipped flat cycle
+    returns before this), so exit marks can lag on quiet days — acceptable for paper
+    trading. The caller wraps this in try/except; it also guards internally and never
+    places an order (select/quote use read_only)."""
+    if not options_shadow or not options_shadow.shadow_enabled(load_strategy()):
+        return
+    if not is_market_open():
+        return  # real option quotes need a live market
+    strategy = load_strategy()
+    cfg = options_shadow.shadow_cfg(strategy)
+    shadow_dir = os.path.join(ROOT, "shadow")
+    os.makedirs(shadow_dir, exist_ok=True)
+    path = os.path.join(shadow_dir, "options_shadow_log.json")
+    slog = options_shadow.load_shadow_log(path)
+    now = now_iso()
+    account_value = float(log.get("summary", {}).get("current_value") or 0)
+
+    # CLOSE/mark pass: re-quote each open shadow and apply the exit discipline.
+    for sh in list(options_shadow.open_shadows(slog)):
+        bid = read_shadow_quote(sh)
+        if bid is None:
+            continue  # quote read failed — leave open, retry a later active cycle
+        state = (raw_sigs.get(sh["underlying"], {}) or {}).get("state")
+        close, reason = options_shadow.should_close(sh, state, bid, cfg)
+        if close:
+            options_shadow.close_shadow_record(slog, sh["id"], bid, reason, now_iso=now)
+            print(f"  [shadow] closed {sh['id']} {sh['underlying']} {sh['type']} "
+                  f"({reason}) exit_bid={bid}")
+
+    # OPEN pass (capped): qualified BUY signals not already shadowed.
+    confs = weekend_pick_confidences()
+    held_conf = {p["symbol"]: p.get("confidence_score") for p in log.get("open_positions", [])}
+    max_open = cfg.get("max_open_shadows", 5)
+    opened = 0
+    for sym, s in raw_sigs.items():
+        if opened >= cfg.get("max_opens_per_cycle", 1):
+            break
+        if len(options_shadow.open_shadows(slog)) >= max_open:
+            break
+        if not s.get("ok"):
+            continue
+        if not (s.get("state") == "BUY" or s.get("transition") == "ENTER_LONG"):
+            continue
+        if options_shadow.has_open_shadow(slog, sym):
+            continue
+        conf = held_conf.get(sym)
+        if conf is None:
+            conf = confs.get(sym)
+        if conf is None or conf < 60:
+            continue  # shadow only vetted setups
+        up = s.get("last_close")
+        if not up:
+            continue
+        contract = select_shadow_contract(sym, up, cfg)
+        if not contract:
+            continue
+        ok, reason = options_shadow.validate_contract(contract, up, cfg)
+        if not ok:
+            print(f"  [shadow] skip {sym}: contract failed gate ({reason})")
+            continue
+        rec = options_shadow.open_shadow_record(
+            slog, underlying=sym, contract=contract, underlying_price=up,
+            account_value=account_value, cfg=cfg, confidence=conf,
+            thesis=f"shadow of {sym} BUY signal", now_iso=now)
+        opened += 1
+        print(f"  [shadow] opened {rec['id']} {sym} {rec['type']} strike={rec['strike']} "
+              f"exp={rec['expiry']} entry_ask={rec['entry_premium']} "
+              f"oversized={rec['oversized_for_account']}")
+
+    options_shadow.save_shadow_log(path, slog)
+    summ = options_shadow.shadow_summary(slog)
+    if summ["open"] or summ["closed"]:
+        append_audit_log("shadow", f"options shadow {datetime.now(ET):%Y-%m-%d_%H%M}",
+                         json.dumps(summ, indent=2))
+
+
 def process_cycle_state(log, actions, broker_positions, exit_info=None):
     """Phase 2 bookkeeping driven by the AUTHORITATIVE broker snapshot, not the
     model's self-report.
@@ -1834,6 +1973,14 @@ EXECUTION RULES:
         process_strategy_rewrite_queue()
     except Exception as e:
         print(f"  [skill_5] rewrite queue processing failed: {e}")
+
+    # Phase B: shadow (paper) options pass — isolated, read-only, never trades. Fully
+    # wrapped so a shadow failure can never crash the trading loop (same contract as
+    # the rewrite queue above).
+    try:
+        process_options_shadow(raw_sigs, log)
+    except Exception as e:
+        print(f"  [shadow] options shadow pass failed: {e}")
 
     print(f"[{stamp}] task={task} done.")
 

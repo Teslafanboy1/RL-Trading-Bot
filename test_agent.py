@@ -29,6 +29,7 @@ sys.path.insert(0, PROJECT_ROOT)
 
 import signals as sig_module
 import agent as agent_module
+import options_shadow as osh
 
 # ─────────────────────────────────────────── synthetic price series ──────────
 
@@ -596,6 +597,126 @@ class TestRiskModel(TmpDirMixin):
         strat = {"risk_management": {"stop_loss_pct": 0.10}}
         block = agent_module._format_risk_block({}, {"open_positions": []}, strat)
         self.assertEqual(block, "")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 5c — Phase B options shadow (paper) engine
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestOptionsShadow(unittest.TestCase):
+    CFG = {
+        "shadow_mode": True,
+        "risk": {"max_loss_per_trade_pct": 0.02, "options_sleeve_max_pct": 0.15},
+        "selection": {"structure_v1": "long_call", "target_dte_min": 30,
+                      "target_dte_max": 45, "max_bid_ask_pct_of_mid": 0.10},
+        "shadow_exit": {"underlying_sell_state": True, "premium_stop_pct": 0.50,
+                        "min_dte_close": 7},
+    }
+    TODAY = date(2026, 6, 22)
+
+    def _contract(self, **kw):
+        c = {"type": "call", "strike": 100.0, "expiry": "2026-07-24",  # 32 DTE
+             "bid": 4.8, "ask": 5.0}
+        c.update(kw)
+        return c
+
+    def test_dte(self):
+        self.assertEqual(osh.dte("2026-07-24", self.TODAY), 32)
+        self.assertIsNone(osh.dte("garbage", self.TODAY))
+
+    def test_validate_ok(self):
+        ok, reason = osh.validate_contract(self._contract(), 100.0, self.CFG, self.TODAY)
+        self.assertTrue(ok, reason)
+
+    def test_validate_illiquid_spread_rejected(self):
+        c = self._contract(bid=2.0, ask=4.0)  # spread = 66% of mid
+        ok, reason = osh.validate_contract(c, 100.0, self.CFG, self.TODAY)
+        self.assertFalse(ok)
+        self.assertIn("illiquid", reason)
+
+    def test_validate_dte_window(self):
+        c = self._contract(expiry="2026-06-29")  # 7 DTE < 30
+        ok, reason = osh.validate_contract(c, 100.0, self.CFG, self.TODAY)
+        self.assertFalse(ok)
+        self.assertIn("dte_out_of_window", reason)
+
+    def test_validate_not_atm(self):
+        c = self._contract(strike=130.0)  # 30% from spot
+        ok, reason = osh.validate_contract(c, 100.0, self.CFG, self.TODAY)
+        self.assertFalse(ok)
+        self.assertIn("not_atm", reason)
+
+    def test_validate_bad_quote(self):
+        ok, reason = osh.validate_contract(self._contract(bid=0, ask=0), 100.0, self.CFG, self.TODAY)
+        self.assertFalse(ok)
+        self.assertIn("bad_quote", reason)
+
+    def test_entry_premium_is_ask(self):
+        self.assertEqual(osh.entry_premium(self._contract(ask=5.0)), 5.0)
+
+    def test_risk_oversized_on_tiny_account(self):
+        # $5 ask -> $500 max loss vs 2% of $104 = $2.08 budget -> oversized (the point)
+        ra = osh.risk_assessment(5.0, 104.0, self.CFG)
+        self.assertTrue(ra["oversized"])
+        self.assertEqual(ra["max_loss_usd"], 500.0)
+
+    def test_should_close_underlying_sell(self):
+        sh = {"entry_premium": 5.0, "expiry": "2026-07-24"}
+        close, reason = osh.should_close(sh, "SELL", 5.2, self.CFG, self.TODAY)
+        self.assertTrue(close)
+        self.assertEqual(reason, "underlying_sell")
+
+    def test_should_close_premium_stop(self):
+        sh = {"entry_premium": 5.0, "expiry": "2026-07-24"}
+        close, reason = osh.should_close(sh, "BUY", 2.4, self.CFG, self.TODAY)  # -52%
+        self.assertTrue(close)
+        self.assertEqual(reason, "premium_stop")
+
+    def test_should_close_dte(self):
+        sh = {"entry_premium": 5.0, "expiry": "2026-06-26"}  # 4 DTE < 7
+        close, reason = osh.should_close(sh, "BUY", 5.0, self.CFG, self.TODAY)
+        self.assertTrue(close)
+        self.assertEqual(reason, "dte_expiry")
+
+    def test_should_close_hold(self):
+        sh = {"entry_premium": 5.0, "expiry": "2026-07-24"}
+        close, _ = osh.should_close(sh, "BUY", 5.0, self.CFG, self.TODAY)
+        self.assertFalse(close)
+
+    def test_close_pnl_win(self):
+        r = osh.close_pnl({"entry_premium": 5.0}, 7.5)
+        self.assertEqual(r["pnl_per_contract_usd"], 250.0)
+        self.assertEqual(r["pnl_pct_on_premium"], 50.0)
+
+    def test_open_close_lifecycle_and_summary(self):
+        log = {"positions": [], "_next_id": 1}
+        rec = osh.open_shadow_record(
+            log, underlying="AMD", contract=self._contract(), underlying_price=100.0,
+            account_value=104.0, cfg=self.CFG, confidence=75, thesis="t",
+            now_iso="2026-06-22T10:00")
+        self.assertEqual(rec["id"], "S0001")
+        self.assertTrue(rec["oversized_for_account"])
+        self.assertTrue(osh.has_open_shadow(log, "AMD"))
+        osh.close_shadow_record(log, "S0001", 7.5, "underlying_sell", now_iso="2026-06-25T10:00")
+        s = osh.shadow_summary(log)
+        self.assertEqual((s["closed"], s["wins"]), (1, 1))
+        self.assertEqual(s["total_pnl_per_contract_usd"], 250.0)
+        self.assertFalse(osh.has_open_shadow(log, "AMD"))
+
+    def test_log_roundtrip(self):
+        path = os.path.join(tempfile.mkdtemp(), "shadow.json")
+        log = osh.load_shadow_log(path)  # fresh default
+        osh.open_shadow_record(log, underlying="NVDA", contract=self._contract(),
+                               underlying_price=100.0, account_value=104.0, cfg=self.CFG)
+        osh.save_shadow_log(path, log)
+        reloaded = osh.load_shadow_log(path)
+        self.assertEqual(len(reloaded["positions"]), 1)
+        self.assertIn("summary", reloaded)
+
+    def test_shadow_enabled(self):
+        self.assertTrue(osh.shadow_enabled({"options": {"shadow_mode": True}}))
+        self.assertFalse(osh.shadow_enabled({"options": {"shadow_mode": False}}))
+        self.assertFalse(osh.shadow_enabled({}))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

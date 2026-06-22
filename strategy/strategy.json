@@ -1,5 +1,5 @@
 {
-  "version": 18,
+  "version": 19,
   "goal": "100% monthly portfolio return",
   "last_updated": "2026-06-22",
   "account": {
@@ -405,6 +405,48 @@
     "min_sample_before_band_recalibration": 10,
     "last_updated": "2026-06-22"
   },
+  "options": {
+    "_note": "Phase B options module. enabled=false => NO real option order is EVER placed below the activation thresholds (hard gate). shadow_mode=true => the bot paper-trades the options expression of its equity signals using REAL bid/ask quotes (so spread cost + IV crush are captured) to build a credible track record BEFORE any real money. Engine: options_shadow.py; isolated read-only pass in agent.py:process_options_shadow.",
+    "enabled": false,
+    "shadow_mode": true,
+    "activation": {
+      "_note": "Real options unlock ONLY when account value >= the tier threshold. Below ~$1.5k a single properly-sized defined-risk spread is too large a % of the book; premium-selling needs collateral for 100 shares / strike*100. Account ~$104 now => DORMANT.",
+      "debit_spreads_min_account_usd": 1500,
+      "premium_selling_min_account_usd": 5000,
+      "current_status": "DORMANT (account ~$104 << $1500) \u2014 shadow only"
+    },
+    "structures_allowed": [
+      "long_call",
+      "long_put",
+      "vertical_debit_spread"
+    ],
+    "structures_forbidden": [
+      "naked_short",
+      "undefined_risk",
+      "ratio_backspread"
+    ],
+    "risk": {
+      "_note": "An option's MAX LOSS (premium for longs, width-credit for spreads) counts against the SAME per-trade risk budget as equities; total options premium-at-risk <= sleeve cap; the underlying's sector counts toward factor_exposure_limits (a SOXL call is a semis bet).",
+      "max_loss_per_trade_pct": 0.02,
+      "options_sleeve_max_pct": 0.15
+    },
+    "selection": {
+      "_note": "v1 shadow structure: ATM long call, 30-45 DTE, on the underlying of a clean BUY signal. Liquidity gate: skip a contract whose bid/ask spread exceeds max_bid_ask_pct_of_mid (the penny-weekly 50%-spread trap). Entry premium = ASK (you pay the ask); exit = BID.",
+      "structure_v1": "long_call",
+      "target_dte_min": 30,
+      "target_dte_max": 45,
+      "strike_rule": "ATM (nearest listed strike to the underlying price)",
+      "max_bid_ask_pct_of_mid": 0.1
+    },
+    "shadow_exit": {
+      "_note": "Close a shadow when the underlying ribbon flips to SELL state, OR the option premium is down >= premium_stop_pct (long-option stop), OR DTE < min_dte_close (avoid gamma/expiry). Mirrors the equity exit discipline so the comparison is apples-to-apples.",
+      "underlying_sell_state": true,
+      "premium_stop_pct": 0.5,
+      "min_dte_close": 7
+    },
+    "max_open_shadows": 5,
+    "max_opens_per_cycle": 1
+  },
   "version_history": [
     {
       "version": 1,
@@ -550,6 +592,13 @@
         "T0005",
         "T0002"
       ]
+    },
+    {
+      "version": 19,
+      "date": "2026-06-22",
+      "timestamp": "2026-06-22T16:02:14-04:00",
+      "change": "Phase B (operator-directed): added the DORMANT options module gate + shadow config. enabled=false is a HARD gate \u2014 no real option order can be placed until account value >= $1500 (debit spreads) / $5000 (premium-selling); account ~$104 => dormant. shadow_mode=true turns on paper-trading of the options expression of equity signals using REAL bid/ask quotes (spread-inclusive) via options_shadow.py + agent.py:process_options_shadow (isolated, read-only, never trades). v1 structure = ATM long call 30-45 DTE with a 10%-spread liquidity gate; exits mirror the equity discipline (underlying SELL state / 50% premium stop / <7 DTE). Builds a credible track record to prove options BEFORE the account clears the activation threshold.",
+      "trade_ids": []
     }
   ]
 }
