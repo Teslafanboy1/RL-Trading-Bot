@@ -62,7 +62,10 @@ Build a **combined ranked list** (same as weekend research Step D):
 - Existing positions tagged `[HOLD]`, `[TRIM]`, or `[EXIT]` with re-scored confidence
 - Any high-confidence redeployment candidates from the weekend picks file or a fresh scan
 
-Sort by confidence descending. Capital flows top-down.
+Sort by confidence descending. Capital flows top-down — and **concentrate**: hold at most
+`position_sizing.max_concurrent_positions` (currently **5**) names, filling the highest-conviction
+idea to its risk-based size before funding the next. At the cap, only **rotate** (sell the weakest to
+fund a stronger); do not dilute into marginal names.
 
 ## Step 5 — Execute via Robinhood MCP
 
@@ -74,6 +77,9 @@ Execute all decisions in this order:
    - Confidence ≥ 75 (no weak redeployments)
    - Cash will be settled before the buy (T+1 check)
    - No earnings within 5 days, no Fed within 3 days
+   - The buy keeps the **≤5-name concentration limit**, the **40%/2-name sector caps**, AND the
+     **≤25% leveraged-sleeve notional cap** (`factor_exposure_limits.leveraged_sleeve_max_pct`) — a 3x
+     ETF can gap 60%+ overnight and no stop beats a gap, so the sleeve cap is the gap-risk rail
 
 Report all actions in `actions_taken` so the learning loop fires.
 

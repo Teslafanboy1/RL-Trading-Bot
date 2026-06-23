@@ -1,5 +1,5 @@
 {
-  "version": 19,
+  "version": 22,
   "goal": "100% monthly portfolio return",
   "last_updated": "2026-06-22",
   "account": {
@@ -92,7 +92,11 @@
     "action": "sell_immediately",
     "note": "Hard stop: if any open position falls 10% below entry price, sell all shares at market immediately \u2014 overrides EMA signal and blackout windows.",
     "leverage_adjusted_stop": true,
-    "leverage_adjusted_stop_note": "For >=2x daily-reset ETFs the effective stop = round(stop_loss_pct / leverage_factor, 4) (e.g. ~0.0333 on a 3x). Tighter only, never looser. Enforced in agent.py:effective_stop_pct() + check_stop_loss_alerts(). See LR002."
+    "leverage_adjusted_stop_note": "For >=2x daily-reset ETFs the effective stop = round(stop_loss_pct / leverage_factor, 4) (e.g. ~0.0333 on a 3x). Tighter only, never looser. Enforced in agent.py:effective_stop_pct() + check_stop_loss_alerts(). See LR002.",
+    "trailing_stop_pct": 0.25,
+    "trailing_stop_note": "Let-winners-run exit: a HELD position that gives back >=25% from its post-entry high-water mark (peak_price) is force-sold (reason=trailing_stop), independent of the ribbon. This is the PRIMARY momentum exit (see exit_on_ribbon_sell). Tracked in agent.py:update_position_peaks() + check_trailing_stop_alerts(); fires via the same deterministic force_sell() path as the hard stop, every cycle. NOTE: a 15-min poller cannot beat an overnight gap - position sizing (esp. the leveraged-sleeve cap) is the real gap defense. Inert if absent/<=0.",
+    "exit_on_ribbon_sell": false,
+    "exit_on_ribbon_sell_note": "false (current): the trailing stop + hard stop govern the mechanical exit; a ribbon SELL-state flip on a held name is ADVISORY only (skill_2 may still exit a BROKEN THESIS, reason=thesis_break). This is what 'let winners run' requires - the old ribbon-SELL forced exit cut winners early (measured: strategy lost to buy&hold on 23/29 names). Set true to restore the prior always-sell-on-SELL-state behavior. Gated in agent.py must_sell + should_skip_model_call + _format_ema_sell_block."
   },
   "learned_rules": [
     {
@@ -286,7 +290,9 @@
     },
     "max_single_position": 0.3,
     "cash_reserve": 0.1,
-    "min_trade_usd": 1.0
+    "min_trade_usd": 1.0,
+    "max_concurrent_positions": 5,
+    "max_concurrent_positions_note": "Concentration (#2): hold at most 5 names. Research/execution deploy TOP-DOWN \u2014 fill the highest-confidence idea to its band ceiling before adding a lower-ranked one; do not dilute into marginal 60-74 names while a 90+ name has capacity. At the cap, only rotate (sell the weakest to fund a stronger). Surfaced deterministically in agent.py:_risk_block_impl; enforced as a directive in skill_1/skill_2/skill_3. The 30%/name cap + 10% cash reserve still bind."
   },
   "factor_exposure_limits": {
     "_note": "Prevents the 'whole book is one bet' failure: SOXL+AMD+AMAT and the NVDA/AVGO/MU/SMCI picks are ALL semis = one leveraged SOX position; the TEMA liquidation also hit the entire correlated book at once. agent.py:sector_exposure() computes current per-sector weight (leveraged ETFs counted at leverage) and injects it; skill_1/skill_2 must not exceed the caps.",
@@ -380,7 +386,9 @@
         "FNGU",
         "TNA"
       ]
-    }
+    },
+    "leveraged_sleeve_max_pct": 0.25,
+    "leveraged_sleeve_note": "Capped leverage sleeve (#3): total NOTIONAL in >1x daily-reset ETFs (TQQQ/SOXL/etc) <= 25% of the account. Measured at notional (NOT leverage-adjusted) so a 60% sleeve drawdown costs ~15% of the account, not the account. This is the gap-risk rail: a 3x ETF can gap 60%+ overnight and no stop beats a gap, so sizing is the only defense. Computed by agent.py:leveraged_sleeve_exposure() and surfaced in _risk_block_impl; LR002 tighter stops + 1/leverage sizing still apply on top. MEASURED CAVEAT: 3x ETFs on the ribbon were the worst risk-adjusted config (Sharpe ~0.3 vs 1.2) and lost to buy-and-hold - this sleeve is the operator's chosen max-return/max-variance lever, bounded by this cap."
   },
   "expectancy": {
     "_note": "Honest edge accounting. Headline win_rate is contaminated by 3 TEMA-bug forced exits (T0003/T0004/T0006). Tracked so sizing can adapt as the sample grows; do NOT recalibrate confidence bands on n<10.",
@@ -410,10 +418,11 @@
     "enabled": false,
     "shadow_mode": true,
     "activation": {
-      "_note": "Real options unlock ONLY when account value >= the tier threshold. Below ~$1.5k a single properly-sized defined-risk spread is too large a % of the book; premium-selling needs collateral for 100 shares / strike*100. Account ~$104 now => DORMANT.",
+      "_note": "Real options unlock ONLY when account value >= the tier threshold. Cheap long calls (the momentum sleeve; max loss = premium) are the lowest-collateral structure, so they unlock first at ~$1k (operator-set go-live target). Debit spreads need ~$1.5k; premium-selling needs collateral for 100 shares / strike*100. Account ~$104 now => DORMANT. NOTE: clearing the threshold only makes real orders ELIGIBLE; arming them still requires flipping options.enabled=true after the shadow record proves positive expectancy.",
+      "long_calls_min_account_usd": 1000,
       "debit_spreads_min_account_usd": 1500,
       "premium_selling_min_account_usd": 5000,
-      "current_status": "DORMANT (account ~$104 << $1500) \u2014 shadow only"
+      "current_status": "DORMANT (account ~$104 << $1000) \u2014 shadow only"
     },
     "structures_allowed": [
       "long_call",
@@ -445,7 +454,42 @@
       "min_dte_close": 7
     },
     "max_open_shadows": 5,
-    "max_opens_per_cycle": 1
+    "max_opens_per_cycle": 1,
+    "momentum": {
+      "_note": "Multi-timeframe momentum screen (momentum_screen.py) — the operator's actual edge, NOT the EMA ribbon. ZERO extra model tokens: the CATALYST (why a cheap name is moving) is REUSED from the one daily skill_1 research pass via its '## MOMENTUM OPTIONS WATCH' block (agent.py:momentum_options_watch), NOT a separate paid web-search call. This pass layers the FREE deterministic 1w/1m/6m/1y momentum + affordability screen on those research-vetted names and paper-trades a call on each survivor. Paper-only (shadow_mode gate); feeds the same options_shadow.py engine as the EMA path, tagged signal_source=momentum_research. min_catalyst_confidence gates on the research's confidence; top_n_open caps opens/scan; universe is only a hint for skill_1's scan list. Tune targets/thresholds here.",
+      "enabled": true,
+      "targets": {
+        "1w": 0.15,
+        "1m": 0.30,
+        "6m": 0.50,
+        "1y": 1.00
+      },
+      "weights": {
+        "1w": 0.20,
+        "1m": 0.35,
+        "6m": 0.25,
+        "1y": 0.20
+      },
+      "anchor_timeframe": "1m",
+      "min_score": 55,
+      "require_all_positive": true,
+      "positive_timeframes": [
+        "1w",
+        "1m",
+        "6m"
+      ],
+      "max_underlying_price": 30.0,
+      "max_contract_cost_usd": 50.0,
+      "top_n_open": 3,
+      "min_catalyst_confidence": 60,
+      "scan_interval_hours": 24,
+      "universe": [
+        "SOFI", "PLUG", "RIOT", "MARA", "F", "NIO", "LCID", "RIVN", "AMC",
+        "CHPT", "RUN", "AFRM", "PATH", "HOOD", "DKNG", "IONQ", "RKLB", "ACHR",
+        "JOBY", "BBAI", "SOUN", "LUNR", "GME", "WBD", "SNAP", "PTON", "CCL",
+        "VALE", "GOLD", "KGC", "UEC", "CIFR", "WULF", "BTBT", "HUT"
+      ]
+    }
   },
   "version_history": [
     {
@@ -598,6 +642,27 @@
       "date": "2026-06-22",
       "timestamp": "2026-06-22T16:02:14-04:00",
       "change": "Phase B (operator-directed): added the DORMANT options module gate + shadow config. enabled=false is a HARD gate \u2014 no real option order can be placed until account value >= $1500 (debit spreads) / $5000 (premium-selling); account ~$104 => dormant. shadow_mode=true turns on paper-trading of the options expression of equity signals using REAL bid/ask quotes (spread-inclusive) via options_shadow.py + agent.py:process_options_shadow (isolated, read-only, never trades). v1 structure = ATM long call 30-45 DTE with a 10%-spread liquidity gate; exits mirror the equity discipline (underlying SELL state / 50% premium stop / <7 DTE). Builds a credible track record to prove options BEFORE the account clears the activation threshold.",
+      "trade_ids": []
+    },
+    {
+      "version": 20,
+      "date": "2026-06-22",
+      "timestamp": "2026-06-22T21:24:06-05:00",
+      "change": "v20 (operator-directed, backtest-justified): 'let winners run' trailing-stop exit. Added risk_management.trailing_stop_pct=0.25 (force-sell a held name that gives back >=25% from its post-entry peak_price; reason=trailing_stop) and exit_on_ribbon_sell=false (the ribbon SELL-state flip is now ADVISORY, not a forced exit). The trailing stop + hard stop are the mechanical exits. Rationale: 10y/29-name backtest (backtest.py + research/trail_probe.py) showed the SELL-state exit cut winners early (lost to buy&hold on 23/29); a 25-35% trailing stop lifts equal-weight portfolio ann.ret ~18->20%, per-trade expectancy ~14->27-46% and PF ~4.2->5-7 at modestly higher drawdown. Inert unless trailing_stop_pct present; flip exit_on_ribbon_sell back to true to restore prior behavior. Engine: agent.py update_position_peaks/check_trailing_stop_alerts + must_sell + should_skip_model_call + _format_ema_sell_block.",
+      "trade_ids": []
+    },
+    {
+      "version": 21,
+      "date": "2026-06-22",
+      "timestamp": "2026-06-22T22:19:10-05:00",
+      "change": "v21 (operator-directed, max-return path): concentration (#2) + capped leverage sleeve (#3). position_sizing.max_concurrent_positions=5 (deploy top-down into <=5 highest-conviction names; no dilution into marginal names; rotate at the cap). factor_exposure_limits.leveraged_sleeve_max_pct=0.25 (total NOTIONAL in >1x ETFs <= 25% of the account; the overnight-gap rail since no stop beats a gap). Both surfaced deterministically in agent.py:_risk_block_impl via leveraged_sleeve_exposure() + the concentration line, and directed in skill_1/skill_2/skill_3. Pairs with the v20 trailing-stop exit. Caveat retained: 3x-on-ribbon is the worst risk-adjusted config (Sharpe ~0.3) - the cap bounds the variance the operator chose. 30%/name cap, 10% cash reserve, LR002 leverage stops all still bind.",
+      "trade_ids": []
+    },
+    {
+      "version": 22,
+      "date": "2026-06-22",
+      "timestamp": "2026-06-22T22:30:00-05:00",
+      "change": "v22 (operator-directed): add options.momentum block — multi-timeframe momentum screener (momentum_screen.py) as a SECOND shadow signal source, matching the operator's real edge (cheap stocks up ~15%/wk, ~30%/mo, ~50%/6mo, ~100%/yr WITH a validated catalyst) rather than the EMA ribbon. Paper-only via the existing shadow_mode gate + options_shadow.py engine; real orders stay hard-gated (enabled=false) until the account clears activation (long_calls_min_account_usd=1000). KEY DESIGN (operator constraint: do not double token usage): the catalyst is REUSED from the single daily skill_1 research pass via its new '## MOMENTUM OPTIONS WATCH' block (agent.py:momentum_options_watch) — NO separate paid catalyst web-search call. process_momentum_shadow layers the FREE deterministic momentum + affordability screen on those research-vetted cheap names and paper-opens calls on survivors (signal_source=momentum_research); only cost is the read-only Haiku option-quote lookup the EMA shadow path already makes. Cheap-stock gates: max_underlying_price=30, max_contract_cost_usd=50 (sized for the $1000 go-live; oversized below that is recorded). skill_1 gains a cheap-momentum scan group + the WATCH output contract. No live-trading change.",
       "trade_ids": []
     }
   ]

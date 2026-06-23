@@ -109,6 +109,11 @@ try:
 except Exception:
     options_shadow = None
 
+try:
+    import momentum_screen  # Phase B+ multi-timeframe momentum screener (optional)
+except Exception:
+    momentum_screen = None
+
 DEFAULT_STOP_LOSS_PCT = 0.10  # hard 10% drawdown limit
 
 
@@ -591,6 +596,22 @@ def sector_exposure(positions, strategy, total_equity=None):
     return out
 
 
+def leveraged_sleeve_exposure(positions, strategy, total_equity=None):
+    """NOTIONAL fraction of the account held in leveraged (>1x daily-reset) ETFs —
+    the 'how much of the book can a leveraged blowup hit' number. Measured at
+    NOTIONAL dollars (NOT leverage-adjusted) on purpose: a 25% cap then means a 60%
+    sleeve drawdown costs ~15% of the account, which is the gap-risk math the cap
+    exists to bound. positions = [{symbol, market_value}]. Returns {pct, notional, names}."""
+    vals = [(p.get("symbol"), float(p.get("market_value") or 0)) for p in positions]
+    invested = sum(mv for _, mv in vals if mv > 0)
+    denom = total_equity if (total_equity and total_equity > 0) else invested
+    lev = [(sym, mv) for sym, mv in vals
+           if mv > 0 and leverage_factor(sym, strategy) > 1]
+    notional = sum(mv for _, mv in lev)
+    return {"pct": round(notional / denom, 4) if denom else 0.0,
+            "notional": round(notional, 2), "names": [sym for sym, _ in lev]}
+
+
 def check_stop_loss_alerts(log):
     """Compare open positions against the hard stop-loss threshold using the
     latest close from signals.py. Returns a list of triggered positions so
@@ -631,6 +652,97 @@ def check_stop_loss_alerts(log):
     return alerts
 
 
+def trailing_stop_pct(strategy):
+    """Trailing-stop giveback fraction (off the high-water mark) from
+    risk_management.trailing_stop_pct. 0 / absent / invalid => trailing disabled,
+    so every check below is a no-op on strategies that predate this field."""
+    try:
+        v = float((strategy.get("risk_management", {}) or {}).get("trailing_stop_pct") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return v if v > 0 else 0.0
+
+
+def update_position_peaks(log, prices):
+    """Bump each open position's `peak_price` high-water mark from the latest price.
+
+    prices: {symbol: last_close}. Seeds peak at entry_price the first time a
+    position is seen. Returns True if any peak moved, so the caller can persist —
+    this must run EVERY cycle (including skipped ones) or the trailing stop trails
+    a stale high. Never raises; a missing/garbage price just leaves the peak put."""
+    changed = False
+    for pos in log.get("open_positions", []):
+        base = pos.get("peak_price")
+        if base is None:
+            base = pos.get("entry_price") or 0
+        try:
+            base = float(base)
+        except (TypeError, ValueError):
+            base = 0.0
+        last = prices.get(pos.get("symbol"))
+        try:
+            last = float(last) if last is not None else None
+        except (TypeError, ValueError):
+            last = None
+        new = max(base, last) if last and last > 0 else base
+        if new != pos.get("peak_price"):
+            pos["peak_price"] = new
+            changed = True
+    return changed
+
+
+def check_trailing_stop_alerts(log, prices=None):
+    """Trailing-stop exits: held positions that have given back >= trailing_stop_pct
+    from their `peak_price` high-water mark. Mirrors check_stop_loss_alerts' shape so
+    the alert flows through the same deterministic force_sell() path.
+
+    Inert (returns []) when trailing_stop_pct is absent/<=0. `prices` is an optional
+    {symbol: last_close} map to avoid re-fetching (the cycle already has signals);
+    falls back to signals.signal_for() per symbol, exactly like the hard-stop check."""
+    if not signals:
+        return []
+    trail = trailing_stop_pct(load_strategy())
+    if trail <= 0:
+        return []
+    prices = prices or {}
+    alerts = []
+    for pos in log.get("open_positions", []):
+        symbol = pos["symbol"]
+        try:
+            peak = float(pos.get("peak_price") or pos.get("entry_price") or 0)
+        except (TypeError, ValueError):
+            continue
+        if peak <= 0:
+            continue
+        last = prices.get(symbol)
+        if last is None:
+            try:
+                sig = signals.signal_for(symbol)
+            except Exception:
+                continue
+            if not sig.get("ok"):
+                continue
+            last = sig.get("last_close")
+        try:
+            last = float(last or 0)
+        except (TypeError, ValueError):
+            continue
+        if last <= 0:
+            continue
+        giveback = (peak - last) / peak
+        if giveback >= trail:
+            alerts.append({
+                "symbol": symbol,
+                "peak_price": round(peak, 4),
+                "last_price": last,
+                "threshold_price": round(peak * (1 - trail), 4),
+                "giveback_pct": round(giveback * 100, 2),
+                "shares": pos.get("shares", 0),
+                "position_id": pos.get("id"),
+            })
+    return alerts
+
+
 def should_skip_model_call(raw_sigs, log):
     """Return (skip: bool, reason: str).
 
@@ -646,6 +758,19 @@ def should_skip_model_call(raw_sigs, log):
     stop_alerts = check_stop_loss_alerts(log)
     if stop_alerts:
         return False, "stop_loss_alert"
+
+    # Trailing-stop exits ride the same "never skip a forced exit" rail as the hard
+    # stop. Reuse this cycle's signal closes so no extra Yahoo fetch is incurred.
+    trail_prices = {s: v.get("last_close") for s, v in raw_sigs.items() if v.get("ok")}
+    if check_trailing_stop_alerts(log, prices=trail_prices):
+        return False, "trailing_stop_alert"
+
+    # When exit_on_ribbon_sell is false (the let-winners-run config) a ribbon SELL on
+    # a held name is advisory, not a forced exit, so it must NOT wake the model every
+    # cycle — the trailing/hard stops above and the periodic forced_news_check still
+    # cover safety and thesis. Default true preserves the prior wake behavior.
+    exit_on_ribbon = (load_strategy().get("risk_management", {}) or {}).get(
+        "exit_on_ribbon_sell", True)
 
     held = {p["symbol"] for p in log.get("open_positions", [])}
     # ENTER_LONG dedup: on an intraday chart the live partial bar can flicker a
@@ -664,7 +789,7 @@ def should_skip_model_call(raw_sigs, log):
             h = _hours_since(el_seen.get(sym))
             if h is None or h >= NEWS_CHECK_HOURS:
                 return False, f"enter_long:{sym}"
-        if t == "EXIT" and sym in held:
+        if t == "EXIT" and sym in held and exit_on_ribbon:
             return False, f"exit:{sym}"
         # State-based safety net: the EXIT edge exists only on the bar where the
         # cross happens. If the cross occurred while the bot wasn't looking (down,
@@ -672,7 +797,7 @@ def should_skip_model_call(raw_sigs, log):
         # the edge-based wake above never fires. A held position sitting in SELL
         # state must wake the model regardless; re-fires every cycle until the
         # position is actually sold (same deliberate nagging as stop-loss alerts).
-        if s.get("state") == "SELL" and sym in held:
+        if s.get("state") == "SELL" and sym in held and exit_on_ribbon:
             return False, f"ema_sell_held:{sym}"
 
     # Collect weekend picks that are in BUY zone and not yet held.
@@ -735,6 +860,7 @@ def record_open_position(log, action):
         "id": generate_trade_id(log),
         "symbol": symbol,
         "entry_price": float(action.get("price") or 0),
+        "peak_price": float(action.get("price") or 0),  # trailing-stop high-water mark, seeded at entry
         "entry_date": now_iso(),
         "shares": float(action.get("shares") or 0),
         "dollar_amount": round(float(action.get("price") or 0) * float(action.get("shares") or 0), 2),
@@ -765,6 +891,7 @@ def adopt_untracked_positions(log, positions):
             "id": generate_trade_id(log),
             "symbol": symbol,
             "entry_price": entry,
+            "peak_price": entry,  # trailing-stop high-water mark; climbs from adoption cost
             "entry_date": now_iso(),
             "shares": shares,
             "dollar_amount": round(entry * shares, 2),
@@ -1520,6 +1647,213 @@ def process_options_shadow(raw_sigs, log):
                          json.dumps(summ, indent=2))
 
 
+# ---------------- Phase B+: momentum→shadow (the operator's real edge) ----------------
+def fetch_daily_closes(symbol):
+    """Daily closes (~1y) for the momentum screen. Reuses signals._fetch_yahoo at
+    1d/1y so the screener sees the same data source as the EMA layer. Returns a list
+    of closes (oldest→newest) or [] on any failure — never raises into the loop."""
+    if not signals:
+        return []
+    try:
+        return signals._fetch_yahoo(symbol, "1d", "1y") or []
+    except Exception:
+        return []
+
+
+def momentum_options_watch():
+    """Catalyst source for the shadow — REUSED from the morning research, so the
+    paper-options pass spends NO extra model tokens (the operator's explicit
+    constraint: don't double token usage for paper trading). The single daily
+    research run (skill_1, Opus) already searches news/filings and validates WHY
+    each name is moving; it emits a dedicated, machine-readable block in its picks
+    file:
+
+        ## MOMENTUM OPTIONS WATCH
+        - SYMBOL | conf XX | catalyst: <one line on why it is moving>
+
+    kept SEPARATE from the equity `### #N — SYMBOL` picks so cheap momentum names
+    fed to the options sleeve never leak into the real equity book. This parses that
+    block from the latest weekend_picks_*.md → {SYMBOL: {confidence, catalyst}}.
+    Returns {} if the file or block is absent (then the shadow simply opens nothing
+    this cycle — it never falls back to a paid catalyst call). Never raises."""
+    try:
+        text = load_latest_research_file("weekend_picks_") or ""
+    except Exception:
+        return {}
+    if not text:
+        return {}
+    # Isolate the MOMENTUM OPTIONS WATCH section (up to the next ## heading / EOF).
+    m = re.search(r"##\s*MOMENTUM OPTIONS WATCH\s*(.*?)(?:\n##\s|\Z)", text,
+                  re.DOTALL | re.IGNORECASE)
+    if not m:
+        return {}
+    out = {}
+    for line in m.group(1).splitlines():
+        # - SYMBOL | conf XX | catalyst: ...
+        lm = re.match(r"\s*[-*]\s*([A-Za-z][A-Za-z.\-]{0,9})\b.*?conf\w*\s*[:=]?\s*"
+                      r"(\d{1,3}).*?catalyst\s*[:=]\s*(.+)$", line, re.IGNORECASE)
+        if not lm:
+            continue
+        sym = lm.group(1).upper()
+        conf = max(0, min(100, int(lm.group(2))))
+        out[sym] = {"confidence": conf, "catalyst": lm.group(3).strip()[:300]}
+    return out
+
+
+def save_momentum_scan(evals):
+    """Persist the latest screen for operator inspection + audit. Overwrites a single
+    snapshot file (the bot never reads it back) and appends a one-line summary to the
+    monthly audit log. Never raises."""
+    try:
+        shadow_dir = os.path.join(ROOT, "shadow")
+        os.makedirs(shadow_dir, exist_ok=True)
+        snap = {"scanned_at": now_iso(),
+                "qualified": [e["symbol"] for e in evals if e.get("qualified")],
+                "evals": evals}
+        with open(os.path.join(shadow_dir, "momentum_last_scan.json"), "w") as f:
+            json.dump(snap, f, indent=2)
+        top = ", ".join(f"{e['symbol']}({e['score']})" for e in evals[:8])
+        append_audit_log("momentum", f"momentum scan {datetime.now(ET):%Y-%m-%d_%H%M}",
+                         f"qualified={snap['qualified']}\ntop_by_score: {top}")
+    except Exception as e:
+        print(f"  [momentum] scan snapshot failed: {e}")
+
+
+def process_momentum_shadow(log):
+    """Phase B+ momentum→shadow pass — the operator's real edge as a SECOND shadow
+    signal source (NOT the EMA ribbon), built to spend ZERO extra model tokens.
+
+    The catalyst ("there must be a REASON it is up") is REUSED from the morning
+    research run (`momentum_options_watch()` parses skill_1's MOMENTUM OPTIONS WATCH
+    block) instead of a separate paid web-search call. This pass then layers the
+    FREE deterministic multi-timeframe momentum screen (Yahoo daily) + affordability
+    gates on top of those already-vetted names, and paper-opens an ATM call on each
+    survivor via the SAME options_shadow.py engine as the EMA path (tagged
+    signal_source=momentum_research). The ONLY model cost is the read-only Haiku
+    option-quote lookup per survivor (unavoidable for a real-quote paper fill) — the
+    same kind of read the EMA shadow path already makes. Closes/marks are handled by
+    the shared process_options_shadow pass.
+
+    Fully isolated, READ-ONLY, never trades (real orders stay gated by
+    options.enabled=false). Screen runs at most once per scan_interval_hours (default
+    24h) — it keys off the morning research, which only changes daily. Caller wraps
+    this in try/except; it also guards internally and never places an order."""
+    strategy = load_strategy()
+    if not (options_shadow and momentum_screen and options_shadow.shadow_enabled(strategy)):
+        return
+    ocfg = options_shadow.shadow_cfg(strategy)
+    mcfg = ocfg.get("momentum", {}) or {}
+    if not mcfg.get("enabled"):
+        return
+    if not is_market_open():
+        return  # opening a shadow needs live option quotes
+
+    # Once-per-day gate (the research it reads only changes daily).
+    st = log.setdefault("_state", {})
+    since = _hours_since(st.get("last_momentum_scan_ts"))
+    if since is not None and since < mcfg.get("scan_interval_hours", 24):
+        return
+
+    # Catalyst names come FREE from the morning research — no paid catalyst call.
+    watch = momentum_options_watch()
+    if not watch:
+        print("  [momentum] no MOMENTUM OPTIONS WATCH names in latest research — "
+              "nothing to shadow (no paid catalyst fallback)")
+        # Still stamp so we don't re-parse every cycle; research is daily anyway.
+        st["last_momentum_scan_ts"] = now_iso()
+        save_trade_log(log)
+        return
+    st["last_momentum_scan_ts"] = now_iso()
+    save_trade_log(log)  # persist the stamp (cycle won't save again after this pass)
+
+    min_conf = mcfg.get("min_catalyst_confidence", 60)
+    # 1) FREE multi-timeframe momentum + affordability screen over the watch names.
+    candidates = {}
+    for sym, info in watch.items():
+        if info.get("confidence", 0) < min_conf:
+            continue
+        closes = fetch_daily_closes(sym)
+        if closes:
+            candidates[sym] = {"closes": closes, "last_price": closes[-1]}
+    evals = momentum_screen.screen(candidates, mcfg)
+    quals = momentum_screen.qualified(evals)
+    save_momentum_scan(evals)
+    if not quals:
+        print(f"  [momentum] {len(watch)} research watch names, none pass the "
+              "momentum/affordability screen this scan")
+        return
+    print(f"  [momentum] {len(quals)} qualify (research-vetted + momentum): "
+          f"{', '.join(e['symbol'] for e in quals[:8])}")
+
+    # 2) Paper-open survivors. Catalyst confidence/text reused from the research.
+    shadow_dir = os.path.join(ROOT, "shadow")
+    os.makedirs(shadow_dir, exist_ok=True)
+    path = os.path.join(shadow_dir, "options_shadow_log.json")
+    slog = options_shadow.load_shadow_log(path)
+    max_open = ocfg.get("max_open_shadows", 5)
+    max_cost = mcfg.get("max_contract_cost_usd")
+    account_value = float(log.get("summary", {}).get("current_value") or 0)
+    now = now_iso()
+    opened = 0
+    for ev in quals[: mcfg.get("top_n_open", 3)]:
+        sym = ev["symbol"]
+        if len(options_shadow.open_shadows(slog)) >= max_open:
+            break
+        if options_shadow.has_open_shadow(slog, sym):
+            continue
+        info = watch.get(sym, {})
+        contract = select_shadow_contract(sym, ev["last_price"], ocfg)
+        if not contract:
+            print(f"  [momentum] skip {sym}: no liquid ATM contract")
+            continue
+        ok, reason = options_shadow.validate_contract(contract, ev["last_price"], ocfg)
+        if not ok:
+            print(f"  [momentum] skip {sym}: contract failed gate ({reason})")
+            continue
+        cost = options_shadow.entry_premium(contract) * 100
+        if max_cost and cost > max_cost:
+            print(f"  [momentum] skip {sym}: contract ${cost:.0f} > "
+                  f"affordability cap ${max_cost:.0f} (unaffordable)")
+            continue
+        rec = options_shadow.open_shadow_record(
+            slog, underlying=sym, contract=contract, underlying_price=ev["last_price"],
+            account_value=account_value, cfg=ocfg, confidence=info.get("confidence"),
+            thesis=f"research catalyst: {info.get('catalyst', '')}", now_iso=now)
+        rec["signal_source"] = "momentum_research"
+        rec["momentum_score"] = ev["score"]
+        rec["momentum_returns"] = ev["returns"]
+        rec["catalyst"] = info.get("catalyst", "")
+        rec["research_confidence"] = info.get("confidence")
+        opened += 1
+        print(f"  [momentum] opened {rec['id']} {sym} call strike={rec['strike']} "
+              f"exp={rec['expiry']} entry_ask={rec['entry_premium']} "
+              f"cost=${cost:.0f} conf={info.get('confidence')} "
+              f"score={ev['score']} oversized={rec['oversized_for_account']}")
+
+    if opened:
+        options_shadow.save_shadow_log(path, slog)
+
+
+def _run_shadow_passes(raw_sigs, log):
+    """Phase B + B+ paper-options passes, bundled so they run on EVERY market-hours
+    cycle — including smart-skipped flat ones. This matters for the momentum edge:
+    cheap momentum names break out exactly when the EMA watchlist (and the index) is
+    flat and the equity model is skipped, so gating the scan behind the equity model
+    call would miss the very setups the operator is after. Both passes are isolated,
+    read-only, never trade, internally gated (momentum to a 24h scan interval), and
+    each is wrapped so a shadow failure can never crash the trading loop. Cheap when
+    the book is empty: with no open shadows and no qualifying signals neither pass
+    makes a model call."""
+    try:
+        process_options_shadow(raw_sigs, log)
+    except Exception as e:
+        print(f"  [shadow] options shadow pass failed: {e}")
+    try:
+        process_momentum_shadow(log)
+    except Exception as e:
+        print(f"  [momentum] momentum shadow pass failed: {e}")
+
+
 def process_cycle_state(log, actions, broker_positions, exit_info=None):
     """Phase 2 bookkeeping driven by the AUTHORITATIVE broker snapshot, not the
     model's self-report.
@@ -1611,6 +1945,20 @@ def _format_ema_sell_block(raw_sigs, log):
             )
     if not rows:
         return ""
+    exit_on_ribbon = (load_strategy().get("risk_management", {}) or {}).get(
+        "exit_on_ribbon_sell", True)
+    if not exit_on_ribbon:
+        # Let-winners-run config: the ribbon flip is ADVISORY. The engine's
+        # deterministic trailing/hard stops own the mechanical exit; do NOT
+        # reflexively dump on the SELL state (that cut winners early — measured).
+        return (
+            "ⓘ RIBBON IN SELL STATE on held positions (ADVISORY — the trailing stop "
+            "and hard stop govern the mechanical exit; the engine force-sells on a "
+            "trailing-stop breach):\n" + "\n".join(rows) + "\n"
+            "Do NOT sell merely because the ribbon flipped — let the trailing stop "
+            "work. Sell THIS cycle ONLY if the entry THESIS is broken (set type='sell' "
+            "and reason='thesis_break'); otherwise HOLD.\n\n"
+        )
     return (
         "⚠ SELL SIGNAL ACTIVE ON HELD POSITIONS — core ribbon rule: red(55) on "
         "top = downtrend = SELL:\n" + "\n".join(rows) + "\n"
@@ -1706,6 +2054,30 @@ def _risk_block_impl(raw_sigs, log, strategy):
             out.append(f"    {sec}: {d['pct']*100:.0f}% ({', '.join(d['names'])}){flag}")
     else:
         out.append("    (no open positions)")
+    # Leveraged-sleeve cap (#3) — the gap-risk rail for the leverage sleeve. Only
+    # surfaced when configured; absent => no change for older strategies/fixtures.
+    sleeve_cap = fl.get("leveraged_sleeve_max_pct")
+    if sleeve_cap is not None:
+        sl = leveraged_sleeve_exposure(mv_positions, strategy, total_equity=total_equity)
+        names = ", ".join(sl["names"]) or "none"
+        breach = sl["pct"] >= sleeve_cap
+        flag = "  <-- AT/OVER CAP: do NOT add leveraged exposure" if breach else ""
+        out.append(
+            f"  LEVERAGED SLEEVE CAP = {sleeve_cap*100:.0f}% of the account in >1x ETFs "
+            f"(NOTIONAL — the overnight-gap limit). Current: {sl['pct']*100:.0f}% ({names}){flag}.")
+        out.append(
+            "  A 3x ETF can gap 60%+ overnight and NO stop (trailing or hard) beats a gap — "
+            "this notional cap is the real defense. Never let total leveraged notional exceed it.")
+
+    # Concentration (#2) — fewer, higher-conviction names. Only when configured.
+    max_pos = ps.get("max_concurrent_positions")
+    if max_pos:
+        out.append(
+            f"  CONCENTRATION: hold at most {max_pos} names ({len(held)} open now). Deploy "
+            f"TOP-DOWN — fill the highest-confidence idea to its band ceiling before adding a "
+            f"lower-ranked one; do NOT dilute into marginal 60-74 names while a 90+ name still "
+            f"has capacity. If at the cap, only rotate (sell the weakest to fund a stronger).")
+
     out.append(
         "  Before ANY buy: confirm the new position keeps its sector <= the cap and "
         "<= max names/sector; if it would breach, size down or skip.")
@@ -1735,15 +2107,27 @@ def run_agent():
         for a in stop_loss_alerts:
             print(f"  [STOP-LOSS] {a['symbol']} down {a['loss_pct']}% — flagging for immediate sell")
 
-    # Hard forced-exit set (from pre-turn signals): stop-loss alerts + held names
-    # sitting in ribbon SELL state. stop_loss takes precedence over ema_exit.
-    # Computed up here so the error path below can warn about pending exits even
-    # when the model call itself fails (e.g. Claude session limit).
+    # Update each held position's high-water mark from this cycle's closes, then
+    # persist — the trailing stop trails a STALE high if peaks aren't bumped on every
+    # cycle that price made a new high (incl. ones that later skip). Cheap local write.
+    trail_prices = {s: v.get("last_close") for s, v in raw_sigs.items() if v.get("ok")}
+    if update_position_peaks(log, trail_prices):
+        save_trade_log(log)
+
+    # Hard forced-exit set (from pre-turn signals): stop-loss + trailing-stop breaches,
+    # plus — only when exit_on_ribbon_sell is true — held names sitting in ribbon SELL
+    # state. stop_loss takes precedence. Computed up here so the error path below can
+    # warn about pending exits even when the model call itself fails (e.g. session limit).
     held_syms = {p["symbol"] for p in log.get("open_positions", [])}
     must_sell = {a["symbol"]: "stop_loss" for a in stop_loss_alerts}
-    for sym, s in raw_sigs.items():
-        if sym in held_syms and s.get("ok") and s.get("state") == "SELL":
-            must_sell.setdefault(sym, "ema_exit")
+    for a in check_trailing_stop_alerts(log, prices=trail_prices):
+        must_sell.setdefault(a["symbol"], "trailing_stop")
+        print(f"  [TRAILING-STOP] {a['symbol']} -{a['giveback_pct']}% off peak "
+              f"{a['peak_price']} — flagging for immediate sell")
+    if (strategy.get("risk_management", {}) or {}).get("exit_on_ribbon_sell", True):
+        for sym, s in raw_sigs.items():
+            if sym in held_syms and s.get("ok") and s.get("state") == "SELL":
+                must_sell.setdefault(sym, "ema_exit")
 
     # SMART SKIP: if every signal is NEUTRAL/HOLD and no stop-loss → no model call needed.
     # Research and midweek phases always run (they do web research, not just signal checks).
@@ -1751,7 +2135,10 @@ def run_agent():
         skip, skip_reason = should_skip_model_call(raw_sigs, log)
         if skip:
             stamp = datetime.now(ET).strftime("%Y-%m-%d_%H%M")
-            print(f"[{stamp}] task={task} SKIPPED ({skip_reason}) — 0 tokens used.")
+            print(f"[{stamp}] task={task} SKIPPED ({skip_reason}) — 0 equity tokens used.")
+            # Still run the paper-options passes: the momentum edge fires on exactly
+            # these flat-index cycles, and they no-op cheaply when nothing qualifies.
+            _run_shadow_passes(raw_sigs, log)
             return
 
     # For market-hours execution checks, strip data the model doesn't need:
@@ -1778,6 +2165,19 @@ def run_agent():
         if midweek:
             research_context += f"\nLATEST MIDWEEK REVIEW (hold/cut/redeploy verdicts; act on any flagged cuts):\n{midweek}\n"
 
+    _rm = strategy.get("risk_management", {}) or {}
+    _stop_pct = _rm.get("stop_loss_pct", DEFAULT_STOP_LOSS_PCT)
+    _trail_pct = trailing_stop_pct(strategy)
+    if _trail_pct > 0 and not _rm.get("exit_on_ribbon_sell", True):
+        _exit_rule = (
+            f"HELD positions are exited by the engine's deterministic stops — the hard "
+            f"{_stop_pct*100:.0f}% stop and the {_trail_pct*100:.0f}% trailing stop off the "
+            f"post-entry peak — NOT by the ribbon flip (let winners run). A ribbon SELL on a "
+            f"held name is ADVISORY: sell early only if the THESIS is broken.")
+    else:
+        _exit_rule = (
+            "for a HELD position the SELL state itself triggers the sell — never wait for "
+            "an EXIT transition, the cross may have passed on an earlier bar.")
     system = f"""{load_file('skills/skill_0_orchestrator.md')}
 
 CURRENT SKILL ACTIVE:
@@ -1796,10 +2196,9 @@ EXECUTION RULES:
 - Trade ONLY in Robinhood account {ACCOUNT_NUMBER} (the Agentic cash account).
   Never use the default margin account.
 - T+1 settlement: read SETTLED cash before any buy; never deploy unsettled funds.
-- Ribbon signal (TEMA 13/21/55 + EMA 8 — matches the operator's chart):
+- Ribbon signal (plain EMA 8/13/21/55 — matches the operator's chart):
   red(55) lowest = BUY, red(55) highest = SELL. ENTER_LONG transition triggers
-  buys; for a HELD position the SELL state itself triggers the sell — never
-  wait for an EXIT transition, the cross may have passed on an earlier bar.
+  buys; {_exit_rule}
 - Honor blackout windows + min_confidence_to_trade. Real scoreboard = beat SPY;
   100% monthly is the stretch ceiling, not a reason to oversize risk."""
 
@@ -1974,13 +2373,10 @@ EXECUTION RULES:
     except Exception as e:
         print(f"  [skill_5] rewrite queue processing failed: {e}")
 
-    # Phase B: shadow (paper) options pass — isolated, read-only, never trades. Fully
-    # wrapped so a shadow failure can never crash the trading loop (same contract as
-    # the rewrite queue above).
-    try:
-        process_options_shadow(raw_sigs, log)
-    except Exception as e:
-        print(f"  [shadow] options shadow pass failed: {e}")
+    # Phase B + B+: shadow (paper) options passes — isolated, read-only, never trade.
+    # Same bundle the smart-skip path runs, so paper trading behaves identically
+    # whether or not the equity model was called this cycle.
+    _run_shadow_passes(raw_sigs, log)
 
     print(f"[{stamp}] task={task} done.")
 

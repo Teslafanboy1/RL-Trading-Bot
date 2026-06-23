@@ -81,6 +81,10 @@ leverage-adjusted stop, and count them at their leverage toward the sector cap.
 **Energy / commodities**
 XOM, CVX, OXY, FANG, SLB, FCX, GOLD
 
+**Cheap-momentum options-sleeve universe (price < $30 — scan for the MOMENTUM OPTIONS WATCH output only)**
+SOFI, PLUG, RIOT, MARA, F, NIO, LCID, RIVN, AMC, CHPT, RUN, PATH, DKNG, IONQ, RKLB, ACHR, JOBY, BBAI, SOUN, LUNR, GME, WBD, SNAP, PTON, CCL, VALE, GOLD, KGC, UEC, CIFR, WULF, BTBT, HUT
+— These are checked **only** to feed the paper-options momentum sleeve (see Output → MOMENTUM OPTIONS WATCH). Validating their catalyst here — inside the one daily research pass — is what lets the options shadow run with **no extra model calls**. A name here qualifies for the WATCH list only if it shows real multi-timeframe momentum (up meaningfully over 1w/1m/6m) **and** you can name a durable catalyst. Do **not** add them to the equity `### #N` picks unless they independently pass the full equity scoring above.
+
 ### B. Dynamic MCP scan (always run alongside A)
 1. Call `get_popular_lists` — pull the top-movers, most-watched, and trending lists.
 2. Call `search` for terms like "momentum", "breakout", "52-week high" to surface
@@ -147,8 +151,23 @@ AMD, AMAT and the NVDA/AVGO/MU/SMCI picks were all one leveraged SOX bet):
   sector. If the ranked list is top-heavy in one sector, cap it and deploy the rest into the next
   sector down — or hold cash. A book diversified across factors beats five correlated semis.
 
-Work top-down through the ranked list: assign each position its risk-based size, **check the sector
-cap before committing**, deduct from the pool, and stop when the pool is exhausted, the reserve is
+**Concentrate — `position_sizing.max_concurrent_positions` (currently 5):** hold **at most 5 names**.
+Deploy **top-down**: fill the highest-confidence idea to its risk-based size before funding the next.
+Do **not** dilute into marginal 60–74 names while a 90+ name still has capacity under the per-name and
+sector caps. If 5 names are already strong, stop — concentration into conviction is the point. This is
+deliberately higher-variance than a wide book; the per-name (30%), sector (40%), and cash-reserve (10%)
+caps are what keep it survivable.
+
+**Capped leverage sleeve — `factor_exposure_limits.leveraged_sleeve_max_pct` (currently 25%):** total
+**NOTIONAL** in >1x daily-reset ETFs (TQQQ/SOXL/FNGU/…) must stay **≤ 25% of the account**. Measured at
+notional (not leverage-adjusted) so a 60% sleeve crash costs ~15% of the account, not the account. A 3x
+ETF can gap 60%+ overnight and **no stop beats a gap** — this cap is the only real defense, so never
+exceed it even if a leveraged name scores highest. LR002 (÷leverage sizing, tighter stop, ≤2-day signal
+staleness, −10 confidence) still applies on top.
+
+Work top-down through the ranked list: assign each position its risk-based size, **check the sector cap,
+the ≤5-name concentration limit, AND the ≤25% leveraged-sleeve cap before committing**, deduct from the
+pool, and stop when the pool is exhausted, the reserve is
 reached, or all candidates are sized. Existing positions at/below their risk-based size need no new
 capital; those above it or breaching a sector cap get a trim order.
 
@@ -196,6 +215,24 @@ Under each pick heading include:
 - Symbols that passed EMA but missed the move threshold or confidence floor
 - Symbols in blackout (with the earnings/Fed date)
 - Approaching-crossover names with the trigger level to watch
+
+### MOMENTUM OPTIONS WATCH
+The cheap-momentum names (price < $30, from the options-sleeve universe + any cheap dynamic-scan movers) that show **real multi-timeframe momentum AND a durable catalyst** — these feed the paper-options momentum sleeve. The agent parses this block verbatim, so the format is a **hard contract**: this exact `## MOMENTUM OPTIONS WATCH` heading, then ONE line per name:
+
+`- SYMBOL | conf XX | catalyst: <one line on WHY it is moving and whether it can continue>`
+
+- `conf XX` is your 0–100 confidence the move is real and durable (the same scoring rigor as an equity pick — it IS the catalyst validation the options sleeve relies on). Only list names you'd score ≥ 60.
+- `catalyst:` must name a concrete, durable reason (earnings/guidance beat, FDA/contract win, sector tailwind, catalyst-backed squeeze). If the move is an unexplained or pure-meme pump, **do not list it** — an unexplained spike is a reject.
+- List 0–6 names, best first. If none qualify, write the heading followed by `- (none this week)`.
+- These are SEPARATE from the equity `### #N` picks and do **not** trigger equity buys; they only tell the paper-options engine which cheap momentum names already have a vetted catalyst, so it spends no extra tokens re-researching them.
+
+Example:
+```
+## MOMENTUM OPTIONS WATCH
+- CIFR | conf 88 | catalyst: crypto miner expanding into AI-datacenter leasing; signed HPC hosting deal, sector tailwind intact
+- WULF | conf 72 | catalyst: TeraWulf AI/HPC hosting contract ramp; powered-datacenter scarcity bid
+- (none else this week)
+```
 
 ### Deployment summary
 - Trim/exit actions: "Trimming BTSG by $X (from 28% → 20% band), freeing $X"

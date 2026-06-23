@@ -475,6 +475,146 @@ class TestStopLossAlerts(TmpDirMixin):
         self.assertEqual(alerts[0]["symbol"], "A")
 
 
+class TestTrailingStop(TmpDirMixin):
+    """Trailing-stop ('let winners run') exit: peak tracking, giveback trigger,
+    correct reason tagging, and the exit_on_ribbon_sell gate."""
+
+    def _pos(self, symbol="TEST", entry=100.0, peak=None, shares=1.0, pos_id="T0001"):
+        p = self._open_pos(symbol, entry, shares, pos_id)
+        if peak is not None:
+            p["peak_price"] = peak
+        return p
+
+    def _enable(self, trail=0.25, exit_on_ribbon=False):
+        self.strategy["risk_management"]["trailing_stop_pct"] = trail
+        self.strategy["risk_management"]["exit_on_ribbon_sell"] = exit_on_ribbon
+        self._flush_strategy()
+
+    # ── update_position_peaks ────────────────────────────────────────────────
+    def test_peak_seeds_from_entry_and_ignores_lower(self):
+        log = {"open_positions": [self._pos(entry=100.0)], "_state": {}}
+        agent_module.update_position_peaks(log, {"TEST": 95.0})  # below entry
+        self.assertEqual(log["open_positions"][0]["peak_price"], 100.0)
+
+    def test_peak_climbs_on_new_high(self):
+        log = {"open_positions": [self._pos(entry=100.0, peak=100.0)], "_state": {}}
+        changed = agent_module.update_position_peaks(log, {"TEST": 130.0})
+        self.assertTrue(changed)
+        self.assertEqual(log["open_positions"][0]["peak_price"], 130.0)
+
+    def test_peak_holds_on_pullback(self):
+        log = {"open_positions": [self._pos(entry=100.0, peak=130.0)], "_state": {}}
+        changed = agent_module.update_position_peaks(log, {"TEST": 120.0})
+        self.assertFalse(changed)
+        self.assertEqual(log["open_positions"][0]["peak_price"], 130.0)
+
+    def test_peak_ignores_missing_price(self):
+        log = {"open_positions": [self._pos(entry=100.0, peak=130.0)], "_state": {}}
+        agent_module.update_position_peaks(log, {})
+        self.assertEqual(log["open_positions"][0]["peak_price"], 130.0)
+
+    # ── check_trailing_stop_alerts ───────────────────────────────────────────
+    def test_inert_when_pct_absent(self):
+        # fixture strategy has no trailing_stop_pct → trailing disabled entirely
+        log = {"open_positions": [self._pos(entry=100.0, peak=200.0)], "_state": {}}
+        self.assertEqual(
+            agent_module.check_trailing_stop_alerts(log, prices={"TEST": 100.0}), [])
+
+    def test_trigger_at_threshold(self):
+        self._enable(0.25)
+        log = {"open_positions": [self._pos(entry=100.0, peak=200.0)], "_state": {}}
+        none = agent_module.check_trailing_stop_alerts(log, prices={"TEST": 150.5})
+        hit = agent_module.check_trailing_stop_alerts(log, prices={"TEST": 150.0})
+        self.assertEqual(none, [])
+        self.assertEqual(len(hit), 1)
+        self.assertEqual(hit[0]["symbol"], "TEST")
+        self.assertAlmostEqual(hit[0]["peak_price"], 200.0)
+        self.assertAlmostEqual(hit[0]["threshold_price"], 150.0, places=2)
+        self.assertAlmostEqual(hit[0]["giveback_pct"], 25.0, places=1)
+
+    def test_measured_off_peak_not_entry(self):
+        # -20% from entry but -60% off the 200 peak → trailing fires on the peak
+        self._enable(0.25)
+        log = {"open_positions": [self._pos(entry=100.0, peak=200.0)], "_state": {}}
+        hit = agent_module.check_trailing_stop_alerts(log, prices={"TEST": 80.0})
+        self.assertEqual(len(hit), 1)
+
+    def test_peak_defaults_to_entry_when_missing(self):
+        self._enable(0.25)
+        log = {"open_positions": [self._pos(entry=100.0)], "_state": {}}  # no peak stored
+        hit = agent_module.check_trailing_stop_alerts(log, prices={"TEST": 74.0})
+        self.assertEqual(len(hit), 1)
+
+    # ── reason must NOT be mis-tagged as a hard stop-loss ────────────────────
+    def test_trailing_close_not_tagged_stop_loss(self):
+        import copy
+        log = copy.deepcopy(self._DEFAULT_LOG)
+        log["open_positions"] = [self._pos(symbol="TEST", entry=100.0)]
+        with patch.object(agent_module, "run_post_trade_pipeline"):
+            agent_module.process_cycle_state(
+                log, actions=[], broker_positions=[],
+                exit_info={"TEST": {"reason": "trailing_stop", "price": 150.0}})
+        self.assertEqual(len(log["trades"]), 1)
+        self.assertFalse(log["trades"][0]["stop_loss"])     # NOT a stop-loss
+        self.assertEqual(log["trades"][0]["outcome"], "WIN")  # 150 > 100 entry
+
+    # ── should_skip_model_call wiring ────────────────────────────────────────
+    def test_trailing_forces_non_skip(self):
+        self._enable(0.25)
+        log = {"open_positions": [self._pos(entry=100.0, peak=200.0)], "_state": {}}
+        raw = {"TEST": {"ok": True, "state": "BUY", "transition": "NO_ACTION",
+                        "last_close": 150.0}}
+        with patch.object(agent_module, "check_stop_loss_alerts", return_value=[]):
+            skip, reason = agent_module.should_skip_model_call(raw, log)
+        self.assertFalse(skip)
+        self.assertEqual(reason, "trailing_stop_alert")
+
+    def test_ribbon_sell_wake_gated_by_flag(self):
+        recent = agent_module.now_iso()
+        raw = {"CLOV": {"ok": True, "state": "SELL", "transition": "NO_ACTION",
+                        "last_close": 100.0}}
+
+        def mk():
+            return {"open_positions": [self._pos("CLOV", entry=100.0, peak=100.0)],
+                    "_state": {"last_execution_call_ts": recent}}
+        with patch.object(agent_module, "check_stop_loss_alerts", return_value=[]), \
+             patch.object(agent_module, "weekend_pick_symbols", return_value=[]):
+            self._enable(0.25, exit_on_ribbon=True)
+            skip_true, reason_true = agent_module.should_skip_model_call(raw, mk())
+            self._enable(0.25, exit_on_ribbon=False)
+            skip_false, _ = agent_module.should_skip_model_call(raw, mk())
+        self.assertFalse(skip_true)
+        self.assertEqual(reason_true, "ema_sell_held:CLOV")
+        self.assertTrue(skip_false)  # ribbon SELL is advisory now → no wake
+
+    # ── _format_ema_sell_block respects the flag ─────────────────────────────
+    def _sell_sig(self):
+        return {"ok": True, "state": "SELL", "last_close": 90.0,
+                "lines": {"red": 95, "blue": 90, "green": 91, "yellow": 92}}
+
+    def test_ema_sell_block_advisory_when_flag_false(self):
+        self._enable(0.25, exit_on_ribbon=False)
+        log = {"open_positions": [self._pos("CLOV", entry=100.0)]}
+        block = agent_module._format_ema_sell_block({"CLOV": self._sell_sig()}, log)
+        self.assertIn("ADVISORY", block)
+        self.assertIn("thesis_break", block)
+        self.assertNotIn("reason='ema_exit'", block)
+
+    def test_ema_sell_block_forced_when_flag_true(self):
+        self._enable(0.25, exit_on_ribbon=True)
+        log = {"open_positions": [self._pos("CLOV", entry=100.0)]}
+        block = agent_module._format_ema_sell_block({"CLOV": self._sell_sig()}, log)
+        self.assertIn("reason='ema_exit'", block)
+
+    # ── record_open_position seeds the high-water mark ───────────────────────
+    def test_record_open_seeds_peak(self):
+        import copy
+        log = copy.deepcopy(self._DEFAULT_LOG)
+        agent_module.record_open_position(
+            log, {"symbol": "NVDA", "price": 120.0, "shares": 1})
+        self.assertEqual(log["open_positions"][0]["peak_price"], 120.0)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # SECTION 5b — Risk model (Phase A): sizing, leverage stop, factor exposure
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -557,6 +697,47 @@ class TestRiskModel(TmpDirMixin):
         exp = agent_module.sector_exposure(book, s, total_equity=100.0)
         self.assertEqual(exp["_total_equity"], 100.0)
         self.assertAlmostEqual(exp["semis_ai_hardware"]["pct"], 0.20, places=4)
+
+    # ── leveraged_sleeve_exposure (#3) ───────────────────────────────────────
+    def test_leveraged_sleeve_exposure(self):
+        """Sleeve % is NOTIONAL (not leverage-adjusted): $25 SOXL of a $100 account = 25%."""
+        s = self._strat()
+        book = [{"symbol": "SOXL", "market_value": 25.0},
+                {"symbol": "AMD", "market_value": 75.0}]
+        sl = agent_module.leveraged_sleeve_exposure(book, s, total_equity=100.0)
+        self.assertAlmostEqual(sl["pct"], 0.25, places=4)
+        self.assertAlmostEqual(sl["notional"], 25.0)
+        self.assertEqual(sl["names"], ["SOXL"])
+
+    def test_leveraged_sleeve_exposure_none(self):
+        s = self._strat()
+        sl = agent_module.leveraged_sleeve_exposure(
+            [{"symbol": "AMD", "market_value": 50.0}], s, total_equity=100.0)
+        self.assertEqual(sl["pct"], 0.0)
+        self.assertEqual(sl["names"], [])
+
+    # ── risk block surfaces the #2/#3 caps only when configured ──────────────
+    def test_risk_block_shows_sleeve_and_concentration(self):
+        self.strategy["factor_exposure_limits"]["leveraged_sleeve_max_pct"] = 0.25
+        self.strategy["position_sizing"]["max_concurrent_positions"] = 5
+        s = self._strat()
+        log = {"open_positions": [self._open_pos("SOXL", 100.0, shares=0.25)],  # $25 mv
+               "summary": {"current_value": 100.0}}
+        raw = {"SOXL": {"ok": True, "state": "BUY", "last_close": 100.0}}
+        block = agent_module._format_risk_block(raw, log, s)
+        self.assertIn("LEVERAGED SLEEVE CAP = 25%", block)
+        self.assertIn("AT/OVER CAP", block)            # 25% notional hits the 25% cap
+        self.assertIn("CONCENTRATION", block)
+        self.assertIn("at most 5 names", block)
+
+    def test_risk_block_omits_caps_when_unset(self):
+        s = self._strat()  # fixture has neither key
+        log = {"open_positions": [self._open_pos("AMD", 100.0, shares=0.2)],
+               "summary": {"current_value": 100.0}}
+        raw = {"AMD": {"ok": True, "state": "BUY", "last_close": 100.0}}
+        block = agent_module._format_risk_block(raw, log, s)
+        self.assertNotIn("LEVERAGED SLEEVE CAP", block)
+        self.assertNotIn("CONCENTRATION", block)
 
     # ── check_stop_loss_alerts integration: leveraged stop is honored ────────
     def test_stop_loss_honors_leveraged_stop(self):
@@ -717,6 +898,291 @@ class TestOptionsShadow(unittest.TestCase):
         self.assertTrue(osh.shadow_enabled({"options": {"shadow_mode": True}}))
         self.assertFalse(osh.shadow_enabled({"options": {"shadow_mode": False}}))
         self.assertFalse(osh.shadow_enabled({}))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 5d — Phase B+ momentum screener (the operator's real edge)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+import momentum_screen as msc
+
+
+def _leader_closes():
+    """Synthetic multi-timeframe momentum leader: a 6mo grind (~+40%) then a hot
+    final month (~+35%, last week ~+8%). Qualifies under the default gate."""
+    closes = [5.0] * 8
+    closes += [5.0 * (1 + 0.0028) ** i for i in range(1, 127)]   # ~6mo grind
+    base = closes[-1]
+    closes += [base * (1 + 0.0145) ** i for i in range(1, 22)]   # hot final month
+    return closes
+
+
+def _grinder_closes():
+    """Steady +0.3%/bar — strong 1y but only ~+6.5%/month, fails the 1m anchor."""
+    return [10.0 * (1 + 0.003) ** i for i in range(260)]
+
+
+class TestMomentumScreen(unittest.TestCase):
+    CFG = {
+        "targets": {"1w": 0.15, "1m": 0.30, "6m": 0.50, "1y": 1.00},
+        "weights": {"1w": 0.20, "1m": 0.35, "6m": 0.25, "1y": 0.20},
+        "anchor_timeframe": "1m", "min_score": 55,
+        "require_all_positive": True, "positive_timeframes": ["1w", "1m", "6m"],
+        "max_underlying_price": 30.0,
+    }
+
+    def test_period_return_basic(self):
+        closes = [10.0] * 30 + [13.0]  # +30% over 1 bar back is wrong; use lookback
+        self.assertAlmostEqual(msc.period_return([10, 11, 12, 13], 3), 0.30, places=6)
+
+    def test_period_return_too_short(self):
+        self.assertIsNone(msc.period_return([10, 11], 5))
+
+    def test_period_return_bad_price(self):
+        self.assertIsNone(msc.period_return([0.0, 0.0, 5.0], 2))
+
+    def test_multi_timeframe_returns_keys(self):
+        r = msc.multi_timeframe_returns(_leader_closes())
+        self.assertEqual(set(r), {"1w", "1m", "6m", "1y"})
+        self.assertGreater(r["1m"], 0.30)          # hot month
+        self.assertIsNone(r["1y"])                 # <252 bars -> unknown, not 0
+
+    def test_score_strong_beats_weak(self):
+        strong = msc.momentum_score(msc.multi_timeframe_returns(_leader_closes()))
+        weak = msc.momentum_score(msc.multi_timeframe_returns(_grinder_closes()))
+        self.assertGreater(strong, weak)
+        self.assertGreater(strong, 55)
+
+    def test_score_renormalizes_on_missing_timeframe(self):
+        # only the 1m present -> score still computed on that weight alone
+        r = {"1w": None, "1m": 0.30, "6m": None, "1y": None}
+        self.assertGreater(msc.momentum_score(r), 0)
+
+    def test_gate_accepts_leader(self):
+        ok, reason = msc.passes_gate(msc.multi_timeframe_returns(_leader_closes()), self.CFG)
+        self.assertTrue(ok, reason)
+
+    def test_gate_rejects_anchor_below_target(self):
+        ok, reason = msc.passes_gate(msc.multi_timeframe_returns(_grinder_closes()), self.CFG)
+        self.assertFalse(ok)
+        self.assertIn("anchor_below_target", reason)
+
+    def test_gate_rejects_negative_timeframe(self):
+        r = {"1w": -0.05, "1m": 0.40, "6m": 0.60, "1y": 1.2}  # anchor ok but 1w red
+        ok, reason = msc.passes_gate(r, self.CFG)
+        self.assertFalse(ok)
+        self.assertIn("negative_timeframe", reason)
+
+    def test_affordable_gate(self):
+        ok, _ = msc.affordable_underlying(12.0, self.CFG)
+        self.assertTrue(ok)
+        ok2, reason = msc.affordable_underlying(500.0, self.CFG)
+        self.assertFalse(ok2)
+        self.assertIn("too_pricey", reason)
+
+    def test_evaluate_qualified_leader(self):
+        closes = _leader_closes()
+        ev = msc.evaluate("WIN", closes, closes[-1], self.CFG)
+        self.assertTrue(ev["qualified"], ev["reason"])
+        self.assertEqual(ev["reason"], "ok")
+
+    def test_evaluate_pricey_leader_rejected(self):
+        closes = _leader_closes()
+        ev = msc.evaluate("WIN", closes, 500.0, self.CFG)  # qualifies on momentum, too pricey
+        self.assertFalse(ev["qualified"])
+        self.assertIn("too_pricey", ev["reason"])
+
+    def test_screen_ranks_and_filters(self):
+        cands = {
+            "WIN": {"closes": _leader_closes(), "last_price": _leader_closes()[-1]},
+            "GRIND": {"closes": _grinder_closes(), "last_price": _grinder_closes()[-1]},
+        }
+        evals = msc.screen(cands, self.CFG)
+        self.assertEqual(evals[0]["symbol"], "WIN")          # highest score first
+        quals = msc.qualified(evals)
+        self.assertEqual([e["symbol"] for e in quals], ["WIN"])
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 5e — Phase B+ momentum→shadow agent wiring
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestMomentumShadowWiring(TmpDirMixin):
+    def _strategy_with_momentum(self, **overrides):
+        mom = {
+            "enabled": True,
+            "targets": {"1w": 0.15, "1m": 0.30, "6m": 0.50, "1y": 1.00},
+            "weights": {"1w": 0.20, "1m": 0.35, "6m": 0.25, "1y": 0.20},
+            "anchor_timeframe": "1m", "min_score": 55,
+            "require_all_positive": True, "positive_timeframes": ["1w", "1m", "6m"],
+            "max_underlying_price": 30.0, "max_contract_cost_usd": 50.0,
+            "top_n_open": 3, "min_catalyst_confidence": 60,
+            "scan_interval_hours": 24, "universe": ["WIN", "GRIND"],
+        }
+        mom.update(overrides)
+        self.strategy["options"] = {
+            "shadow_mode": True, "enabled": False,
+            "max_open_shadows": 5, "max_opens_per_cycle": 1,
+            "risk": {"max_loss_per_trade_pct": 0.02, "options_sleeve_max_pct": 0.15},
+            "selection": {"structure_v1": "long_call", "target_dte_min": 30,
+                          "target_dte_max": 45, "max_bid_ask_pct_of_mid": 0.10},
+            "shadow_exit": {"underlying_sell_state": True, "premium_stop_pct": 0.50,
+                            "min_dte_close": 7},
+            "momentum": mom,
+        }
+        self._flush_strategy()
+
+    def _contract(self, ask=0.40, strike=10.0):
+        # 30-45 DTE from 2026-06-22 -> 2026-07-24 is 32 DTE; tight spread (<10% of mid)
+        return {"type": "call", "strike": strike, "expiry": "2026-07-24",
+                "bid": round(ask - 0.02, 2), "ask": ask, "underlying_price": strike}
+
+    def _shadow_log(self):
+        path = os.path.join(self.tmpdir, "shadow", "options_shadow_log.json")
+        with open(path) as f:
+            return json.load(f)
+
+    def test_disabled_returns_early(self):
+        self._strategy_with_momentum(enabled=False)
+        log = {"summary": {"current_value": 100.0}, "_state": {}}
+        with patch.object(agent_module, "is_market_open", return_value=True):
+            agent_module.process_momentum_shadow(log)
+        self.assertFalse(os.path.exists(
+            os.path.join(self.tmpdir, "shadow", "options_shadow_log.json")))
+
+    def test_time_gate_suppresses_rescan(self):
+        self._strategy_with_momentum()
+        log = {"summary": {"current_value": 100.0},
+               "_state": {"last_momentum_scan_ts": agent_module.now_iso()}}
+        called = []
+        with patch.object(agent_module, "is_market_open", return_value=True), \
+             patch.object(agent_module, "momentum_options_watch",
+                          side_effect=lambda: called.append("watch") or {}):
+            agent_module.process_momentum_shadow(log)
+        self.assertEqual(called, [])  # never reached the research read
+
+    def test_no_watch_names_opens_nothing(self):
+        # The reuse-research design has NO paid catalyst fallback: empty watch -> nothing.
+        self._strategy_with_momentum()
+        log = {"summary": {"current_value": 1000.0}, "_state": {}}
+        with patch.object(agent_module, "is_market_open", return_value=True), \
+             patch.object(agent_module, "momentum_options_watch", return_value={}), \
+             patch.object(agent_module, "fetch_daily_closes") as fc, \
+             patch.object(agent_module, "select_shadow_contract") as sel:
+            agent_module.process_momentum_shadow(log)
+        fc.assert_not_called()
+        sel.assert_not_called()
+        self.assertIn("last_momentum_scan_ts", log["_state"])  # still stamped
+
+    def test_full_flow_opens_momentum_shadow(self):
+        self._strategy_with_momentum()
+        leader = _leader_closes()
+
+        def fake_closes(sym):
+            return leader if sym == "WIN" else _grinder_closes()
+
+        log = {"summary": {"current_value": 1000.0}, "_state": {}}
+        with patch.object(agent_module, "is_market_open", return_value=True), \
+             patch.object(agent_module, "momentum_options_watch",
+                          return_value={"WIN": {"confidence": 82, "catalyst": "earnings beat+raised"},
+                                        "GRIND": {"confidence": 70, "catalyst": "steady"}}), \
+             patch.object(agent_module, "fetch_daily_closes", side_effect=fake_closes), \
+             patch.object(agent_module, "select_shadow_contract",
+                          return_value=self._contract(ask=0.40, strike=round(leader[-1]))):
+            agent_module.process_momentum_shadow(log)
+
+        slog = self._shadow_log()
+        opened = [p for p in slog["positions"] if p["underlying"] == "WIN"]
+        self.assertEqual(len(opened), 1)
+        rec = opened[0]
+        self.assertEqual(rec["signal_source"], "momentum_research")
+        self.assertEqual(rec["research_confidence"], 82)
+        self.assertIn("earnings", rec["catalyst"])
+        self.assertIn("momentum_score", rec)
+        # GRIND is research-vetted but fails the momentum screen -> no shadow
+        self.assertFalse(any(p["underlying"] == "GRIND" for p in slog["positions"]))
+        self.assertIn("last_momentum_scan_ts", log["_state"])
+
+    def test_low_research_confidence_skipped(self):
+        # A watch name below min_catalyst_confidence is never even screened.
+        self._strategy_with_momentum(min_catalyst_confidence=60)
+        leader = _leader_closes()
+        log = {"summary": {"current_value": 1000.0}, "_state": {}}
+        with patch.object(agent_module, "is_market_open", return_value=True), \
+             patch.object(agent_module, "momentum_options_watch",
+                          return_value={"WIN": {"confidence": 45, "catalyst": "weak meme"}}), \
+             patch.object(agent_module, "fetch_daily_closes",
+                          side_effect=lambda s: leader) as fc, \
+             patch.object(agent_module, "select_shadow_contract") as sel:
+            agent_module.process_momentum_shadow(log)
+        fc.assert_not_called()   # below conf floor -> not screened
+        sel.assert_not_called()
+
+    def test_affordability_cost_gate_skips_expensive_contract(self):
+        self._strategy_with_momentum(max_contract_cost_usd=50.0)
+        leader = _leader_closes()
+        log = {"summary": {"current_value": 1000.0}, "_state": {}}
+        with patch.object(agent_module, "is_market_open", return_value=True), \
+             patch.object(agent_module, "momentum_options_watch",
+                          return_value={"WIN": {"confidence": 90, "catalyst": "big contract win"}}), \
+             patch.object(agent_module, "fetch_daily_closes",
+                          side_effect=lambda s: leader if s == "WIN" else []), \
+             patch.object(agent_module, "select_shadow_contract",
+                          return_value=self._contract(ask=1.20, strike=round(leader[-1]))):
+            # ask 1.20 -> $120/contract > $50 cap
+            agent_module.process_momentum_shadow(log)
+        path = os.path.join(self.tmpdir, "shadow", "options_shadow_log.json")
+        if os.path.exists(path):
+            self.assertFalse(any(p["underlying"] == "WIN" for p in self._shadow_log()["positions"]))
+
+    def test_process_momentum_shadow_makes_no_model_call(self):
+        # The whole point of the reuse-research design: zero extra run_model calls.
+        self._strategy_with_momentum()
+        leader = _leader_closes()
+        log = {"summary": {"current_value": 1000.0}, "_state": {}}
+        with patch.object(agent_module, "is_market_open", return_value=True), \
+             patch.object(agent_module, "momentum_options_watch",
+                          return_value={"WIN": {"confidence": 80, "catalyst": "ok"}}), \
+             patch.object(agent_module, "fetch_daily_closes", side_effect=lambda s: leader), \
+             patch.object(agent_module, "select_shadow_contract",
+                          return_value=self._contract(strike=round(leader[-1]))), \
+             patch.object(agent_module, "run_model") as rm:
+            agent_module.process_momentum_shadow(log)
+        rm.assert_not_called()  # select_shadow_contract is mocked; no other model call
+
+    def test_momentum_options_watch_parses_research_block(self):
+        sample = (
+            "### #1 — NVDA | Confidence: 80/100\nequity pick\n\n"
+            "## MOMENTUM OPTIONS WATCH\n"
+            "- CIFR | conf 88 | catalyst: AI-datacenter pivot, sector tailwind\n"
+            "- AMC | confidence: 45 | catalyst: meme squeeze, no backing\n\n"
+            "## DEPLOYMENT SUMMARY\nblah\n")
+        with patch.object(agent_module, "load_latest_research_file", return_value=sample):
+            w = agent_module.momentum_options_watch()
+        self.assertEqual(set(w), {"CIFR", "AMC"})       # equity NVDA pick excluded
+        self.assertEqual(w["CIFR"]["confidence"], 88)
+        self.assertIn("datacenter", w["CIFR"]["catalyst"])
+
+    def test_momentum_options_watch_missing_block(self):
+        with patch.object(agent_module, "load_latest_research_file",
+                          return_value="### #1 — NVDA | Confidence: 80/100\n"):
+            self.assertEqual(agent_module.momentum_options_watch(), {})
+
+    def test_run_shadow_passes_invokes_both(self):
+        log = {"summary": {"current_value": 100.0}, "_state": {}}
+        with patch.object(agent_module, "process_options_shadow") as opt, \
+             patch.object(agent_module, "process_momentum_shadow") as mom:
+            agent_module._run_shadow_passes({"SPY": {}}, log)
+        opt.assert_called_once()
+        mom.assert_called_once()
+
+    def test_run_shadow_passes_swallows_failures(self):
+        log = {"summary": {}, "_state": {}}
+        with patch.object(agent_module, "process_options_shadow",
+                          side_effect=RuntimeError("boom")), \
+             patch.object(agent_module, "process_momentum_shadow",
+                          side_effect=RuntimeError("boom2")):
+            agent_module._run_shadow_passes({}, log)  # must not raise
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

@@ -89,6 +89,14 @@ intraweek redeploy alike.
   buy that would push its sector over the cap, or add a 3rd name to a full sector, is sized
   down or skipped — do NOT rebuild the all-semis book that the SOXL/AMD/AMAT cluster and the
   TEMA liquidation both punished.
+- **Respect the concentration limit (`max_concurrent_positions`, currently 5).** The RISK MODEL
+  block shows how many names are open. At the cap, do NOT add a new name — only **rotate** (the
+  new idea must beat the weakest holding enough to justify selling it). Below the cap, still
+  prefer filling the highest-confidence idea to its size before opening a marginal one.
+- **Respect the leveraged-sleeve cap (`leveraged_sleeve_max_pct`, currently 25% NOTIONAL).** The
+  RISK MODEL block shows current leveraged notional vs the cap. A buy that would push total >1x-ETF
+  notional over 25% of the account is sized down or skipped — a 3x ETF can gap 60%+ overnight and
+  no stop (trailing or hard) beats a gap, so this cap is the only real defense. Never breach it.
 - If all clear → execute the buy via the Robinhood MCP at the risk-based size, recording the
   confidence score, thesis, and sources.
 - If invalidated -> skip and log the reason.
@@ -113,25 +121,36 @@ For **each open position**:
    - If the thesis-breaking event has occurred → score drops to 0 → **sell immediately**
    - If sentiment has significantly shifted (e.g., analyst downgrade, key source turned bearish) → re-score; if now below 60 → **sell immediately**
    - If no material change → hold, no action needed
-3. **Ribbon check**: the ribbon is four plain EMAs — EMA 8/13/21/55 (matches the
-   operator's chart; its "TEMA"-labeled indicator is actually plain `ema()`). If the
-   signal block shows **SELL state** for a held symbol — red(55)
-   on top of all three other lines — **sell immediately**, even if the transition
-   column reads NO_ACTION (the cross may have happened on an earlier bar).
-4. If selling: execute via Robinhood MCP at market, set `reason="thesis_broken"` or
-   `reason="ema_exit"` in `actions_taken` so the learning loop fires correctly.
+3. **Ribbon check (ADVISORY under let-winners-run)**: the ribbon is four plain EMAs
+   — EMA 8/13/21/55 (matches the operator's chart; its "TEMA"-labeled indicator is
+   actually plain `ema()`). With `risk_management.exit_on_ribbon_sell=false` (current
+   config), a held symbol flipping to **SELL state** is **NOT** an automatic sell — the
+   mechanical exit is owned by the engine's deterministic **trailing stop** (25% off the
+   post-entry peak) and the hard stop. Do **not** reflexively dump on a ribbon flip; that
+   cut winners early (measured: the strategy lost to buy-and-hold on 23/29 names). Treat a
+   ribbon SELL as a prompt to scrutinize the thesis, not as the sell trigger itself.
+4. If selling because the **thesis is broken** (not merely the ribbon): execute via
+   Robinhood MCP at market and set `reason="thesis_break"` in `actions_taken`. You do NOT
+   need to place trailing-stop or hard-stop exits — the engine fires those itself via
+   `force_sell` and will re-fire until the broker confirms the position is gone.
 
 Do **not** skip this section on "forced_news_check" cycles — that is exactly when
 it is most important. A forced check fires every `NEWS_CHECK_HOURS` (default 4h)
 specifically to run this section on days when the EMA never triggers.
 
-## SELL
-- Sell immediately when the 55 (red) crosses above ALL of 8/13/21 and becomes the
-  HIGHEST line. Execute the sell via the Robinhood MCP at that moment.
-- A held position whose signal reads **SELL state** is a sell NOW, regardless of
-  transition — never wait for a fresh EXIT edge that already passed.
-- Also sell immediately if the thesis integrity check above flags a thesis-breaking
-  event or confidence decay below 60.
+## SELL (let-winners-run exit policy)
+The mechanical exits are owned by the engine, **not** by you, and fire deterministically
+every cycle via `force_sell` (you never need to place them):
+- **Hard stop** — position ≤ 10% below entry (tighter for leveraged ETFs). `reason="stop_loss"`.
+- **Trailing stop** — position gives back ≥ 25% from its post-entry high-water mark
+  (`peak_price`). This is the PRIMARY momentum exit: it lets winners run through the
+  ribbon's noise and only exits on a real pullback from the high. `reason="trailing_stop"`.
+
+Your only discretionary sell is a **broken thesis**:
+- Sell immediately if the thesis integrity check flags a thesis-breaking event or
+  confidence decay below 60 → `reason="thesis_break"`.
+- A ribbon **SELL state** alone is **advisory** (see thesis check step 3) — do not sell on
+  it unless the thesis is actually broken; the trailing stop handles the mechanical exit.
 - After a sell, cash is unsettled for T+1 — note when it frees up.
 
 ## After every executed trade
