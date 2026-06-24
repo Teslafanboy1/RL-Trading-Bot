@@ -2420,43 +2420,56 @@ def main():
 
         print("What would you like to do?")
         print("  r — run research now and exit")
-        print(f"  w — wait until {research_time:%H:%M} ET ({opens:%A}) for pre-market research, then trade")
+        print(f"  w — wait until {research_time:%H:%M} ET ({opens:%A}) for pre-market research, then trade all week")
         choice = input("\nYour choice (r/w): ").strip().lower()
 
         if choice == "r":
             print("Running research now...\n")
             run_agent()
             return
-        else:
-            # Sleep until 30 min before open, run research, then sleep the final 30 min
-            wait_secs = max(0, (research_time - datetime.now(ET)).total_seconds())
+        # w (or anything else): fall through — the daily loop below handles it
+
+    # Daily loop: research at 9:20 → trade → close → repeat. Runs until Ctrl-C.
+    while True:
+        # If market is closed (startup w-path or just closed), sleep until pre-market research.
+        if not is_market_open():
+            opens = next_market_open()
+            research_time = opens - timedelta(minutes=10)
+            now = datetime.now(ET)
+            wait_secs = max(0, (research_time - now).total_seconds())
             if wait_secs > 0:
-                print(f"\nWaiting until {research_time:%A %Y-%m-%d at %H:%M} ET for pre-market research. (Ctrl-C to cancel)")
+                print(
+                    f"\nWaiting until {research_time:%A %Y-%m-%d at %H:%M} ET "
+                    f"for pre-market research. (Ctrl-C to stop)"
+                )
                 time.sleep(wait_secs)
             print("Running pre-market research...\n")
             run_agent()
+            opens = next_market_open()
             wait_secs = max(0, (opens - datetime.now(ET)).total_seconds())
             if wait_secs > 0:
-                print(f"Research done. Waiting until {opens:%H:%M} ET for market open. (Ctrl-C to cancel)")
+                print(
+                    f"Research done. Waiting until {opens:%H:%M} ET "
+                    f"for market open. (Ctrl-C to cancel)"
+                )
                 time.sleep(wait_secs)
             print("Market is now open. Starting trading loop...\n")
 
-    schedule.every(POLL_MINUTES).minutes.do(run_agent)
-    run_agent()
-    while True:
-        if not is_market_open():
-            # Do NOT run an end-of-day research cycle here. At close this routed to
-            # the research skill (Opus, ~$2.10) whose output was then DISCARDED:
-            # persist_phase_output() refuses to clobber the morning's picks file,
-            # so it only ever produced an unsaved_*.md + a warning. Tomorrow's picks
-            # come from the pre-market research run (the `w` startup path), so this
-            # run bought nothing but ~$44/mo of wasted Opus calls. Just stop.
-            print("Market just closed. Stopping for the day. (No end-of-day research "
-                  "run — its output was always discarded; tomorrow's picks come from "
-                  "the pre-market research cycle.)")
-            return
-        schedule.run_pending()
-        time.sleep(1)
+        # Intraday trading loop — clear any stale schedule jobs from the prior day.
+        schedule.clear()
+        schedule.every(POLL_MINUTES).minutes.do(run_agent)
+        run_agent()
+        while True:
+            if not is_market_open():
+                opens = next_market_open()
+                print(
+                    f"Market just closed. Will run pre-market research at "
+                    f"{(opens - timedelta(minutes=10)):%H:%M} ET on "
+                    f"{opens:%A %Y-%m-%d}. (Ctrl-C to stop)"
+                )
+                break
+            schedule.run_pending()
+            time.sleep(1)
 
 
 if __name__ == "__main__":

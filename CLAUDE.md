@@ -46,16 +46,21 @@ SIGNAL_INTERVAL=1d python3 signals.py SPY    # daily-chart mode
 8. After reconciliation, if any hard forced exit is **still held at the broker** (both the main turn and `force_sell` failed to fill), a `WARNING` is printed, `notify_operator()` fires an **out-of-band alert** (see `ALERT_WEBHOOK_URL`), and the alert re-fires next cycle — manual sell may be required. The same out-of-band alert fires from the model-failure early-return path when `claude -p` is unavailable (session/usage limit) while a forced exit is pending. `notify_operator()` is a direct stdlib HTTP POST — it deliberately does **not** route through `claude -p` (that's exactly what's down in the session-limit case) and never raises (an alerting failure can't break the trading loop).
 9. **Strategy-rewrite processing (Phase 3, `process_strategy_rewrite_queue`).** At the very end of the cycle — after `process_cycle_state()` and all broker reconciliation — the first un-`[DONE]` entry in `research/strategy_rewrite_queue.md` is handed to skill_5, and its output text is parsed and applied by Python (see [Strategy rewrite processing](#strategy-rewrite-processing-process_strategy_rewrite_queue)). At most one entry per cycle, fully wrapped in try/except so a rewrite failure can never crash the trading loop.
 
-#### Startup behaviour when market is closed
+#### Startup behaviour and daily loop
 
-When `bash run.sh` is invoked while the market is closed (any day, including weekends),
-the agent prompts `r` or `w`:
-- **`r`** — run research now and exit.
-- **`w`** — wait until **9:20 AM ET** on the next trading day, run pre-market research
-  (`skill_1_research.md`, `claude-opus-4-8`), then sleep the remaining 10 minutes and
-  start the trading loop at 9:30 AM ET. The picks file produced by research is
-  automatically loaded into every execution cycle, so the trading loop acts on the
-  picks immediately at open.
+`bash run.sh` runs continuously until Ctrl-C — it does **not** exit at market close.
+Instead it loops: research at 9:20 AM ET → trade 9:30–16:00 ET → sleep overnight →
+research next morning → trade → repeat. This means fresh picks are generated **every
+trading day** at 9:20 AM ET, not just on weekends. Start it once and it runs all week.
+
+When invoked while the market is **closed**, it prompts `r` or `w`:
+- **`r`** — run research now and exit (one-shot, no trading loop).
+- **`w`** (default) — enter the daily loop: wait until **9:20 AM ET**, run pre-market
+  research (`skill_1_research.md`, `claude-opus-4-8`), sleep the remaining 10 minutes,
+  start the trading loop at 9:30 AM ET, then repeat daily until Ctrl-C.
+
+When invoked while the market is **open**, it enters the intraday trading loop
+immediately using the latest `weekend_picks_*.md` as today's picks.
 
 #### Smart skip trigger conditions (`should_skip_model_call`)
 

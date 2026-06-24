@@ -55,9 +55,10 @@ Sort by confidence score descending. The top N positions by confidence score sho
 
 ## Candidate universe
 
-Scan BOTH sources to build the candidate pool:
+Scan BOTH sources to build the candidate pool. The scanner (Section B) sweeps the
+entire US equity universe — Section A is the anchor set you always check regardless.
 
-### A. Static high-beta universe (always scan these)
+### A. Static anchor universe (always scan these)
 Check the EMA signal for every ticker in these groups via `signals.py` or Robinhood MCP quotes:
 
 **Semiconductors / AI hardware**
@@ -69,8 +70,26 @@ META, MSFT, GOOGL, PLTR, SNOW, NET, DDOG, CRWD, MDB, GTLB, AI, BBAI, SOUN
 **High-beta tech / fintech / crypto-adjacent**
 TSLA, COIN, HOOD, MSTR, RBLX, SOFI, UPST, AFRM, SQ, PYPL
 
-**Biotech / high-volatility**
-MRNA, NVAX, ACMR, EDIT, CRSP, RXRX, ARKG (ETF)
+**Healthcare / pharma / biotech**
+LLY, ABBV, REGN, ISRG, DXCM, HIMS, VKTX, MRNA, NVAX, ACMR, EDIT, CRSP, RXRX, ARKG
+
+**Financials / payments**
+JPM, GS, V, MA, AXP, NU, APP
+
+**Consumer / e-commerce**
+AMZN, SHOP, MELI, SE, CPNG
+
+**Defense / aerospace / industrial**
+LMT, RTX, GE, BA, AXON, HEI
+
+**International ADRs (US-listed, high-beta)**
+ASML, BIDU, BABA, SE, MELI, NU
+
+**Energy / commodities**
+XOM, CVX, OXY, FANG, SLB, FCX, GOLD
+
+**Sector ETFs (liquid, EMA-friendly — treat as any other pick; no LR002 penalty)**
+XLK, XLF, XLE, XLV, XBI, ARKK, GLD, SLV
 
 **Leveraged ETFs (use only if EMA signal is strong AND confidence ≥ 85)**
 TQQQ, SOXL, FNGU
@@ -78,20 +97,53 @@ TQQQ, SOXL, FNGU
 stale-momentum entries — size by the leverage haircut (÷ leverage) with the tighter
 leverage-adjusted stop, and count them at their leverage toward the sector cap.
 
-**Energy / commodities**
-XOM, CVX, OXY, FANG, SLB, FCX, GOLD
-
 **Cheap-momentum options-sleeve universe (price < $30 — scan for the MOMENTUM OPTIONS WATCH output only)**
 SOFI, PLUG, RIOT, MARA, F, NIO, LCID, RIVN, AMC, CHPT, RUN, PATH, DKNG, IONQ, RKLB, ACHR, JOBY, BBAI, SOUN, LUNR, GME, WBD, SNAP, PTON, CCL, VALE, GOLD, KGC, UEC, CIFR, WULF, BTBT, HUT
 — These are checked **only** to feed the paper-options momentum sleeve (see Output → MOMENTUM OPTIONS WATCH). Validating their catalyst here — inside the one daily research pass — is what lets the options shadow run with **no extra model calls**. A name here qualifies for the WATCH list only if it shows real multi-timeframe momentum (up meaningfully over 1w/1m/6m) **and** you can name a durable catalyst. Do **not** add them to the equity `### #N` picks unless they independently pass the full equity scoring above.
 
-### B. Dynamic MCP scan (always run alongside A)
-1. Call `get_popular_lists` — pull the top-movers, most-watched, and trending lists.
-2. Call `search` for terms like "momentum", "breakout", "52-week high" to surface
-   names not on the static list.
-3. Call `get_watchlists` and `get_watchlist_items` to include any symbols you've
-   previously flagged.
-4. Add any new names from B to the candidate pool before scoring.
+### B. Dynamic MCP scan — sweep the full US equity universe (always run alongside A)
+
+These three scanner calls together cover the entire US market. Run all three; merge
+the resulting tickers into the candidate pool before scoring. Any name that surfaces
+here AND passes the EMA gate is a valid candidate regardless of whether it is in
+Section A.
+
+**1. Daily gainers preset** — top movers across all US equities today:
+```
+create_scan(preset="DAILY_GAINERS")   # then run_scan(scan_id=...)
+```
+Take the top 20 tickers by % gain. These are the names the whole market is watching.
+
+**2. Multi-day momentum scan** — sustained breakouts, not just one-day pops:
+```
+create_scan(
+  preset="INITIAL",
+  title="Multi-day momentum",
+  filters=[
+    {"filter_type": "FILTER_TYPE_PERCENT_CHANGE", "predicate": "PREDICATE_GREATER_THAN",
+     "values": ["5"], "interval": "5d", "plot": "close"},
+    {"filter_type": "FILTER_TYPE_VOLUME", "predicate": "PREDICATE_GREATER_THAN",
+     "values": ["500000"], "interval": "1d"}
+  ]
+)
+```
+Take the top 20 by 5-day % change. This catches names that have been building for days.
+
+**3. High options volume scan** — unusual institutional positioning:
+```
+create_scan(preset="HIGH_OPTIONS_VOLUME_IV")   # then run_scan(scan_id=...)
+```
+Take the top 15 by options volume. Unusual options activity is an early signal before
+price moves; it also identifies names with liquid enough contracts for the options sleeve.
+
+**4. Trending / watchlist sweep:**
+- Call `get_popular_watchlists` — pull Robinhood's curated trending, most-watched, and
+  sector-rotation lists. Add any ticker not already in the pool.
+- Call `get_watchlists` + `get_watchlist_items` to include any symbols previously flagged.
+
+**Merge and de-dupe:** combine all scanner results + Section A into one flat list. Run
+the EMA gate (Step 1 below) on every ticker in the merged list. Only EMA-qualified
+names advance to Step 2+.
 
 ## Evaluation pipeline (run for every candidate)
 

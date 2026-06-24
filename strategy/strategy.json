@@ -1,7 +1,7 @@
 {
-  "version": 22,
+  "version": 23,
   "goal": "100% monthly portfolio return",
-  "last_updated": "2026-06-22",
+  "last_updated": "2026-06-24",
   "account": {
     "type": "true_cash",
     "settlement": "T+1",
@@ -80,11 +80,12 @@
   },
   "progress_tracking": {
     "monthly_goal": "100%",
-    "month_start_value": 100.17,
-    "current_value": 102.2787,
-    "current_return": "2.1%",
+    "month_start_value": 254.745,
+    "current_value": 256.8537,
+    "current_return": "0.8%",
     "on_track": false,
     "required_weekly_return": 95.88,
+    "_rebase_note": "2026-06-24: operator added ~$154.57 of new capital (account $102.28 -> broker total $256.85). month_start_value rebased UP by the deposit (100.17 -> 254.745) so the deposit is NOT counted as a trading gain and so the risk-based sizing denominator (agent.py reads summary.current_value = month_start_value + total_pnl) sees the full account. Without this rebase the sizing layer would keep trading against the stale ~$102 base and leave the new ~$150 idle. current_value = 254.745 + total_pnl(2.1087) = 256.8537 ~= broker total. required_weekly_return is stale and will be recomputed next cycle by update_monthly_progress; it is INFORMATIONAL only.",
     "_note": "2026-06-22 (Phase A): goal reframed - see goal_framing. 100%/mo is an aspirational ceiling; the operating mandate is risk-adjusted compounding under position_sizing + factor_exposure_limits. required_weekly_return is INFORMATIONAL, not a sizing input - never raise per-trade risk to chase it."
   },
   "risk_management": {
@@ -663,6 +664,13 @@
       "date": "2026-06-22",
       "timestamp": "2026-06-22T22:30:00-05:00",
       "change": "v22 (operator-directed): add options.momentum block — multi-timeframe momentum screener (momentum_screen.py) as a SECOND shadow signal source, matching the operator's real edge (cheap stocks up ~15%/wk, ~30%/mo, ~50%/6mo, ~100%/yr WITH a validated catalyst) rather than the EMA ribbon. Paper-only via the existing shadow_mode gate + options_shadow.py engine; real orders stay hard-gated (enabled=false) until the account clears activation (long_calls_min_account_usd=1000). KEY DESIGN (operator constraint: do not double token usage): the catalyst is REUSED from the single daily skill_1 research pass via its new '## MOMENTUM OPTIONS WATCH' block (agent.py:momentum_options_watch) — NO separate paid catalyst web-search call. process_momentum_shadow layers the FREE deterministic momentum + affordability screen on those research-vetted cheap names and paper-opens calls on survivors (signal_source=momentum_research); only cost is the read-only Haiku option-quote lookup the EMA shadow path already makes. Cheap-stock gates: max_underlying_price=30, max_contract_cost_usd=50 (sized for the $1000 go-live; oversized below that is recorded). skill_1 gains a cheap-momentum scan group + the WATCH output contract. No live-trading change.",
+      "trade_ids": []
+    },
+    {
+      "version": 23,
+      "date": "2026-06-24",
+      "timestamp": "2026-06-24T00:00:00-04:00",
+      "change": "v23 (operator-directed): capital-base rebase after a new deposit. Operator added ~$154.57 (account $102.28 -> broker total $256.85, of which $202.72 is settled cash). progress_tracking.month_start_value rebased UP by the deposit amount (100.17 -> 254.745) so (a) the deposit is NOT misread as a trading gain and (b) the risk-based sizing/sector denominator, which agent.py derives as summary.current_value = month_start_value + total_pnl, now reflects the full ~$257 account instead of the stale ~$102. WITHOUT this rebase the sizing layer (agent.py:2008 _risk_block_impl, position_size_pct, sector_exposure) would keep sizing against ~$102 and leave the new ~$150 permanently idle. current_value -> 256.8537 (254.745 + total_pnl 2.1087); trade_log.json summary updated to match. NO risk-parameter change: risk_per_trade (0.02), band ceilings, max_single_position (0.30), factor caps (40%/sector, 25% leveraged sleeve), trailing/hard stops all unchanged - per goal_framing the larger base deploys the SAME disciplined process at larger dollar size, not more aggression. Options remain DORMANT (account $257 << $1000 activation; shadow record still empty -> both go-live gates unmet).",
       "trade_ids": []
     }
   ]
