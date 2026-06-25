@@ -1558,7 +1558,20 @@ class TestPersistPhaseOutput(TmpDirMixin):
         # the persisted file must round-trip through weekend_pick_symbols()
         self.assertEqual(agent_module.weekend_pick_symbols(), ["NVDA"])
 
-    def test_research_without_picks_not_persisted(self):
+    def test_research_no_picks_marker_persisted_and_clears_watchlist(self):
+        # A legit risk-off "no qualifying picks" run carries the machine-readable
+        # marker and MUST be saved — otherwise execution inherits the prior day's
+        # stale watchlist (the 2026-06-19 NVDA/AVGO bug).
+        text = ("## Pre-market prep\n\n## RANKED PICKS: NONE\n"
+                "SPY in ribbon SELL; entire high-beta universe reads SELL.\n")
+        fname = agent_module.persist_phase_output("research_and_prep", text)
+        self.assertEqual(fname, f"weekend_picks_{self._today()}.md")
+        # zero `### #N` headings → fresh EMPTY watchlist, not a days-old one
+        self.assertEqual(agent_module.weekend_pick_symbols(), [])
+
+    def test_research_without_picks_or_marker_not_persisted(self):
+        # genuinely malformed/prose output (no picks AND no marker) is still dropped
+        # so run_agent's loud unsaved_*.md + WARNING fallback fires
         self.assertIsNone(agent_module.persist_phase_output("research_and_prep",
                                                             "No qualified candidates today."))
 
@@ -1713,13 +1726,36 @@ class TestRecordOpenPosition(TmpDirMixin):
         self.assertEqual(pos["confidence_score"], 85)
         self.assertEqual(pos["thesis"], "GPU demand")
 
-    def test_duplicate_buy_ignored(self):
-        log = {"open_positions": [self._open_pos("NVDA")],
+    def test_scale_into_winner_blends(self):
+        # Adding to an already-held name is a real scale-in, not a no-op: blend the
+        # cost basis, sum the shares, keep the higher peak so the stop/trailing/P&L
+        # machinery stays in sync with the broker.
+        pos = self._open_pos("NVDA", entry=100.0, shares=1.0)
+        pos["peak_price"] = 120.0
+        log = {"open_positions": [pos],
                "_state": {"next_id": 2}, "summary": {}, "trades": []}
-        action = {"type": "buy", "symbol": "NVDA", "price": 510.0, "shares": 0.1}
+        action = {"type": "buy", "symbol": "NVDA", "price": 150.0, "shares": 1.0,
+                  "confidence": 88}
         agent_module.record_open_position(log, action)
-        self.assertEqual(len(log["open_positions"]), 1)
-        self.assertAlmostEqual(log["open_positions"][0]["entry_price"], 100.0)
+        self.assertEqual(len(log["open_positions"]), 1)  # still one position
+        p = log["open_positions"][0]
+        self.assertAlmostEqual(p["entry_price"], 125.0)        # blended avg cost
+        self.assertAlmostEqual(p["shares"], 2.0)               # summed
+        self.assertAlmostEqual(p["dollar_amount"], 250.0)      # blended * shares
+        self.assertAlmostEqual(p["peak_price"], 150.0)         # raised to the add
+        self.assertEqual(p["confidence_score"], 88)            # latest conviction
+        self.assertEqual(p["id"], "T0001")                     # same trade id
+        self.assertEqual(len(p["scaled_in"]), 1)               # add is audited
+
+    def test_scale_in_keeps_existing_peak_when_adding_below_it(self):
+        pos = self._open_pos("CAT", entry=900.0, shares=1.0)
+        pos["peak_price"] = 1020.0
+        log = {"open_positions": [pos], "_state": {"next_id": 2},
+               "summary": {}, "trades": []}
+        action = {"type": "buy", "symbol": "CAT", "price": 1000.0, "shares": 1.0}
+        agent_module.record_open_position(log, action)
+        # adding at 1000 < peak 1020 must NOT lower the high-water mark
+        self.assertAlmostEqual(log["open_positions"][0]["peak_price"], 1020.0)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

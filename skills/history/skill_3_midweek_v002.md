@@ -52,10 +52,7 @@ For each position, compare **current weight** to its new **band maximum**:
 - `current_weight > band_maximum` → over-weighted → recommend trim to band maximum
 - `band_maximum` dropped due to confidence decay → recommend trim to new band maximum
 - `TRIM_TO_ZERO` or `SELL_SIGNAL` → full exit
-- `current_weight ≤ band_maximum` and confidence ≥ 60 → HOLD; **and if the name is in BUY/HOLD
-  ribbon state, is in the green, and sits BELOW its band ceiling while settled cash exceeds the
-  reserve → flag `SCALE_UP $X`** to top it up toward the ceiling (`scale_into_winners`). Topping up a
-  confirmed winner is preferred to leaving cash idle. Never scale up a SELL-state or losing name.
+- `current_weight ≤ band_maximum` and confidence ≥ 60 → HOLD, no action
 
 ## Step 4 — Free capital and rank
 
@@ -75,10 +72,7 @@ fund a stronger); do not dilute into marginal names.
 Execute all decisions in this order:
 1. **EMA EXITs and TRIM_TO_ZERO positions first** — sell via `place_equity_order` at market
 2. **Over-weighted trims** — sell the excess shares to bring position to band maximum
-3. **`SCALE_UP` top-ups** — for each held BUY/HOLD-state winner flagged `SCALE_UP` in Step 3, buy the
-   dollar difference toward its band ceiling via `place_equity_order` (settled cash, all caps apply).
-   Deploy idle cash into confirmed winners BEFORE concluding "hold dry powder."
-4. **Redeploy freed capital** into the top-ranked unowned candidate if:
+3. **Redeploy freed capital** into the top-ranked unowned candidate if:
    - EMA signal is BUY/HOLD
    - Confidence ≥ 75 (no weak redeployments)
    - Cash will be settled before the buy (T+1 check)

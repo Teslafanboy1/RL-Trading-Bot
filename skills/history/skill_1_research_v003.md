@@ -255,21 +255,6 @@ format, **the picks are silently dropped, the file is never saved, and execution
 runs on a stale day-old picks file.** Every pick gets its own `### #N — SYMBOL`
 heading — no exceptions, including pre-market prep runs with only a handful of picks.
 
-**If — and only if — ZERO candidates clear the EMA gate + 60 confidence floor**
-(a genuine risk-off tape, not laziness), you MUST still declare it machine-readably
-by writing this EXACT line as its own heading in place of the pick headings:
-
-`## RANKED PICKS: NONE`
-
-then one sentence on why (e.g. "SPY in ribbon SELL; entire high-beta universe reads
-SELL — holding cash is the correct action"). This is a hard contract: the agent saves
-the day's research file on EITHER `### #N` picks OR this marker. Without the marker, a
-no-pick run is dropped and execution silently runs on the PRIOR day's stale picks file
-(which may list names that have since flipped to SELL — the exact 2026-06-19 NVDA/AVGO
-bug). "No qualifying picks" is a valid, must-be-recorded outcome — never write it as
-bare prose. (You still scale into existing BUY-state winners — see the open-position
-reassessment; "no NEW picks" does not mean "deploy nothing".)
-
 Under each pick heading include:
 - Confidence score (0–100), EMA state (ENTER_LONG / HOLD / APPROACHING)
 - 5-day % range, recent momentum direction

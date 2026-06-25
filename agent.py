@@ -851,10 +851,40 @@ def research_metadata_for(symbol):
 
 def record_open_position(log, action):
     """Record entry metadata when the model BUYS (needed so a future close has
-    entry price/confidence/sources/thesis)."""
+    entry price/confidence/sources/thesis).
+
+    Scaling INTO an already-held name (the let-the-winners-run "scale into
+    winners" path) is a real add, not a no-op: we blend the cost basis, sum the
+    shares, and keep the higher peak so the deterministic stop-loss / trailing /
+    P&L machinery (which all read entry_price, shares, peak_price from the trade
+    log) stays in sync with the broker. Treating an add as "already tracked" and
+    returning — the old behavior — left the log pinned to the original tranche,
+    so a 0.0167-share CAT topped up to 4x size still reported the original cost,
+    stop, and P&L. The hard stop after a blend is -10% of the BLENDED avg cost,
+    which is the correct reference for an averaged-up position."""
     symbol = action["symbol"]
-    if any(p["symbol"] == symbol for p in log["open_positions"]):
-        return  # already tracked
+    add_price = float(action.get("price") or 0)
+    add_shares = float(action.get("shares") or 0)
+    existing = next((p for p in log["open_positions"] if p["symbol"] == symbol), None)
+    if existing is not None:
+        old_shares = float(existing.get("shares") or 0)
+        old_entry = float(existing.get("entry_price") or 0)
+        new_shares = old_shares + add_shares
+        if new_shares > 0 and add_shares > 0:
+            blended = (old_shares * old_entry + add_shares * add_price) / new_shares
+            existing["entry_price"] = round(blended, 4)
+            existing["shares"] = new_shares
+            existing["dollar_amount"] = round(blended * new_shares, 2)
+            # never lower the trailing-stop high-water mark; raise it if we added
+            # at a fresh high so a later giveback is measured from the true peak
+            existing["peak_price"] = max(float(existing.get("peak_price") or 0),
+                                         add_price, blended)
+            # latest conviction wins if the add carried a (re-scored) confidence
+            if action.get("confidence"):
+                existing["confidence_score"] = action["confidence"]
+            existing.setdefault("scaled_in", []).append(
+                {"date": now_iso(), "price": add_price, "shares": add_shares})
+        return
     meta = research_metadata_for(symbol)
     log["open_positions"].append({
         "id": generate_trade_id(log),
@@ -1430,8 +1460,19 @@ def persist_phase_output(task, text):
     today = datetime.now(ET).strftime("%Y-%m-%d")
     if task == "midweek_validation":
         fname = f"midweek_review_{today}.md"
-    elif task == "research_and_prep" and re.search(r"^###\s+#\d+\s+—\s+\w+", text, re.M):
-        # only persist research output that actually contains ranked picks
+    elif task == "research_and_prep" and (
+        re.search(r"^###\s+#\d+\s+—\s+\w+", text, re.M)
+        or re.search(r"^##\s+RANKED PICKS:\s*NONE\b", text, re.M)
+    ):
+        # Persist research that either contains ranked picks OR explicitly declares
+        # no qualifying picks (the `## RANKED PICKS: NONE` marker skill_1 emits in a
+        # risk-off tape). The no-pick case MUST still be saved: otherwise the day's
+        # research is dropped and execution silently inherits the prior day's
+        # weekend_picks_*.md — a stale watchlist that can list names which have since
+        # flipped to SELL (the 2026-06-19 NVDA/AVGO bug). Saving an empty-picks file
+        # makes weekend_pick_symbols() return the *current* (possibly empty) watchlist
+        # instead of a days-old one. Genuinely malformed output (no picks AND no
+        # marker) still falls through to the unsaved_*.md + WARNING path in run_agent.
         fname = f"weekend_picks_{today}.md"
     else:
         return None

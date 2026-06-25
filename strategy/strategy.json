@@ -1,7 +1,7 @@
 {
-  "version": 23,
+  "version": 24,
   "goal": "100% monthly portfolio return",
-  "last_updated": "2026-06-24",
+  "last_updated": "2026-06-25",
   "account": {
     "type": "true_cash",
     "settlement": "T+1",
@@ -70,7 +70,7 @@
     "90_to_100_confidence": 0.3,
     "75_to_89_confidence": 0.2,
     "60_to_74_confidence": 0.15,
-    "cash_reserve": 0.1,
+    "cash_reserve": 0.05,
     "max_single_position": 0.3,
     "_superseded_by": "position_sizing (v18) - risk-based sizing replaces the flat % bands; these percents now act only as per-confidence CEILINGS via position_sizing.band_ceilings"
   },
@@ -97,7 +97,9 @@
     "trailing_stop_pct": 0.25,
     "trailing_stop_note": "Let-winners-run exit: a HELD position that gives back >=25% from its post-entry high-water mark (peak_price) is force-sold (reason=trailing_stop), independent of the ribbon. This is the PRIMARY momentum exit (see exit_on_ribbon_sell). Tracked in agent.py:update_position_peaks() + check_trailing_stop_alerts(); fires via the same deterministic force_sell() path as the hard stop, every cycle. NOTE: a 15-min poller cannot beat an overnight gap - position sizing (esp. the leveraged-sleeve cap) is the real gap defense. Inert if absent/<=0.",
     "exit_on_ribbon_sell": false,
-    "exit_on_ribbon_sell_note": "false (current): the trailing stop + hard stop govern the mechanical exit; a ribbon SELL-state flip on a held name is ADVISORY only (skill_2 may still exit a BROKEN THESIS, reason=thesis_break). This is what 'let winners run' requires - the old ribbon-SELL forced exit cut winners early (measured: strategy lost to buy&hold on 23/29 names). Set true to restore the prior always-sell-on-SELL-state behavior. Gated in agent.py must_sell + should_skip_model_call + _format_ema_sell_block."
+    "exit_on_ribbon_sell_note": "false (current): the trailing stop + hard stop govern the mechanical exit; a ribbon SELL-state flip on a held name is ADVISORY only (skill_2 may still exit a BROKEN THESIS, reason=thesis_break). This is what 'let winners run' requires - the old ribbon-SELL forced exit cut winners early (measured: strategy lost to buy&hold on 23/29 names). Set true to restore the prior always-sell-on-SELL-state behavior. Gated in agent.py must_sell + should_skip_model_call + _format_ema_sell_block.",
+    "scale_into_winners": true,
+    "scale_into_winners_note": "true (2026-06-25, operator-directed): when settled cash exceeds the cash_reserve, a held position in confirmed BUY/HOLD ribbon state and in the green that sits BELOW its band ceiling is TOPPED UP toward the ceiling (buy the weight difference) BEFORE any new-name buy or holding cash. Enforced as a directive in skill_2 (Before every BUY) + skill_3 (Step 3/Step 5 SCALE_UP). record_open_position() blends cost basis + sums shares + keeps the higher peak on an add so the stop/trailing/P&L machinery stays in sync with the broker. NEVER average down into a SELL-state or losing name (the SOXL/AMD knife-catch failure mode) \u2014 only BUY/HOLD winners qualify. The new-name entry gate (fresh ribbon BUY + conf>=60 + factor/sector caps) is UNCHANGED; this only puts idle cash to work in names already proven, it does NOT relax knife-catch protection."
   },
   "learned_rules": [
     {
@@ -286,11 +288,11 @@
     "band_ceilings": {
       "90_to_100": 0.3,
       "75_to_89": 0.2,
-      "60_to_74": 0.15,
+      "60_to_74": 0.2,
       "below_60": 0.0
     },
     "max_single_position": 0.3,
-    "cash_reserve": 0.1,
+    "cash_reserve": 0.05,
     "min_trade_usd": 1.0,
     "max_concurrent_positions": 5,
     "max_concurrent_positions_note": "Concentration (#2): hold at most 5 names. Research/execution deploy TOP-DOWN \u2014 fill the highest-confidence idea to its band ceiling before adding a lower-ranked one; do not dilute into marginal 60-74 names while a 90+ name has capacity. At the cap, only rotate (sell the weakest to fund a stronger). Surfaced deterministically in agent.py:_risk_block_impl; enforced as a directive in skill_1/skill_2/skill_3. The 30%/name cap + 10% cash reserve still bind."
@@ -457,19 +459,19 @@
     "max_open_shadows": 5,
     "max_opens_per_cycle": 1,
     "momentum": {
-      "_note": "Multi-timeframe momentum screen (momentum_screen.py) — the operator's actual edge, NOT the EMA ribbon. ZERO extra model tokens: the CATALYST (why a cheap name is moving) is REUSED from the one daily skill_1 research pass via its '## MOMENTUM OPTIONS WATCH' block (agent.py:momentum_options_watch), NOT a separate paid web-search call. This pass layers the FREE deterministic 1w/1m/6m/1y momentum + affordability screen on those research-vetted names and paper-trades a call on each survivor. Paper-only (shadow_mode gate); feeds the same options_shadow.py engine as the EMA path, tagged signal_source=momentum_research. min_catalyst_confidence gates on the research's confidence; top_n_open caps opens/scan; universe is only a hint for skill_1's scan list. Tune targets/thresholds here.",
+      "_note": "Multi-timeframe momentum screen (momentum_screen.py) \u2014 the operator's actual edge, NOT the EMA ribbon. ZERO extra model tokens: the CATALYST (why a cheap name is moving) is REUSED from the one daily skill_1 research pass via its '## MOMENTUM OPTIONS WATCH' block (agent.py:momentum_options_watch), NOT a separate paid web-search call. This pass layers the FREE deterministic 1w/1m/6m/1y momentum + affordability screen on those research-vetted names and paper-trades a call on each survivor. Paper-only (shadow_mode gate); feeds the same options_shadow.py engine as the EMA path, tagged signal_source=momentum_research. min_catalyst_confidence gates on the research's confidence; top_n_open caps opens/scan; universe is only a hint for skill_1's scan list. Tune targets/thresholds here.",
       "enabled": true,
       "targets": {
         "1w": 0.15,
-        "1m": 0.30,
-        "6m": 0.50,
-        "1y": 1.00
+        "1m": 0.3,
+        "6m": 0.5,
+        "1y": 1.0
       },
       "weights": {
-        "1w": 0.20,
+        "1w": 0.2,
         "1m": 0.35,
         "6m": 0.25,
-        "1y": 0.20
+        "1y": 0.2
       },
       "anchor_timeframe": "1m",
       "min_score": 55,
@@ -485,10 +487,41 @@
       "min_catalyst_confidence": 60,
       "scan_interval_hours": 24,
       "universe": [
-        "SOFI", "PLUG", "RIOT", "MARA", "F", "NIO", "LCID", "RIVN", "AMC",
-        "CHPT", "RUN", "AFRM", "PATH", "HOOD", "DKNG", "IONQ", "RKLB", "ACHR",
-        "JOBY", "BBAI", "SOUN", "LUNR", "GME", "WBD", "SNAP", "PTON", "CCL",
-        "VALE", "GOLD", "KGC", "UEC", "CIFR", "WULF", "BTBT", "HUT"
+        "SOFI",
+        "PLUG",
+        "RIOT",
+        "MARA",
+        "F",
+        "NIO",
+        "LCID",
+        "RIVN",
+        "AMC",
+        "CHPT",
+        "RUN",
+        "AFRM",
+        "PATH",
+        "HOOD",
+        "DKNG",
+        "IONQ",
+        "RKLB",
+        "ACHR",
+        "JOBY",
+        "BBAI",
+        "SOUN",
+        "LUNR",
+        "GME",
+        "WBD",
+        "SNAP",
+        "PTON",
+        "CCL",
+        "VALE",
+        "GOLD",
+        "KGC",
+        "UEC",
+        "CIFR",
+        "WULF",
+        "BTBT",
+        "HUT"
       ]
     }
   },
@@ -663,7 +696,7 @@
       "version": 22,
       "date": "2026-06-22",
       "timestamp": "2026-06-22T22:30:00-05:00",
-      "change": "v22 (operator-directed): add options.momentum block — multi-timeframe momentum screener (momentum_screen.py) as a SECOND shadow signal source, matching the operator's real edge (cheap stocks up ~15%/wk, ~30%/mo, ~50%/6mo, ~100%/yr WITH a validated catalyst) rather than the EMA ribbon. Paper-only via the existing shadow_mode gate + options_shadow.py engine; real orders stay hard-gated (enabled=false) until the account clears activation (long_calls_min_account_usd=1000). KEY DESIGN (operator constraint: do not double token usage): the catalyst is REUSED from the single daily skill_1 research pass via its new '## MOMENTUM OPTIONS WATCH' block (agent.py:momentum_options_watch) — NO separate paid catalyst web-search call. process_momentum_shadow layers the FREE deterministic momentum + affordability screen on those research-vetted cheap names and paper-opens calls on survivors (signal_source=momentum_research); only cost is the read-only Haiku option-quote lookup the EMA shadow path already makes. Cheap-stock gates: max_underlying_price=30, max_contract_cost_usd=50 (sized for the $1000 go-live; oversized below that is recorded). skill_1 gains a cheap-momentum scan group + the WATCH output contract. No live-trading change.",
+      "change": "v22 (operator-directed): add options.momentum block \u2014 multi-timeframe momentum screener (momentum_screen.py) as a SECOND shadow signal source, matching the operator's real edge (cheap stocks up ~15%/wk, ~30%/mo, ~50%/6mo, ~100%/yr WITH a validated catalyst) rather than the EMA ribbon. Paper-only via the existing shadow_mode gate + options_shadow.py engine; real orders stay hard-gated (enabled=false) until the account clears activation (long_calls_min_account_usd=1000). KEY DESIGN (operator constraint: do not double token usage): the catalyst is REUSED from the single daily skill_1 research pass via its new '## MOMENTUM OPTIONS WATCH' block (agent.py:momentum_options_watch) \u2014 NO separate paid catalyst web-search call. process_momentum_shadow layers the FREE deterministic momentum + affordability screen on those research-vetted cheap names and paper-opens calls on survivors (signal_source=momentum_research); only cost is the read-only Haiku option-quote lookup the EMA shadow path already makes. Cheap-stock gates: max_underlying_price=30, max_contract_cost_usd=50 (sized for the $1000 go-live; oversized below that is recorded). skill_1 gains a cheap-momentum scan group + the WATCH output contract. No live-trading change.",
       "trade_ids": []
     },
     {
@@ -671,6 +704,13 @@
       "date": "2026-06-24",
       "timestamp": "2026-06-24T00:00:00-04:00",
       "change": "v23 (operator-directed): capital-base rebase after a new deposit. Operator added ~$154.57 (account $102.28 -> broker total $256.85, of which $202.72 is settled cash). progress_tracking.month_start_value rebased UP by the deposit amount (100.17 -> 254.745) so (a) the deposit is NOT misread as a trading gain and (b) the risk-based sizing/sector denominator, which agent.py derives as summary.current_value = month_start_value + total_pnl, now reflects the full ~$257 account instead of the stale ~$102. WITHOUT this rebase the sizing layer (agent.py:2008 _risk_block_impl, position_size_pct, sector_exposure) would keep sizing against ~$102 and leave the new ~$150 permanently idle. current_value -> 256.8537 (254.745 + total_pnl 2.1087); trade_log.json summary updated to match. NO risk-parameter change: risk_per_trade (0.02), band ceilings, max_single_position (0.30), factor caps (40%/sector, 25% leveraged sleeve), trailing/hard stops all unchanged - per goal_framing the larger base deploys the SAME disciplined process at larger dollar size, not more aggression. Options remain DORMANT (account $257 << $1000 activation; shadow record still empty -> both go-live gates unmet).",
+      "trade_ids": []
+    },
+    {
+      "version": 24,
+      "date": "2026-06-25",
+      "timestamp": "2026-06-25T03:19:38-04:00",
+      "change": "v24: deploy-aggressively (operator-directed 2026-06-25, idle ~$202 cash). Enable risk_management.scale_into_winners; raise 60-74 band ceiling 0.15->0.20 (the binding cap on CAT conf64/AMAT conf70, NOT the 0.02 risk cap) so confirmed winners can reach the 20%/name risk cap; cut cash_reserve 0.10->0.05. risk_per_trade_pct UNCHANGED at 0.02 (goal_framing forbids raising per-trade risk to chase) and the new-name knife-catch gate is UNCHANGED \u2014 this only redeploys idle cash into already-confirmed BUY-state winners (CAT/AMAT), not into SELL-state names.",
       "trade_ids": []
     }
   ]

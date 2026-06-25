@@ -58,23 +58,15 @@ intraweek redeploy alike.
   override those upward.
 
 ## Before every BUY
-- **Scale into winners FIRST — do not let settled cash sit idle above the reserve.**
-  When `scale_into_winners` is true (strategy.json → risk_management) and settled cash exceeds the
-  cash reserve, before you ever conclude "hold cash" you MUST check every held position: any name
-  in confirmed **BUY/HOLD** ribbon state whose current portfolio weight is **below its band ceiling**
-  should be **topped up toward that ceiling** — buy the dollar difference between its current weight
-  and the ceiling, subject to settled cash (T+1), the per-name risk cap, the sector/factor caps, and
-  the leveraged-sleeve cap. Averaging UP into a confirmed winner is preferred to idle cash. This is a
-  directive, not an option: idle cash above the reserve while a held winner sits below its ceiling is
-  a miss. **NEVER average DOWN into a SELL-state or losing position** — that is knife-catching (the
-  SOXL/AMD failure mode), not scaling a winner. Only BUY/HOLD-state, in-the-green names qualify.
-- **Then, new names — intraweek redeployment is also ALLOWED.** Your primary new candidates are the
-  **LATEST WEEKEND RESEARCH** picks. A new name from the research static universe (skill_1's sector
-  lists) may be opened if it is in a clean confirmed BUY and clears EVERY gate here, the quant-firm
-  entry gates above, AND the factor caps — with a freshly documented thesis + sources. A new intraweek
-  name is held to the SAME bar as a weekend pick, never a lower one. If, after topping up winners,
-  nothing NEW clears the bar, holding the remaining cash is correct — idle cash beats a forced trade,
-  and a downtrending tape with no qualifying BUY is exactly when cash is the right call.
+- **Candidate sourcing — intraweek redeployment is ALLOWED (do not leave cash idle for days).**
+  Your primary candidates are the **LATEST WEEKEND RESEARCH** picks. But settled cash above the
+  10% reserve should not sit dead waiting on the next weekend run. If a qualifying setup exists,
+  you MAY redeploy intraweek into either (a) adding to an existing BUY-state winner up to its
+  risk-based size and sector cap, or (b) a new name from the research static universe (skill_1's
+  sector lists) that is in a clean confirmed BUY and clears EVERY gate here, the quant-firm entry
+  gates above, AND the factor caps — with a freshly documented thesis + sources. A new intraweek
+  name is held to the SAME bar as a weekend pick, never a lower one. If nothing clears the bar,
+  holding cash is the correct action — idle cash beats a forced trade.
 - Confirm the candidate passes the **Pre-trade entry gate** above (confidence ≥ 60,
   non-empty thesis, non-empty sources_used) **and the quant-firm entry gates** (overextension,
   valuation-gap, insider-distribution, hard Fed blackout, leveraged-ETF rules).
