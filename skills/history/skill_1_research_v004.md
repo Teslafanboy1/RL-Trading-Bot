@@ -1,6 +1,7 @@
 # skill_1_research — Weekend scanner (Phase A)
 
-You find the best stock candidates for the coming week, size them under the risk model. **As of v25 the mandate is CONCENTRATED MOMENTUM ROTATION — output the top 3 strongest-momentum names only (see Concentration Mandate below), not a diversified list.** You learn from past
+You find the best stock candidates for the coming week, size them, and verify they
+can realistically contribute to the monthly 100% goal. You learn from past
 postmortems and victories which sources and signals to trust most.
 
 ## Goal-pace check (do this first — INFORMATIONAL ONLY)
@@ -16,35 +17,6 @@ Instead, rank candidates by **risk-adjusted quality**: a clean ribbon setup + a 
 sized under the risk model. A high-quality 8–12% setup that can't single-handedly hit the goal is
 still a BUY — compounding clean wins is the plan. The real scoreboard is **beat SPY with
 controlled drawdown**; never raise per-trade risk to chase the ceiling.
-
-## CONCENTRATION MANDATE (v25 — concentrated momentum rotation, operator-directed 2026-06-26)
-
-**This overrides the old "5+ candidates" target.** Read `concentration` in strategy.json.
-Output the **top 3** names only — a concentrated momentum book.
-
-Selection rule for BOTH existing positions and new candidates:
-1. **Momentum rank** = 0.5·(1-month return) + 0.3·(1-week return) + 0.2·(6-month return)
-   from daily closes. Rank every eligible name by this score, highest first.
-2. **Hard gates (all required):** EMA ribbon in **BUY** (red 55 below 8/13/21 — the ribbon
-   TIMES entry; a momentum leader in EMA SELL does NOT qualify yet); price **above 200-day
-   SMA**; 1-month return ≥ +8% with no negative shorter timeframe.
-3. **Diversification rail:** max **2 names per sector** — if the 3 strongest are one sector,
-   take the strongest 2 + the strongest name from another sector. The one rail kept on the
-   concentrated book.
-4. **Leveraged ETFs (TQQQ/SOXL/FNGU/TECL/LABU…) are eligible**, compete on the same momentum
-   rank, but are risk-sized DOWN by leverage_factor (≈1/3 for 3x) with the tighter
-   leverage-adjusted stop. Never let leveraged names dominate.
-
-Allocate ~1/3 each to the top 3, but the deterministic risk engine (`position_size_pct`) is
-**authoritative** — never exceed its suggested size; keep the ~5% cash reserve. Rotate: exit
-any held name no longer in the top 3, and exit immediately any name that loses EMA BUY or
-breaks its stop. Still emit the exact `### #N — SYMBOL | Confidence: XX/100` headings (hard
-output contract — execution parses tickers from them).
-
-Be honest in the writeup: this is the **aggressive** config — backtested ~20-28%/yr forward
-with ~69% max drawdown. Aim is to beat SPY ~2x, NOT a fixed monthly number.
-
----
 
 ## Open position review (do this second, before scanning new candidates)
 

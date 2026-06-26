@@ -1,7 +1,7 @@
 {
-  "version": 24,
+  "version": 25,
   "goal": "100% monthly portfolio return",
-  "last_updated": "2026-06-25",
+  "last_updated": "2026-06-26",
   "account": {
     "type": "true_cash",
     "settlement": "T+1",
@@ -260,7 +260,9 @@
     "aspirational_ceiling": "100%/month",
     "operating_mandate": "Maximize risk-adjusted compounding subject to hard risk limits (position_sizing + factor_exposure_limits + risk_management). The 100%/mo figure is an aspirational CEILING, never a license to oversize, chase, or use leverage to 'catch up'. Return is the OUTPUT of edge under risk control, not an input that justifies risk. Set the risk limits; let return follow.",
     "rationale": "100%/mo compounds to ~4096x/yr - beyond any sustained record (Renaissance Medallion ~66%/yr net). Every time the bot reached for the goal it lost: SOXL 3x intraday chase -11.84% and AMD parabolic-high chase -4.99% are together 73% of all loss dollars, while the patient trades (HOOD/CAT held, AMAT +9.31%) made money. Clean-sample expectancy was -1.64%/trade; the counterfactual where vol-adjusted sizing shrinks SOXL to ~1/3 and the overextension gate blocks AMD flips realized P&L from +$2.11 to +$4.40.",
-    "directed_by": "operator, 2026-06-22 (Phase A)"
+    "directed_by": "operator, 2026-06-22 (Phase A)",
+    "operating_target_annual": "~20-25% (aggressive concentrated momentum; aspirational, not a per-month quota)",
+    "_v25_note": "2026-06-26: operator explored leveraged/options for 10-20%/mo; backtests proved that unreachable (best forward ~20-28%/yr at ~69% DD). Adopted concentrated top-3 momentum rotation as the max-credible-aggression equity strategy. 10%/mo+ remains an aspirational ceiling only; sizing stays risk-based (risk_per_trade 0.02 UNCHANGED)."
   },
   "position_sizing": {
     "_note": "Quant-firm risk-based sizing. Positions are sized by RISK, not a flat confidence-band percent, so leveraged/high-vol names auto-shrink (the SOXL/AMD failure mode). Computed deterministically in agent.py:position_size_pct() and injected into the prompt; the model applies the suggested size, NEVER a larger one. The confidence band is a hard CEILING, not the target.",
@@ -712,6 +714,20 @@
       "timestamp": "2026-06-25T03:19:38-04:00",
       "change": "v24: deploy-aggressively (operator-directed 2026-06-25, idle ~$202 cash). Enable risk_management.scale_into_winners; raise 60-74 band ceiling 0.15->0.20 (the binding cap on CAT conf64/AMAT conf70, NOT the 0.02 risk cap) so confirmed winners can reach the 20%/name risk cap; cut cash_reserve 0.10->0.05. risk_per_trade_pct UNCHANGED at 0.02 (goal_framing forbids raising per-trade risk to chase) and the new-name knife-catch gate is UNCHANGED \u2014 this only redeploys idle cash into already-confirmed BUY-state winners (CAT/AMAT), not into SELL-state names.",
       "trade_ids": []
+    },
+    {
+      "version": 25,
+      "date": "2026-06-26",
+      "timestamp": "2026-06-26T13:12:50-04:00",
+      "change": "v25: concentrated momentum rotation (top-3). Hold the 3 strongest multi-TF-momentum names in EMA BUY + >SMA200, max 2/sector, leveraged ETFs eligible & risk-sized. Goal reframed to ~20-25%/yr aspirational. Risk rails (risk_per_trade 0.02, factor caps, leverage-adjusted stops) UNCHANGED. Operator-directed after backtests showed 10-20%/mo unreachable.",
+      "trade_ids": []
     }
-  ]
+  ],
+  "concentration": {
+    "_note": "v25 (operator-directed 2026-06-26): CONCENTRATED MOMENTUM ROTATION. Hold only the top-N strongest multi-timeframe-momentum names (rank = 0.5*1m + 0.3*1w + 0.2*6m) that are ALSO in EMA BUY and > SMA200, subject to factor_exposure_limits (max 2 per sector). Leveraged ETFs eligible, risk-sized down by leverage_factors. Backtested ~20-28%/yr forward (survivorship-stripped) with ~69% max drawdown \u2014 an aggressive, deep-drawdown mandate chosen knowingly. The EMA ribbon TIMES entry; momentum PICKS.",
+    "max_positions": 3,
+    "selection": "momentum_rank gated by EMA_BUY + above_SMA200 + max_2_per_sector",
+    "leveraged_etfs_eligible": true,
+    "directed_by": "operator, 2026-06-26"
+  }
 }

@@ -2432,6 +2432,24 @@ def next_market_open():
     return candidate
 
 
+def _sleep_until(target, announce=None):
+    """Sleep until `target` (tz-aware ET), polling the REAL clock every <=60s so a
+    system suspend (laptop lid closed) can't overshoot the wake time. A single long
+    time.sleep() PAUSES while macOS is asleep and then wakes hours late — the exact
+    bug that left the bot stuck on 'Waiting until ... for pre-market research'
+    straight through an open market. This re-checks datetime.now(ET) on a short
+    cadence and returns as soon as now >= target (Ctrl-C still interrupts). A late
+    wake then recovers gracefully: a past target returns immediately and the loop
+    proceeds (runs the missed research, then trades)."""
+    if announce:
+        print(announce)
+    while True:
+        now = datetime.now(ET)
+        if now >= target:
+            return
+        time.sleep(min(60.0, (target - now).total_seconds()))
+
+
 def main():
     print(f"Trading agent (Phase 1+2) via `claude` CLI. "
           f"check_model={CHECK_MODEL} research_model={MODEL} "
@@ -2476,24 +2494,19 @@ def main():
         if not is_market_open():
             opens = next_market_open()
             research_time = opens - timedelta(minutes=10)
-            now = datetime.now(ET)
-            wait_secs = max(0, (research_time - now).total_seconds())
-            if wait_secs > 0:
-                print(
-                    f"\nWaiting until {research_time:%A %Y-%m-%d at %H:%M} ET "
-                    f"for pre-market research. (Ctrl-C to stop)"
-                )
-                time.sleep(wait_secs)
+            _sleep_until(
+                research_time,
+                f"\nWaiting until {research_time:%A %Y-%m-%d at %H:%M} ET "
+                f"for pre-market research. (Ctrl-C to stop)",
+            )
             print("Running pre-market research...\n")
             run_agent()
             opens = next_market_open()
-            wait_secs = max(0, (opens - datetime.now(ET)).total_seconds())
-            if wait_secs > 0:
-                print(
-                    f"Research done. Waiting until {opens:%H:%M} ET "
-                    f"for market open. (Ctrl-C to cancel)"
-                )
-                time.sleep(wait_secs)
+            _sleep_until(
+                opens,
+                f"Research done. Waiting until {opens:%H:%M} ET "
+                f"for market open. (Ctrl-C to cancel)",
+            )
             print("Market is now open. Starting trading loop...\n")
 
         # Intraday trading loop — clear any stale schedule jobs from the prior day.

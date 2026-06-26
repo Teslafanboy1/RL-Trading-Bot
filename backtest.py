@@ -47,6 +47,7 @@ import math
 import urllib.request
 
 import signals  # reuse the EXACT live signal math
+import momentum_screen as mscreen  # reuse the operator's multi-timeframe momentum edge
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 
@@ -89,6 +90,37 @@ LEVERAGE = {  # mirror strategy.json position_sizing.leverage_factors
     "SOXL": 3, "SOXS": 3, "TQQQ": 3, "SQQQ": 3, "FNGU": 3, "FNGD": 3,
     "SPXL": 3, "UPRO": 3, "TNA": 3, "TZA": 3, "TECL": 3, "LABU": 3,
     "UVXY": 2, "SSO": 2, "QLD": 2,
+}
+
+# --------------------------------------------------- leveraged-momentum sleeve
+# The "max credible growth" small-account design (see momentum_sleeve()): take the
+# operator's real edge — multi-timeframe momentum (momentum_screen.py) — and express
+# it through 3x index ETFs (the only AFFORDABLE leverage for a $400 cash account:
+# fractional shares, no option premium/theta/IV-crush/spread). Long-only, trend-
+# gated, trailing-stop exit ("let winners run"). The leverage IS the ETF; we never
+# stack margin on top. Liquid 3x ETFs with long Yahoo history:
+LEV_UNIVERSE = ["TQQQ", "SOXL", "SPXL", "UPRO", "TECL", "FAS", "TNA", "LABU", "FNGU", "UDOW"]
+
+# Max-aggression CONCENTRATED ROTATION universe (see backtest_rotation): high-beta
+# single names + leveraged ETFs, so the engine can rotate into whichever is strongest.
+AGGRO_UNIVERSE = [
+    "NVDA", "AMD", "AVGO", "MU", "AMAT", "SMCI", "MRVL", "TSM",
+    "PLTR", "COIN", "MSTR", "HOOD", "SOFI", "SNOW", "CRWD", "NET", "DDOG",
+    "META", "TSLA", "SHOP", "RBLX",
+    "TQQQ", "SOXL", "FNGU", "TECL", "LABU", "FAS", "TNA",
+]
+
+MOM_TRAIL = float(os.environ.get("BACKTEST_MOM_TRAIL", "0.25"))     # giveback from peak
+MOM_TREND_LEN = int(os.environ.get("BACKTEST_MOM_TREND", "200"))    # SMA trend gate (bars)
+# Entry gate tuned for 3x INDEX ETFs (not the cheap-single-stock defaults in
+# momentum_screen): anchor = 1-month momentum positive & meaningful, every shorter
+# timeframe non-negative, plus a 200-bar trend filter applied in backtest_momentum.
+MOM_CFG = {
+    "targets": {"1w": 0.0, "1m": 0.08, "6m": 0.15, "1y": 0.25},
+    "anchor_timeframe": "1m",
+    "require_all_positive": True,
+    "positive_timeframes": ["1m", "6m"],
+    "min_score": 40,
 }
 
 
@@ -451,6 +483,68 @@ def backtest_meanrev(symbol):
     if in_pos:
         trades.append(_close(symbol, entry_px, closes[-1] * (1 - cost),
                              entry_i, n - 1, ts, "open_eod"))
+    return _summarize(symbol, trades, closes, source, n, stop, 0, ts)
+
+
+# --------------------------------------------------- leveraged-momentum sleeve
+def _mtf_returns_at(closes, i, lookbacks):
+    """{timeframe: pct or None} as of bar i, using only closes[..i] (no look-ahead).
+    O(1) per bar — avoids re-slicing the series each step (which would be O(n^2))."""
+    out = {}
+    for tf, lb in lookbacks.items():
+        j = i - lb
+        out[tf] = (closes[i] / closes[j] - 1.0) if j >= 0 and closes[j] > 0 else None
+    return out
+
+
+def backtest_momentum(symbol, trail=None, trend_len=None, cfg=None):
+    """Multi-timeframe-momentum entry + trailing-stop exit, for the (typically 3x)
+    leveraged sleeve. Mirrors the live let-winners-run design:
+      ENTRY  — momentum gate passes (momentum_screen.passes_gate) AND close is above
+               its trend_len SMA (don't buy a 3x ETF in a downtrend — that's the
+               2022-TQQQ-to-zero trap).
+      EXIT   — leverage-adjusted hard stop from entry (LR002), OR a trailing stop
+               (give back `trail` from the post-entry peak), OR a trend break
+               (close < SMA). Trailing stop is the PRIMARY momentum exit.
+    Same next-bar-fill / per-side cost / no-look-ahead honesty guards and the same
+    _summarize output shape as backtest_symbol, so every report/sizing path reuses it."""
+    trail = MOM_TRAIL if trail is None else trail
+    trend_len = MOM_TREND_LEN if trend_len is None else trend_len
+    cfg = cfg or MOM_CFG
+    ts, closes, source = _fetch_history(symbol)
+    n = len(closes)
+    need = max(trend_len, mscreen.LOOKBACK_BARS["1y"]) + 5
+    if n < need:
+        return {"symbol": symbol, "ok": False, "source": source, "bars": n,
+                "note": f"need >= {need} bars, got {n}"}
+    sma = _sma(closes, trend_len)
+    stop = effective_stop(symbol)
+    cost = COST_BPS / 10000.0
+    trades = []
+    in_pos = False
+    entry_px = entry_i = peak = 0.0
+    for i in range(need, n - 1):                 # -1: need bar i+1 to fill on
+        if not in_pos:
+            rets = _mtf_returns_at(closes, i, mscreen.LOOKBACK_BARS)
+            gate_ok, _ = mscreen.passes_gate(rets, cfg)
+            if gate_ok and sma[i] is not None and closes[i] > sma[i]:
+                in_pos = True
+                entry_px = closes[i + 1] * (1 + cost)
+                entry_i = i + 1
+                peak = closes[i + 1]
+        else:
+            peak = max(peak, closes[i])
+            if closes[i] <= entry_px * (1 - stop):           # hard stop (breaching close)
+                trades.append(_close(symbol, entry_px, closes[i] * (1 - cost), entry_i, i, ts, "stop_loss"))
+                in_pos = False
+            elif closes[i] <= peak * (1 - trail):            # trailing stop (breaching close)
+                trades.append(_close(symbol, entry_px, closes[i] * (1 - cost), entry_i, i, ts, "trailing_stop"))
+                in_pos = False
+            elif sma[i] is not None and closes[i] < sma[i]:  # trend break (next-bar exit)
+                trades.append(_close(symbol, entry_px, closes[i + 1] * (1 - cost), entry_i, i + 1, ts, "trend_break"))
+                in_pos = False
+    if in_pos:
+        trades.append(_close(symbol, entry_px, closes[-1] * (1 - cost), entry_i, n - 1, ts, "open_eod"))
     return _summarize(symbol, trades, closes, source, n, stop, 0, ts)
 
 
@@ -885,6 +979,263 @@ def combine(symbols):
     print(f"  VERDICT: {'; '.join(verdict)}")
 
 
+def _full_calendar(results):
+    """Sorted union of every trading date across the result set (held or flat)."""
+    dates = set()
+    for r in results:
+        for k in range(len(r["_ts"] or [])):
+            d = _fmt_ts(r["_ts"], k)
+            if d:
+                dates.add(d)
+    return sorted(dates)
+
+
+def _eqw_calendar_series(results):
+    """Equal-capital-bucket portfolio: each of the N names gets 1/N of capital and
+    earns 0 on days it holds nothing. Includes flat days (full trading calendar) so
+    CAGR/Sharpe correctly penalise time spent in cash — the honest comparison to a
+    fully-invested buy-and-hold benchmark."""
+    n = len(results) or 1
+    dates = _full_calendar(results)
+    return {d: sum(r["_daily"].get(d, 0.0) for r in results) / n for d in dates}
+
+
+def _cagr(series):
+    """Compound annual growth rate of a daily-return series over its calendar span."""
+    dates = sorted(series)
+    if len(dates) < 2:
+        return 0.0
+    eq = 1.0
+    for d in dates:
+        eq *= (1 + series[d])
+    yrs = len(dates) / _PERIODS_PER_YEAR.get(INTERVAL, 252)
+    return eq ** (1 / yrs) - 1 if yrs > 0 and eq > 0 else 0.0
+
+
+def _monthly_stats(series):
+    """Compound each calendar month, then summarise the distribution of monthly
+    returns — the table that directly answers 'can it hit X% per month?'."""
+    from collections import defaultdict
+    months = defaultdict(list)
+    for d in sorted(series):
+        months[d[:7]].append(series[d])
+    mret = []
+    for ym in sorted(months):
+        eq = 1.0
+        for r in months[ym]:
+            eq *= (1 + r)
+        mret.append(eq - 1)
+    if not mret:
+        return None
+    s = sorted(mret)
+    pos = [x for x in mret if x > 0]
+    return {"n": len(mret), "mean": sum(mret) / len(mret),
+            "median": s[len(s) // 2], "best": s[-1], "worst": s[0],
+            "pct_pos": len(pos) / len(mret),
+            "hit_5": sum(1 for x in mret if x >= 0.05) / len(mret),
+            "hit_10": sum(1 for x in mret if x >= 0.10) / len(mret)}
+
+
+# ----------------------------------------------- concentrated momentum rotation
+def _prep_symbol(sym, trend_len, cfg):
+    """Pre-compute per-date close, bar return, raw momentum rank-score, and an
+    eligibility flag (momentum gate + above-trend) for the rotation simulator.
+    Returns None if the symbol lacks enough history. Rank-score is the UNCAPPED
+    blended momentum (1m/1w/6m) so the strongest names rank highest — distinct from
+    momentum_screen's capped 0-100 score, which saturates and can't discriminate."""
+    ts, closes, source = _fetch_history(sym)
+    n = len(closes)
+    need = max(trend_len, mscreen.LOOKBACK_BARS["1y"]) + 2
+    if n < need:
+        return None
+    sma = _sma(closes, trend_len)
+    p = {"close": {}, "ret": {}, "score": {}, "elig": {}}
+    for k in range(n):
+        d = _fmt_ts(ts, k)
+        if d is None:
+            continue
+        p["close"][d] = closes[k]
+        if k >= 1 and closes[k - 1]:
+            p["ret"][d] = closes[k] / closes[k - 1] - 1
+        if k >= need:
+            r = _mtf_returns_at(closes, k, mscreen.LOOKBACK_BARS)
+            p["score"][d] = (0.5 * (r["1m"] or 0) + 0.3 * (r["1w"] or 0)
+                             + 0.2 * (r["6m"] or 0))         # uncapped strength rank
+            gate_ok, _ = mscreen.passes_gate(r, cfg)
+            p["elig"][d] = bool(gate_ok and sma[k] is not None and closes[k] > sma[k])
+    return p
+
+
+def backtest_rotation(symbols, top_n=3, trail=None, trend_len=None, cfg=None):
+    """Concentrated momentum-ROTATION portfolio: each day hold the `top_n` strongest
+    eligible names (momentum gate + above-trend), equal weight, cash in any unfilled
+    slot. Exit a held name on a trailing stop (giveback `trail` from peak), the
+    leverage-adjusted hard stop, or loss of eligibility (momentum/trend broke) — then
+    rotate the freed slot into the next strongest leader. This is the live let-winners-
+    run edge run at MAX aggression: no diversification drag, always in the leaders.
+    Per-side cost charged on every entry/exit. No look-ahead: returns on day i come
+    from names held INTO day i; entries decided on close i earn from i+1. Returns a
+    date->portfolio-return series (same shape the report/stat helpers consume)."""
+    trail = MOM_TRAIL if trail is None else trail
+    trend_len = MOM_TREND_LEN if trend_len is None else trend_len
+    cfg = cfg or MOM_CFG
+    cost = COST_BPS / 10000.0
+    preps = {}
+    for s in symbols:
+        pr = _prep_symbol(s, trend_len, cfg)
+        if pr:
+            preps[s] = pr
+    if not preps:
+        return None
+    stop = {s: effective_stop(s) for s in preps}
+    dates = sorted(set().union(*[set(p["close"]) for p in preps.values()]))
+    held = {}                                    # sym -> {entry, peak}
+    port = {}
+    for d in dates:
+        day_ret = 0.0
+        for sym, pos in held.items():            # 1) today's P&L from names held into today
+            r = preps[sym]["ret"].get(d)
+            if r is not None:
+                day_ret += r / top_n
+            c = preps[sym]["close"].get(d)
+            if c is not None:
+                pos["peak"] = max(pos["peak"], c)
+        events = 0                               # entries+exits today (each costs one side)
+        for sym in list(held):                   # 2) exits on close d
+            c = preps[sym]["close"].get(d)
+            if c is None:
+                continue
+            pos = held[sym]
+            if (c <= pos["peak"] * (1 - trail) or c <= pos["entry"] * (1 - stop[sym])
+                    or not preps[sym]["elig"].get(d, False)):
+                del held[sym]
+                events += 1
+        if len(held) < top_n:                    # 3) rotate freed slots into the strongest
+            cand = sorted(((preps[s]["score"].get(d, -9.9), s) for s in preps
+                           if s not in held and preps[s]["elig"].get(d, False)), reverse=True)
+            for sc, s in cand[:top_n - len(held)]:
+                c = preps[s]["close"].get(d)
+                if c:
+                    held[s] = {"entry": c, "peak": c}
+                    events += 1
+        port[d] = day_ret - events * cost / top_n
+    return port
+
+
+def momentum_sleeve(symbols):
+    """THE leveraged-momentum sleeve test. For each (3x) ETF: momentum-entry +
+    trailing-stop strategy vs simply buy-and-holding that same ETF vs the EMA ribbon
+    on it. Then an equal-bucket portfolio: CAGR, max drawdown, Sharpe, the monthly-
+    return distribution, and the implied Kelly leverage — all against a plain
+    buy-and-hold SPY benchmark over the identical window. The drawdown column is the
+    point: 3x leverage is a return multiplier AND a ruin multiplier."""
+    mom = [r for r in (backtest_momentum(s) for s in symbols) if r["ok"]]
+    rib = {r["symbol"]: r for r in (backtest_symbol(s) for s in symbols) if r["ok"]}
+    if not mom:
+        print("no usable symbols — each leveraged ETF needs ~1y+ of daily history.")
+        return
+    print(f"\nLeveraged-momentum sleeve — interval={INTERVAL} range={RANGE}, "
+          f"{len(mom)} ETFs, trail={int(MOM_TRAIL*100)}% trend=SMA{MOM_TREND_LEN}")
+    print(f"  entry: 1m≥{int(MOM_CFG['targets']['1m']*100)}% & all-positive & >SMA{MOM_TREND_LEN};"
+          f"  exit: lev-adj stop / trailing / trend-break, cost={COST_BPS}bps/side\n")
+    print(f"  {'ETF':<6}{'n':>4}{'win':>6}{'exp/t':>9}{'MOM ret':>11}{'maxDD':>8}"
+          f"{'B&H ret':>11}{'B&H DD':>8}{'ribbon':>10}")
+    print(f"  {'-'*73}")
+    for r in sorted(mom, key=lambda x: x["strategy_return"], reverse=True):
+        bh_dd = _bh_maxdd(r["_closes"])
+        rr = rib.get(r["symbol"])
+        rib_s = _pct(rr["strategy_return"]) if rr else "—"
+        print(f"  {r['symbol']:<6}{r['trades']:>4}{r['win_rate']*100:>5.0f}%"
+              f"{_pct(r['expectancy']):>9}{_pct(r['strategy_return']):>11}"
+              f"{r['max_drawdown']*100:>7.0f}%{_pct(r['buy_hold_return']):>11}"
+              f"{bh_dd*100:>7.0f}%{rib_s:>10}")
+
+    # Equal-bucket portfolio + benchmark over the SAME window.
+    port = _eqw_calendar_series(mom)
+    p_st = _series_stats(port)
+    start, end = (sorted(port)[0], sorted(port)[-1]) if port else ("", "")
+    spy_full = _spy_daily()
+    spy_win = {d: v for d, v in spy_full.items() if start <= d <= end}
+    spy_cagr, spy_dd = _cagr(spy_win), _maxdd_from_daily(spy_win)
+    spy_bh = 1.0
+    for d in sorted(spy_win):
+        spy_bh *= (1 + spy_win[d])
+
+    vals = [port[d] for d in sorted(port)]
+    mu = sum(vals) / len(vals)
+    var = sum((x - mu) ** 2 for x in vals) / (len(vals) - 1) if len(vals) > 1 else 0.0
+    kelly = (mu / var) if var > 0 else 0.0
+    ms = _monthly_stats(port)
+
+    print(f"\n  Equal-bucket portfolio ({len(mom)} ETFs, 1/N each), {start} → {end}")
+    print(f"  {'-'*73}")
+    print(f"  {'':<22}{'STRATEGY':>14}{'buy&hold SPY':>16}")
+    print(f"  {'CAGR':<22}{_pct(_cagr(port)):>14}{_pct(spy_cagr):>16}")
+    print(f"  {'ann. Sharpe':<22}{p_st['sharpe']:>14.2f}{_series_stats(spy_win)['sharpe']:>16.2f}")
+    print(f"  {'MAX DRAWDOWN':<22}{p_st['dd']*100:>13.0f}%{spy_dd*100:>15.0f}%")
+    if ms:
+        print(f"\n  Monthly returns ({ms['n']} months): mean {_pct(ms['mean'])}, "
+              f"median {_pct(ms['median'])}, best {_pct(ms['best'])}, worst {_pct(ms['worst'])}")
+        print(f"  Positive months: {ms['pct_pos']*100:.0f}%   |   "
+              f"months that hit ≥+10%: {ms['hit_10']*100:.0f}%")
+    print(f"\n  Implied full-Kelly leverage on this (already-3x) sleeve ≈ {kelly:.1f}x; "
+          f"¼-Kelly ≈ {kelly/4:.1f}x.")
+    print(f"  → The 3x ETF IS the leverage. On a cash account you cap ADDED leverage "
+          f"at 1.0x (no margin).")
+    print(f"\n  READ THIS: the gaudy CAGR is inseparable from the MAX DRAWDOWN and is "
+          f"\n  regime-dependent — {start[:4]}–{end[:4]} was the biggest equity bull run in history.")
+
+
+def rotation_report(symbols, top_ns=(1, 2, 3)):
+    """THE max-aggression test: concentrated momentum rotation at varying
+    concentration (top_n=1 is all-in the single strongest name). Reports CAGR /
+    Sharpe / max drawdown and — the whole point — the MONTHLY return distribution:
+    how often it actually hits +5% and +10%, and how ugly the bad months get.
+    Benchmarked against buy-and-hold SPY over the same window."""
+    print(f"\nConcentrated momentum ROTATION — interval={INTERVAL} range={RANGE}, "
+          f"{len(symbols)} names, trail={int(MOM_TRAIL*100)}% trend=SMA{MOM_TREND_LEN}")
+    print(f"  hold the top_n strongest eligible names (gate+trend); rotate on "
+          f"stop/trail/trend-break. cost={COST_BPS}bps/side.\n")
+    print(f"  {'concen.':<10}{'CAGR':>8}{'Sharpe':>8}{'maxDD':>7}{'mo.mean':>9}"
+          f"{'mo.med':>8}{'worst':>8}{'≥+5%':>7}{'≥+10%':>7}{'pos':>6}")
+    print(f"  {'-'*78}")
+    span = None
+    for tn in top_ns:
+        port = backtest_rotation(symbols, top_n=tn)
+        if not port:
+            continue
+        st = _series_stats(port)
+        ms = _monthly_stats(port)
+        if span is None:
+            ds = sorted(port)
+            span = (ds[0], ds[-1])
+        label = "all-in (1)" if tn == 1 else f"top-{tn}"
+        print(f"  {label:<10}{_pct(_cagr(port)):>8}{st['sharpe']:>8.2f}"
+              f"{st['dd']*100:>6.0f}%{_pct(ms['mean']):>9}{_pct(ms['median']):>8}"
+              f"{_pct(ms['worst']):>8}{ms['hit_5']*100:>6.0f}%{ms['hit_10']*100:>6.0f}%"
+              f"{ms['pct_pos']*100:>5.0f}%")
+    if span:
+        spy = {d: v for d, v in _spy_daily().items() if span[0] <= d <= span[1]}
+        sst, sms = _series_stats(spy), _monthly_stats(spy)
+        print(f"  {'-'*78}")
+        print(f"  {'SPY B&H':<10}{_pct(_cagr(spy)):>8}{sst['sharpe']:>8.2f}"
+              f"{sst['dd']*100:>6.0f}%{_pct(sms['mean']):>9}{_pct(sms['median']):>8}"
+              f"{_pct(sms['worst']):>8}{sms['hit_5']*100:>6.0f}%{sms['hit_10']*100:>6.0f}%"
+              f"{sms['pct_pos']*100:>5.0f}%")
+        print(f"\n  window {span[0]} → {span[1]}. '≥+10%' = share of months that hit "
+              f"your target. Read it next to 'worst' and 'maxDD'\n  — the same "
+              f"concentration that buys good months buys the bad ones. Regime: a bull decade.")
+
+
+def _bh_maxdd(closes):
+    """Buy-and-hold max drawdown of a close series."""
+    peak, dd = closes[0], 0.0
+    for c in closes:
+        peak = max(peak, c)
+        dd = max(dd, (peak - c) / peak)
+    return dd
+
+
 if __name__ == "__main__":
     import sys
     args = list(sys.argv[1:])
@@ -896,12 +1247,20 @@ if __name__ == "__main__":
     do_neutral = "--neutral" in args
     do_short = "--short" in args
     do_sizing = "--sizing" in args
+    do_momentum = "--momentum" in args
+    do_rotation = "--rotation" in args
     universe = "--universe" in args
     flags = {"--md", "--regime", "--compare", "--universe", "--combine",
-             "--meanrev", "--neutral", "--short", "--sizing"}
+             "--meanrev", "--neutral", "--short", "--sizing", "--momentum", "--rotation"}
     syms = UNIVERSE if universe else (
         [a.upper() for a in args if a not in flags] or ["SPY"])
-    if do_sizing:
+    if do_rotation:
+        # --rotation defaults to the high-beta + leveraged aggression universe.
+        rotation_report([a.upper() for a in args if a not in flags] or AGGRO_UNIVERSE)
+    elif do_momentum:
+        # --momentum defaults to the leveraged-ETF universe when no symbols given.
+        momentum_sleeve([a.upper() for a in args if a not in flags] or LEV_UNIVERSE)
+    elif do_sizing:
         sizing(syms)
     elif do_neutral:
         marketneutral(syms)
