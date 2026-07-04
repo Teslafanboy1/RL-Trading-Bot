@@ -1,0 +1,73 @@
+{
+  "positions": [
+    {
+      "id": "S0001",
+      "underlying": "CAT",
+      "type": "call",
+      "strike": 1000.0,
+      "expiry": "2026-07-24",
+      "structure": "long_call",
+      "entry_date": "2026-06-24T12:45:57-04:00",
+      "entry_underlying": 998.89,
+      "entry_premium": 51.05,
+      "contracts": 1,
+      "confidence": 64,
+      "thesis": "shadow of CAT BUY signal",
+      "oversized_for_account": true,
+      "max_loss_usd": 5105.0,
+      "pct_of_account": 19.8751,
+      "status": "closed",
+      "exit_premium": 40.25,
+      "pnl_per_contract_usd": -1080.0,
+      "pnl_pct_on_premium": -21.16,
+      "exit_date": "2026-06-24T13:18:30-04:00",
+      "exit_reason": "underlying_sell"
+    },
+    {
+      "id": "S0002",
+      "underlying": "AMAT",
+      "type": "call",
+      "strike": 630.0,
+      "expiry": "2026-07-31",
+      "structure": "long_call",
+      "entry_date": "2026-06-25T10:41:29-04:00",
+      "entry_underlying": 631.745,
+      "entry_premium": 66.15,
+      "contracts": 1,
+      "confidence": 70,
+      "thesis": "shadow of AMAT BUY signal",
+      "oversized_for_account": true,
+      "max_loss_usd": 6615.0,
+      "pct_of_account": 25.754,
+      "status": "open"
+    },
+    {
+      "id": "S0003",
+      "underlying": "CAT",
+      "type": "call",
+      "strike": 1045.0,
+      "expiry": "2026-07-31",
+      "structure": "long_call",
+      "entry_date": "2026-06-25T11:06:34-04:00",
+      "entry_underlying": 1047.3665,
+      "entry_premium": 65.15,
+      "contracts": 1,
+      "confidence": 64,
+      "thesis": "shadow of CAT BUY signal",
+      "oversized_for_account": true,
+      "max_loss_usd": 6515.0,
+      "pct_of_account": 25.3646,
+      "status": "open"
+    }
+  ],
+  "_next_id": 4,
+  "_note": "Phase B shadow (paper) options track record. No real money. P&L is per 1 contract; % on premium is the size-independent metric.",
+  "summary": {
+    "open": 2,
+    "closed": 1,
+    "wins": 0,
+    "win_rate": 0.0,
+    "total_pnl_per_contract_usd": -1080.0,
+    "avg_pct_on_premium": -21.16
+  }
+}
