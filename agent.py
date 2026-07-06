@@ -2125,6 +2125,205 @@ def _risk_block_impl(raw_sigs, log, strategy):
     return "\n".join(out) + "\n\n"
 
 
+# ----------------------------------------------------- thesis-integrity agent
+def run_thesis_check(log, raw_sigs):
+    """Dedicated, web-enabled, DECISION-ONLY agent (skill_2b_thesis). For every
+    open position it web-searches breaking news and re-scores the thesis, then
+    returns {symbol: reason} for every name whose thesis is broken OR whose
+    confidence decayed below the trade floor (60). The caller folds these into
+    the deterministic force_sell set — the same path stop-loss/trailing use — so
+    a news break can exit AHEAD of the lagging EMA and the −10% hard stop.
+
+    This exists because the market-hours execution turn (run_agent) has NO web
+    tools, so skill_2's old per-position "web search [SYMBOL] news today" could
+    never actually run. This agent is where the news gets read.
+
+    read_only=True: it has web + RH-read tools but NO order tools — it only
+    decides; the engine sells. Fully wrapped: any failure returns {} and never
+    raises into the trading loop."""
+    try:
+        positions = log.get("open_positions", [])
+        if not positions:
+            return {}
+        # Per-position context: avg cost, current price/P&L from this cycle's closes.
+        lines = []
+        for p in positions:
+            sym = p["symbol"]
+            entry = float(p.get("entry_price") or 0)
+            sig = raw_sigs.get(sym, {})
+            last = float(sig.get("last_close") or 0) if sig.get("ok") else 0.0
+            pnl = f"{((last-entry)/entry*100):+.1f}%" if (entry > 0 and last > 0) else "n/a"
+            conf = p.get("confidence_at_entry", p.get("confidence"))
+            lines.append(
+                f"- {sym}: avg_cost={entry} current={last or 'n/a'} pnl={pnl} "
+                f"entry_confidence={conf} thesis={p.get('thesis') or '(none recorded)'}")
+        picks = load_latest_research_file("weekend_picks_") or ""
+        system = load_file("skills/skill_2b_thesis.md")
+        user = (
+            f"Time (ET): {datetime.now(ET):%Y-%m-%d %H:%M} ({datetime.now(ET):%A})\n\n"
+            f"OPEN POSITIONS to re-check (one verdict required PER NAME):\n"
+            + "\n".join(lines)
+            + "\n\nLATEST WEEKEND RESEARCH (find each name's thesis + the 'one thing "
+            "that would invalidate this thesis' here):\n"
+            + (picks[:6000] if picks else "(no picks file found)")
+            + "\n\nWeb-search each name's news NOW, re-score, and emit the required "
+            "```json {\"verdicts\": [...]} block LAST. Decide only — place no orders."
+        )
+        text, usage = run_model(system, user, mcp=True, web=True,
+                                read_only=True, model=CHECK_MODEL)
+        stamp = datetime.now(ET).strftime("%Y-%m-%d_%H%M")
+        append_audit_log("thesis", f"Thesis check {stamp}", text)
+        if text.startswith("(claude -p error") or text.startswith("(error:"):
+            print(f"  [thesis] model unavailable — no verdicts this cycle: {text[:120]}")
+            return {}
+        block = extract_last_json_block(text)
+        verdicts = (block or {}).get("verdicts", []) if isinstance(block, dict) else []
+        held = {p["symbol"] for p in positions}
+        broken = {}
+        for v in verdicts:
+            if not isinstance(v, dict):
+                continue
+            sym = v.get("symbol")
+            if sym not in held:
+                continue
+            try:
+                conf = float(v.get("confidence", 100))
+            except (TypeError, ValueError):
+                conf = 100.0
+            if v.get("thesis_broken") is True or conf < 60:
+                broken[sym] = "thesis_break"
+        if broken:
+            print(f"  [thesis] flagged for exit (thesis_break/conf<60): {sorted(broken)}")
+        else:
+            print(f"  [thesis] all {len(held)} position(s) intact "
+                  f"(tokens in={usage['input_tokens']} out={usage['output_tokens']}).")
+        return broken
+    except Exception as e:
+        print(f"  [thesis] check failed (ignored, no exit forced): {e}")
+        return {}
+
+
+# --------------------------------------------------------- ops / heartbeat
+HEARTBEAT_PATH = os.path.join(ROOT, "logs", "heartbeat.json")
+
+
+def write_heartbeat(log, task, *, model_failed=False, model_ran=False):
+    """Model-free ops record written at the END of every cycle (incl. skipped
+    ones). 0 tokens. Captures enough for check_heartbeat_health() and any future
+    external watchdog to notice the loop went dark / a stop is overdue / claude
+    is repeatedly failing. Never raises — an ops-logging failure can't break the
+    trading loop."""
+    try:
+        prev = load_json("logs/heartbeat.json", {})
+        strategy = load_strategy()
+        fails = int(prev.get("consecutive_model_failures", 0))
+        if model_failed:
+            fails += 1
+        elif model_ran:
+            fails = 0
+        positions = []
+        for p in log.get("open_positions", []):
+            sym = p["symbol"]
+            entry = float(p.get("entry_price") or 0)
+            try:
+                sig = signals.signal_for(sym) if signals else {}
+            except Exception:
+                sig = {}
+            last = float(sig.get("last_close") or 0) if sig.get("ok") else 0.0
+            pnl = round((last - entry) / entry * 100, 2) if (entry > 0 and last > 0) else None
+            stop = effective_stop_pct(sym, strategy)
+            past_stop = pnl is not None and pnl <= -stop * 100
+            # cycles a still-held position has been past its stop (for overdue alert)
+            prev_pos = {q["symbol"]: q for q in prev.get("open_positions", [])}
+            cyc = int(prev_pos.get(sym, {}).get("cycles_past_stop", 0)) + 1 if past_stop else 0
+            positions.append({"symbol": sym, "entry": entry, "last": last or None,
+                              "pnl_pct": pnl, "stop_pct": round(stop * 100, 2),
+                              "past_stop": past_stop, "cycles_past_stop": cyc})
+        hb = {
+            "last_cycle_ts": now_iso(),
+            "last_task": task,
+            "last_successful_equity_turn_ts": (
+                now_iso() if model_ran else prev.get("last_successful_equity_turn_ts")),
+            "consecutive_model_failures": fails,
+            "open_positions": positions,
+            "mode": EXECUTION_MODE,
+            "last_alerted": prev.get("last_alerted", {}),
+        }
+        save_json("logs/heartbeat.json", hb)
+        return hb
+    except Exception as e:
+        print(f"  [heartbeat] write failed (ignored): {e}")
+        return None
+
+
+def check_heartbeat_health(log, *, at_startup=False):
+    """Model-free watchdog. Reads logs/heartbeat.json and fires notify_operator()
+    (direct HTTP POST — works even when claude -p is down) on: loop was dark too
+    long, a stop-loss is overdue (held past-stop for >=2 cycles), or claude -p has
+    failed >=3 cycles in a row. De-dupes via a 'last_alerted' marker so a standing
+    condition doesn't alert every cycle. Never raises."""
+    try:
+        hb = load_json("logs/heartbeat.json", {})
+        if not hb:
+            return
+        alerted = dict(hb.get("last_alerted", {}))
+        fired = False
+
+        # 1) Loop was dark. At startup, a large gap since the last recorded cycle
+        # means the machine was asleep / the process was down (the Jun26->Jul4 gap).
+        last_ts = hb.get("last_cycle_ts")
+        gap_h = _hours_since(last_ts)
+        dark_threshold = 26.0 if at_startup else max(1.0, (3 * POLL_MINUTES) / 60.0)
+        if gap_h is not None and gap_h >= dark_threshold:
+            key = f"dark:{last_ts}"
+            if alerted.get("dark") != key:
+                notify_operator(
+                    "Trading bot: loop resumed after a gap",
+                    f"No cycle ran for ~{gap_h:.1f}h (last was {last_ts}). The bot "
+                    f"could not monitor stops/theses during that window. Verify open "
+                    f"positions now: {[p['symbol'] for p in hb.get('open_positions', [])]}.")
+                alerted["dark"] = key
+                fired = True
+
+        # 2) Stop-loss overdue — a position held past its stop for >=2 cycles.
+        overdue = [p for p in hb.get("open_positions", [])
+                   if p.get("past_stop") and int(p.get("cycles_past_stop", 0)) >= 2]
+        if overdue:
+            names = sorted(p["symbol"] for p in overdue)
+            key = "overdue:" + ",".join(names)
+            if alerted.get("overdue") != key:
+                notify_operator(
+                    "Trading bot: stop-loss NOT executed",
+                    f"{names} are past the hard stop and STILL held after >=2 cycles: "
+                    + "; ".join(f"{p['symbol']} {p['pnl_pct']}% (stop -{p['stop_pct']}%)"
+                                for p in overdue)
+                    + ". The engine should have force-sold — check for a blocked claude -p / broker issue.")
+                alerted["overdue"] = key
+                fired = True
+        elif alerted.get("overdue"):
+            alerted.pop("overdue", None)  # cleared -> allow a future re-alert
+
+        # 3) claude -p repeatedly failing.
+        fails = int(hb.get("consecutive_model_failures", 0))
+        if fails >= 3:
+            key = f"fails:{fails}"
+            if alerted.get("fails") != key:
+                notify_operator(
+                    "Trading bot: Claude unavailable",
+                    f"claude -p has failed {fails} cycles in a row (session/usage "
+                    f"limit or auth). No trades can execute until it recovers.")
+                alerted["fails"] = key
+                fired = True
+        elif alerted.get("fails"):
+            alerted.pop("fails", None)
+
+        if fired or alerted != hb.get("last_alerted", {}):
+            hb["last_alerted"] = alerted
+            save_json("logs/heartbeat.json", hb)
+    except Exception as e:
+        print(f"  [heartbeat] health check failed (ignored): {e}")
+
+
 def run_agent():
     log = load_trade_log()
     # Lean view (version_history elided) for the read-only cycle prompt; the full
@@ -2170,16 +2369,37 @@ def run_agent():
             if sym in held_syms and s.get("ok") and s.get("state") == "SELL":
                 must_sell.setdefault(sym, "ema_exit")
 
+    # THESIS-INTEGRITY AGENT (skill_2b): dedicated, web-enabled, decision-only pass
+    # on the ~NEWS_CHECK_HOURS cadence while positions are open + market is open. It
+    # reads the news the execution turn cannot (that turn has no web tools) and folds
+    # any broken thesis into must_sell → the same deterministic force_sell path as the
+    # stop-loss/trailing stop. Gated so it costs at most one extra Haiku call per ~4h.
+    if (task == "market_hours_check" and is_market_open() and log.get("open_positions")):
+        _last_tc = log["_state"].get("last_thesis_check_ts")
+        _tc_age = _hours_since(_last_tc)
+        if _tc_age is None or _tc_age >= NEWS_CHECK_HOURS:
+            broken = run_thesis_check(log, raw_sigs)
+            log["_state"]["last_thesis_check_ts"] = now_iso()
+            save_trade_log(log)
+            for _sym, _reason in broken.items():
+                must_sell.setdefault(_sym, _reason)
+
     # SMART SKIP: if every signal is NEUTRAL/HOLD and no stop-loss → no model call needed.
     # Research and midweek phases always run (they do web research, not just signal checks).
     if task == "market_hours_check":
         skip, skip_reason = should_skip_model_call(raw_sigs, log)
+        # A pending forced exit (stop-loss / trailing / thesis-break) must NEVER be
+        # skipped — the main turn + force_sell path is what actually places the sell.
+        if skip and must_sell:
+            skip, skip_reason = False, None
         if skip:
             stamp = datetime.now(ET).strftime("%Y-%m-%d_%H%M")
             print(f"[{stamp}] task={task} SKIPPED ({skip_reason}) — 0 equity tokens used.")
             # Still run the paper-options passes: the momentum edge fires on exactly
             # these flat-index cycles, and they no-op cheaply when nothing qualifies.
             _run_shadow_passes(raw_sigs, log)
+            write_heartbeat(log, task)
+            check_heartbeat_health(log)
             return
 
     # For market-hours execution checks, strip data the model doesn't need:
@@ -2316,6 +2536,8 @@ EXECUTION RULES:
                 f"claude -p is unavailable, so NOTHING was sold this cycle. Manual "
                 f"sell may be required until it recovers. Detail: {text[:180]}")
         save_trade_log(log)  # preserve the pre-call stamps
+        write_heartbeat(log, task, model_failed=True)
+        check_heartbeat_health(log)
         print(f"[{stamp}] task={task} done (model unavailable).")
         return
 
@@ -2419,6 +2641,11 @@ EXECUTION RULES:
     # whether or not the equity model was called this cycle.
     _run_shadow_passes(raw_sigs, log)
 
+    # Ops/heartbeat: record this (successful) cycle + surface any dark-loop /
+    # overdue-stop / repeated-failure condition. Model-free, never raises.
+    write_heartbeat(log, task, model_ran=True)
+    check_heartbeat_health(log)
+
     print(f"[{stamp}] task={task} done.")
 
 
@@ -2468,6 +2695,11 @@ def main():
         if not os.path.exists(v001_path) and os.path.exists(skill_path):
             shutil.copy(skill_path, v001_path)
             print(f"  [baseline] {sk}_v001.md created")
+
+    # Ops/heartbeat: on startup, alert immediately if the loop was dark for a long
+    # stretch (machine asleep / process down) — the Jun26->Jul4 blind spot. Uses the
+    # last heartbeat left by the previous run; no-op on a first-ever launch.
+    check_heartbeat_health(load_trade_log(), at_startup=True)
 
     if not is_market_open():
         now = datetime.now(ET)

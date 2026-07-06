@@ -2698,6 +2698,232 @@ def run_token_report():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 20 — thesis-integrity agent (skill_2b / run_thesis_check)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestThesisCheck(TmpDirMixin):
+    """The dedicated thesis agent is DECISION-ONLY: it parses a verdicts block and
+    returns {symbol: 'thesis_break'} for names that are broken OR decayed below the
+    trade floor (60). It must never raise into the loop — any failure => {}."""
+
+    def _verdict_text(self, verdicts):
+        return "prose...\n```json\n" + json.dumps({"verdicts": verdicts}) + "\n```"
+
+    def _run(self, positions, model_return):
+        self.tradelog["open_positions"] = positions
+        self._flush_log()
+        log = agent_module.load_trade_log()
+        with patch.object(agent_module, "run_model",
+                          return_value=(model_return, {"input_tokens": 1, "output_tokens": 1})):
+            return agent_module.run_thesis_check(log, {})
+
+    def test_flags_broken_thesis(self):
+        text = self._verdict_text([
+            {"symbol": "MU", "confidence": 80, "thesis_broken": False, "reason": "ok"},
+            {"symbol": "LABU", "confidence": 30, "thesis_broken": True, "reason": "FDA reject"}])
+        broken = self._run([self._open_pos("MU", pos_id="M1"),
+                            self._open_pos("LABU", pos_id="L1")], text)
+        self.assertEqual(broken, {"LABU": "thesis_break"})
+
+    def test_flags_confidence_below_floor_even_if_not_broken(self):
+        text = self._verdict_text([
+            {"symbol": "MU", "confidence": 45, "thesis_broken": False, "reason": "downgrade"}])
+        broken = self._run([self._open_pos("MU", pos_id="M1")], text)
+        self.assertEqual(broken, {"MU": "thesis_break"})
+
+    def test_intact_positions_return_empty(self):
+        text = self._verdict_text([
+            {"symbol": "MU", "confidence": 82, "thesis_broken": False, "reason": "ok"}])
+        self.assertEqual(self._run([self._open_pos("MU", pos_id="M1")], text), {})
+
+    def test_no_open_positions_short_circuits(self):
+        """Empty book => {} and run_model is never called (no token spend)."""
+        log = agent_module.load_trade_log()
+        with patch.object(agent_module, "run_model") as rm:
+            self.assertEqual(agent_module.run_thesis_check(log, {}), {})
+        rm.assert_not_called()
+
+    def test_model_error_returns_empty(self):
+        broken = self._run([self._open_pos("MU", pos_id="M1")],
+                           "(claude -p error rc=1: session limit)")
+        self.assertEqual(broken, {})
+
+    def test_malformed_output_returns_empty(self):
+        broken = self._run([self._open_pos("MU", pos_id="M1")], "no json at all here")
+        self.assertEqual(broken, {})
+
+    def test_verdict_for_unheld_symbol_is_ignored(self):
+        text = self._verdict_text([
+            {"symbol": "TSLA", "confidence": 10, "thesis_broken": True, "reason": "x"}])
+        self.assertEqual(self._run([self._open_pos("MU", pos_id="M1")], text), {})
+
+    def test_never_raises_on_internal_error(self):
+        """If run_model itself blows up, the exception is swallowed and {} returned."""
+        self.tradelog["open_positions"] = [self._open_pos("MU", pos_id="M1")]
+        self._flush_log()
+        log = agent_module.load_trade_log()
+        with patch.object(agent_module, "run_model", side_effect=RuntimeError("boom")):
+            try:
+                self.assertEqual(agent_module.run_thesis_check(log, {}), {})
+            except Exception as e:
+                self.fail(f"run_thesis_check must never raise, got {e!r}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 20b — run_agent wiring: thesis break -> force_sell (integration)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestThesisWiringIntegration(TmpDirMixin):
+    """End-to-end through run_agent: on a market-hours cycle with the thesis gate
+    stale, a thesis-break verdict must be folded into must_sell, override the smart
+    skip, and reach the deterministic force_sell path — never trusting a footer."""
+
+    def setUp(self):
+        super().setUp()
+        os.makedirs(os.path.join(self.tmpdir, "logs"), exist_ok=True)
+        # skill_2b file so run_thesis_check has its system prompt (content irrelevant
+        # to the mock, which branches on the web= kwarg).
+        with open(os.path.join(self.tmpdir, "skills", "skill_2b_thesis.md"), "w") as f:
+            f.write("thesis agent")
+        self.tradelog["open_positions"] = [self._open_pos("MU", entry=1000.0, shares=0.1,
+                                                          pos_id="M1")]
+        self._flush_log()
+
+    def test_thesis_break_reaches_force_sell_and_writes_heartbeat(self):
+        raw = {"MU": {"ok": True, "state": "BUY", "transition": "NO_ACTION",
+                      "last_close": 990.0}}
+        fake_signals = MagicMock()
+        fake_signals.signals_with_raw.return_value = (raw, "MU: BUY")
+        fake_signals.signal_for.return_value = {"ok": True, "last_close": 990.0}
+
+        usage = {"input_tokens": 1, "output_tokens": 1, "cost_usd": 0.0}
+
+        def fake_run_model(system, user, **kwargs):
+            if kwargs.get("web"):  # the thesis agent call
+                return ('```json\n{"verdicts":[{"symbol":"MU","confidence":20,'
+                        '"thesis_broken":true,"reason":"catalyst gone"}]}\n```', usage)
+            # the main execution turn — benign footer (its claims are NOT trusted)
+            return ('```json\n{"cash":10,"positions":[],"actions_taken":[]}\n```', usage)
+
+        force = MagicMock(return_value=(True, 990.0))
+        with patch.object(agent_module, "signals", fake_signals), \
+             patch.object(agent_module, "active_skill",
+                          return_value=("SKILL", "market_hours_check")), \
+             patch.object(agent_module, "is_market_open", return_value=True), \
+             patch.object(agent_module, "run_model", side_effect=fake_run_model), \
+             patch.object(agent_module, "read_broker_state",
+                          return_value=([{"symbol": "MU", "shares": 0.1}], set())), \
+             patch.object(agent_module, "force_sell", force), \
+             patch.object(agent_module, "process_cycle_state"), \
+             patch.object(agent_module, "process_strategy_rewrite_queue"), \
+             patch.object(agent_module, "_run_shadow_passes"):
+            agent_module.run_agent()
+
+        # force_sell fired for MU with the thesis-break reason
+        force.assert_called_once()
+        args = force.call_args[0]
+        self.assertEqual(args[0], "MU")
+        self.assertEqual(args[2], "thesis_break")
+        # gate stamped + heartbeat written
+        log = agent_module.load_trade_log()
+        self.assertIn("last_thesis_check_ts", log["_state"])
+        self.assertTrue(os.path.exists(os.path.join(self.tmpdir, "logs", "heartbeat.json")))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 21 — ops / heartbeat (write_heartbeat + check_heartbeat_health)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestHeartbeat(TmpDirMixin):
+    """Model-free ops watchdog. write_heartbeat records the cycle; the health check
+    fires notify_operator on dark-loop / overdue-stop / repeated-failure, de-dupes a
+    standing condition, and never raises."""
+
+    def setUp(self):
+        super().setUp()
+        os.makedirs(os.path.join(self.tmpdir, "logs"), exist_ok=True)
+
+    def _hb(self):
+        return json.load(open(os.path.join(self.tmpdir, "logs", "heartbeat.json")))
+
+    def test_write_heartbeat_schema_and_failure_counter(self):
+        log = agent_module.load_trade_log()
+        with patch.object(agent_module, "signals", None):
+            agent_module.write_heartbeat(log, "market_hours_check", model_failed=True)
+            self.assertEqual(self._hb()["consecutive_model_failures"], 1)
+            agent_module.write_heartbeat(log, "market_hours_check", model_failed=True)
+            self.assertEqual(self._hb()["consecutive_model_failures"], 2)
+            # a successful turn resets the counter
+            agent_module.write_heartbeat(log, "market_hours_check", model_ran=True)
+        hb = self._hb()
+        self.assertEqual(hb["consecutive_model_failures"], 0)
+        self.assertIn("last_cycle_ts", hb)
+        self.assertEqual(hb["mode"], agent_module.EXECUTION_MODE)
+
+    def test_write_heartbeat_never_raises(self):
+        try:
+            agent_module.write_heartbeat("not-a-log-dict", "task")
+        except Exception as e:
+            self.fail(f"write_heartbeat must never raise, got {e!r}")
+
+    def test_dark_loop_alert_fires_once(self):
+        old = (datetime.now(agent_module.ET) - timedelta(hours=40)).isoformat()
+        hb = {"last_cycle_ts": old, "open_positions": [], "last_alerted": {}}
+        json.dump(hb, open(os.path.join(self.tmpdir, "logs", "heartbeat.json"), "w"))
+        with patch.object(agent_module, "notify_operator") as notif:
+            agent_module.check_heartbeat_health(agent_module.load_trade_log(), at_startup=True)
+            agent_module.check_heartbeat_health(agent_module.load_trade_log(), at_startup=True)
+        notif.assert_called_once()  # de-duped on the second identical check
+
+    def test_overdue_stop_alert(self):
+        hb = {"last_cycle_ts": datetime.now(agent_module.ET).isoformat(),
+              "open_positions": [{"symbol": "MU", "pnl_pct": -17.0, "stop_pct": 10.0,
+                                  "past_stop": True, "cycles_past_stop": 2}],
+              "last_alerted": {}}
+        json.dump(hb, open(os.path.join(self.tmpdir, "logs", "heartbeat.json"), "w"))
+        with patch.object(agent_module, "notify_operator") as notif:
+            agent_module.check_heartbeat_health(agent_module.load_trade_log())
+        notif.assert_called_once()
+        self.assertIn("stop-loss", notif.call_args[0][0].lower())
+
+    def test_overdue_stop_not_fired_after_one_cycle(self):
+        """A position past-stop for only 1 cycle is within the force_sell retry window."""
+        hb = {"last_cycle_ts": datetime.now(agent_module.ET).isoformat(),
+              "open_positions": [{"symbol": "MU", "pnl_pct": -17.0, "stop_pct": 10.0,
+                                  "past_stop": True, "cycles_past_stop": 1}],
+              "last_alerted": {}}
+        json.dump(hb, open(os.path.join(self.tmpdir, "logs", "heartbeat.json"), "w"))
+        with patch.object(agent_module, "notify_operator") as notif:
+            agent_module.check_heartbeat_health(agent_module.load_trade_log())
+        notif.assert_not_called()
+
+    def test_repeated_model_failures_alert(self):
+        hb = {"last_cycle_ts": datetime.now(agent_module.ET).isoformat(),
+              "open_positions": [], "consecutive_model_failures": 3, "last_alerted": {}}
+        json.dump(hb, open(os.path.join(self.tmpdir, "logs", "heartbeat.json"), "w"))
+        with patch.object(agent_module, "notify_operator") as notif:
+            agent_module.check_heartbeat_health(agent_module.load_trade_log())
+        notif.assert_called_once()
+        self.assertIn("unavailable", notif.call_args[0][0].lower())
+
+    def test_healthy_state_is_silent(self):
+        hb = {"last_cycle_ts": datetime.now(agent_module.ET).isoformat(),
+              "open_positions": [{"symbol": "MU", "pnl_pct": 5.0, "stop_pct": 10.0,
+                                  "past_stop": False, "cycles_past_stop": 0}],
+              "consecutive_model_failures": 0, "last_alerted": {}}
+        json.dump(hb, open(os.path.join(self.tmpdir, "logs", "heartbeat.json"), "w"))
+        with patch.object(agent_module, "notify_operator") as notif:
+            agent_module.check_heartbeat_health(agent_module.load_trade_log())
+        notif.assert_not_called()
+
+    def test_health_check_never_raises_on_missing_file(self):
+        try:
+            agent_module.check_heartbeat_health(agent_module.load_trade_log())
+        except Exception as e:
+            self.fail(f"check_heartbeat_health must never raise, got {e!r}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # MAIN — run tests + print token report
 # ═══════════════════════════════════════════════════════════════════════════════
 
