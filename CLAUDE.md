@@ -98,10 +98,11 @@ Drop a CSV with a `Close` column at `data/<SYMBOL>.csv` to override Yahoo Financ
 
 ### Skills (`skills/`)
 
-Eight role-based markdown prompts loaded as the `system` context for each agent turn:
+Nine role-based markdown prompts loaded as the `system` context for each agent turn:
 - `skill_0_orchestrator.md` — injected every cycle; coordinates the other skills
 - `skill_1_research.md` — weekend/after-hours scanner, writes `research/weekend_picks_*.md`
 - `skill_2_execution.md` — market-hours executor (Mon + intraweek)
+- `skill_2b_thesis.md` — **decision-only** thesis-integrity agent; runs on the ~`NEWS_CHECK_HOURS` cadence during market hours, web-searches per held position, and emits a machine-readable `verdicts` JSON that the engine turns into `force_sell` exits (see below). Split out of skill_2 because the execution turn has no web tools.
 - `skill_3_midweek.md` — Wednesday position review, writes `research/midweek_review_*.md`
 - `skill_4_postmortem.md` — fires on LOSS; writes `postmortems/postmortem_NNN.md`
 - `skill_4b_victory.md` — fires on WIN; writes `postmortems/victory_NNN.md`
@@ -114,7 +115,11 @@ Phase routing in `agent.py:active_skill()`:
 - Off-hours + Wednesday (and `midweek_review_{today}.md` not yet written) → skill_3 (fallback if script started after close)
 - Otherwise → skill_1
 
-`skill_2_execution.md` runs a **thesis integrity check** on every cycle (including `forced_news_check` wakeups): for each held position, searches for breaking news, re-scores confidence, and sells immediately if the thesis-breaking event has occurred or confidence drops below 60. This is the only sell path that can fire before a −10% stop-loss when news changes faster than the EMA can react.
+**Thesis-integrity agent (`skill_2b_thesis.md` + `run_thesis_check()`).** The per-position news check used to live inside `skill_2_execution.md`, but the market-hours execution turn (`agent.py:run_agent` → `run_model(..., mcp=True)`) is called with **no `web=True`**, so the model had no WebSearch/WebFetch tool and the check could never actually run — a latent gap on the only sell path that can fire before a −10% stop-loss when news moves faster than the lagging EMA. It is now its own **dedicated, web-enabled, decision-only** agent: `run_thesis_check(log, raw_sigs)` runs at most once per `NEWS_CHECK_HOURS` (gated on `_state.last_thesis_check_ts`, same pattern as the forced-news-check gate) while positions are open and the market is open, calls `claude -p` on `CHECK_MODEL` with `web=True, read_only=True` (web + RH-read tools, **no order tools**), and parses a trailing `{"verdicts":[{symbol,confidence,thesis_broken,reason}]}` block. Any name with `thesis_broken` or `confidence < 60` is folded into the pre-turn `must_sell` set (`reason='thesis_break'`) and exits through the **same deterministic `force_sell` path** as the hard/trailing stop — the model never places the sell, so the footer-lie failure mode can't apply. A pending `must_sell` (from stop-loss, trailing, or thesis-break) also **overrides the smart skip**, so a broken thesis fires a forced exit even on an otherwise-flat cycle. The pass is fully wrapped (returns `{}` on any failure, never raises); transcripts append to `logs/thesis_YYYY-MM.md`. `skill_2` no longer web-searches per position.
+
+### Ops / heartbeat (model-free watchdog)
+
+`write_heartbeat()` + `check_heartbeat_health()` are a **model-free** (0-token) ops layer that runs at the end of **every** cycle (including skipped ones) and once at startup. `write_heartbeat()` records `logs/heartbeat.json` — `{last_cycle_ts, last_task, last_successful_equity_turn_ts, consecutive_model_failures, open_positions:[{symbol,pnl_pct,stop_pct,past_stop,cycles_past_stop}], mode, last_alerted}`. `check_heartbeat_health()` fires `notify_operator()` (the same direct-HTTP-POST alert used for forced exits — **not** a `claude -p` call, so it works when Claude itself is down) on three conditions, each de-duped via the `last_alerted` marker so a standing condition doesn't spam: (1) **loop went dark** — no cycle for ≥26h at startup (or ≥3×`POLL_MINUTES` intraday); this is what would have surfaced the Jun 26→Jul 4 outage the instant the machine woke; (2) **stop-loss overdue** — a position past its `effective_stop_pct` and still held ≥2 cycles; (3) **`claude -p` failing** — `consecutive_model_failures ≥ 3` (incremented on the model-error early-return, reset on any successful turn). Both functions are wrapped and never raise. **Caveat:** this is in-process — it cannot run while the Mac is asleep; it only *surfaces* a gap on resume. A truly always-on watchdog would read the same `logs/heartbeat.json` from a separate always-on host (documented as future work, not built).
 
 #### Research phase (`skill_1_research.md`)
 

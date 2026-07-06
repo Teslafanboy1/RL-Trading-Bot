@@ -111,25 +111,40 @@ intraweek redeploy alike.
 - If **LATEST MIDWEEK REVIEW** is present and flags a redeploy candidate, treat
   that candidate as your next buy target once cash settles.
 
-## Thesis integrity check — now owned by the dedicated thesis agent (skill_2b)
+## Thesis integrity check (every cycle, for every held position)
 
-You no longer web-search per-position news yourself. A dedicated, web-enabled
-**thesis-integrity agent** (`skill_2b_thesis.md`) runs on the ~`NEWS_CHECK_HOURS`
-(default 4h) cadence during market hours: it re-scores every held position against
-its thesis and the "one thing that would invalidate it", and any broken thesis
-(or confidence decayed below 60) is fed straight into the engine's deterministic
-`force_sell` path — the same mechanism as the hard/trailing stop, tagged
-`reason="thesis_break"`. This split exists because the market-hours execution turn
-(you) has **no web tools**, so the old per-position news search here could never
-actually run.
+Run this even when the EMA shows HOLD and no stop-loss has triggered. The 55-bar
+EMA is a lagging indicator — it can take hours or days to reflect a bad earnings
+print, a CEO resignation, a sector shock, or a regulatory reversal. This check
+is the only mechanism that can sell before the damage reaches −10%.
 
-What this means for you:
-- Do **not** attempt `"[SYMBOL] news today"` web searches — you have no web tool.
-- You do **not** place thesis-break, trailing-stop, or hard-stop exits; the engine
-  fires all three via `force_sell` and re-fires until the broker confirms the exit.
-- If the injected STOP-LOSS / SELL SIGNAL blocks flag a name, still sell it first
-  (those are the deterministic exits surfaced to you). Otherwise focus on the BUY
-  side: scaling winners and vetting new entries against the gates above.
+For **each open position**:
+1. **Web search** `"[SYMBOL] news today"` — scan the top 3–5 results for:
+   - Earnings miss or guidance cut
+   - Regulatory action, lawsuit, or FDA rejection
+   - CEO/CFO departure or scandal
+   - Sector-wide shock (rate hike surprise, tariff, ban)
+   - The specific "one thing that would invalidate this thesis" from the picks file
+2. **Re-score confidence** (0–100) using the same formula as research:
+   - If the thesis-breaking event has occurred → score drops to 0 → **sell immediately**
+   - If sentiment has significantly shifted (e.g., analyst downgrade, key source turned bearish) → re-score; if now below 60 → **sell immediately**
+   - If no material change → hold, no action needed
+3. **Ribbon check (ADVISORY under let-winners-run)**: the ribbon is four plain EMAs
+   — EMA 8/13/21/55 (matches the operator's chart; its "TEMA"-labeled indicator is
+   actually plain `ema()`). With `risk_management.exit_on_ribbon_sell=false` (current
+   config), a held symbol flipping to **SELL state** is **NOT** an automatic sell — the
+   mechanical exit is owned by the engine's deterministic **trailing stop** (25% off the
+   post-entry peak) and the hard stop. Do **not** reflexively dump on a ribbon flip; that
+   cut winners early (measured: the strategy lost to buy-and-hold on 23/29 names). Treat a
+   ribbon SELL as a prompt to scrutinize the thesis, not as the sell trigger itself.
+4. If selling because the **thesis is broken** (not merely the ribbon): execute via
+   Robinhood MCP at market and set `reason="thesis_break"` in `actions_taken`. You do NOT
+   need to place trailing-stop or hard-stop exits — the engine fires those itself via
+   `force_sell` and will re-fire until the broker confirms the position is gone.
+
+Do **not** skip this section on "forced_news_check" cycles — that is exactly when
+it is most important. A forced check fires every `NEWS_CHECK_HOURS` (default 4h)
+specifically to run this section on days when the EMA never triggers.
 
 ## SELL (let-winners-run exit policy)
 The mechanical exits are owned by the engine, **not** by you, and fire deterministically
