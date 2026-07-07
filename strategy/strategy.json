@@ -1,7 +1,7 @@
 {
-  "version": 30,
+  "version": 32,
   "goal": "100% monthly portfolio return",
-  "last_updated": "2026-06-26",
+  "last_updated": "2026-07-07",
   "account": {
     "type": "true_cash",
     "settlement": "T+1",
@@ -31,10 +31,10 @@
       "macro": "Fed calendar earnings calendar"
     },
     "source_weights": {
-      "news": 0.3595,
-      "social": 0.1585,
-      "fundamental": 0.3631,
-      "macro": 0.1189
+      "news": 0.3567,
+      "social": 0.1502,
+      "fundamental": 0.3805,
+      "macro": 0.1126
     },
     "source_performance": {
       "news": {
@@ -80,11 +80,11 @@
   },
   "progress_tracking": {
     "monthly_goal": "100%",
-    "month_start_value": 254.745,
-    "current_value": 255.5464,
-    "current_return": "0.3%",
+    "month_start_value": 391.725,
+    "current_value": 373.6746,
+    "current_return": "-4.6%",
     "on_track": false,
-    "required_weekly_return": 0.0,
+    "required_weekly_return": 27.99,
     "_rebase_note": "2026-06-24: operator added ~$154.57 of new capital (account $102.28 -> broker total $256.85). month_start_value rebased UP by the deposit (100.17 -> 254.745) so the deposit is NOT counted as a trading gain and so the risk-based sizing denominator (agent.py reads summary.current_value = month_start_value + total_pnl) sees the full account. Without this rebase the sizing layer would keep trading against the stale ~$102 base and leave the new ~$150 idle. current_value = 254.745 + total_pnl(2.1087) = 256.8537 ~= broker total. required_weekly_return is stale and will be recomputed next cycle by update_monthly_progress; it is INFORMATIONAL only.",
     "_note": "2026-06-22 (Phase A): goal reframed - see goal_framing. 100%/mo is an aspirational ceiling; the operating mandate is risk-adjusted compounding under position_sizing + factor_exposure_limits. required_weekly_return is INFORMATIONAL, not a sizing input - never raise per-trade risk to chase it."
   },
@@ -99,7 +99,9 @@
     "exit_on_ribbon_sell": false,
     "exit_on_ribbon_sell_note": "false (current): the trailing stop + hard stop govern the mechanical exit; a ribbon SELL-state flip on a held name is ADVISORY only (skill_2 may still exit a BROKEN THESIS, reason=thesis_break). This is what 'let winners run' requires - the old ribbon-SELL forced exit cut winners early (measured: strategy lost to buy&hold on 23/29 names). Set true to restore the prior always-sell-on-SELL-state behavior. Gated in agent.py must_sell + should_skip_model_call + _format_ema_sell_block.",
     "scale_into_winners": true,
-    "scale_into_winners_note": "true (2026-06-25, operator-directed): when settled cash exceeds the cash_reserve, a held position in confirmed BUY/HOLD ribbon state and in the green that sits BELOW its band ceiling is TOPPED UP toward the ceiling (buy the weight difference) BEFORE any new-name buy or holding cash. Enforced as a directive in skill_2 (Before every BUY) + skill_3 (Step 3/Step 5 SCALE_UP). record_open_position() blends cost basis + sums shares + keeps the higher peak on an add so the stop/trailing/P&L machinery stays in sync with the broker. NEVER average down into a SELL-state or losing name (the SOXL/AMD knife-catch failure mode) \u2014 only BUY/HOLD winners qualify. The new-name entry gate (fresh ribbon BUY + conf>=60 + factor/sector caps) is UNCHANGED; this only puts idle cash to work in names already proven, it does NOT relax knife-catch protection."
+    "scale_into_winners_note": "true (2026-06-25, operator-directed): when settled cash exceeds the cash_reserve, a held position in confirmed BUY/HOLD ribbon state and in the green that sits BELOW its band ceiling is TOPPED UP toward the ceiling (buy the weight difference) BEFORE any new-name buy or holding cash. Enforced as a directive in skill_2 (Before every BUY) + skill_3 (Step 3/Step 5 SCALE_UP). record_open_position() blends cost basis + sums shares + keeps the higher peak on an add so the stop/trailing/P&L machinery stays in sync with the broker. NEVER average down into a SELL-state or losing name (the SOXL/AMD knife-catch failure mode) \u2014 only BUY/HOLD winners qualify. The new-name entry gate (fresh ribbon BUY + conf>=60 + factor/sector caps) is UNCHANGED; this only puts idle cash to work in names already proven, it does NOT relax knife-catch protection.",
+    "monthly_halt_dd": 0.25,
+    "monthly_halt_note": "Account-level kill-switch (risk_guard.py, approved 2026-07-06): if broker total equity draws down >= 25% from the month's peak, every position is force-sold and a HALT file is written; the loop refuses to trade while it exists. Deleting HALT is a deliberate manual operator act after review."
   },
   "learned_rules": [
     {
@@ -787,6 +789,22 @@
       "trade_ids": [
         "T0009"
       ]
+    },
+    {
+      "version": 31,
+      "date": "2026-07-07",
+      "timestamp": "2026-07-06T15:15:52-04:00",
+      "change": "source-weight rebalance after trade T0015",
+      "trade_ids": [
+        "T0015"
+      ]
+    },
+    {
+      "version": 32,
+      "date": "2026-07-07",
+      "timestamp": "2026-07-07T01:44:40-04:00",
+      "change": "v31 (operator-approved 2026-07-06): RX-3 deployment scaffolding. New `rotation` block = the deterministic rotation_engine.py config (top-2 momentum rotation x vol throttle 0.50 x RISKX 5-signal risk-appetite gate + DEFENS defensive-momentum sleeve + T-bill cash sweep), running PAPER-ONLY until the promotion ladder passes (see research/redesign_proposal_2026-07-06.md addendum). New risk_management.monthly_halt_dd=0.25: account-level kill-switch (risk_guard.py) \u2014 a 25% drawdown from the month's peak broker equity flattens the book and halts trading until the operator deletes the HALT file. Legacy live behavior otherwise unchanged.",
+      "trade_ids": []
     }
   ],
   "concentration": {
@@ -795,5 +813,71 @@
     "selection": "momentum_rank gated by EMA_BUY + above_SMA200 + max_2_per_sector",
     "leveraged_etfs_eligible": true,
     "directed_by": "operator, 2026-06-26"
+  },
+  "rotation": {
+    "_note": "RX-3 (approved 2026-07-06). Engine: rotation_engine.py \u2014 pure Python, same math as the edge_lab backtests (10y lagged: ~+51%/yr, Sharpe ~1.5, maxDD 33%; salted-universe floor ~+39%; honest forward +25-40%/yr). paper_enabled gates the daily paper pass (agent.process_rx3_paper -> shadow/rx3_paper.json). mode stays 'paper' until the promotion ladder (>=10 paper days consistent with the engine, then half size 2wks) passes; flipping to live is an OPERATOR action.",
+    "mode": "paper",
+    "paper_enabled": true,
+    "top_n": 2,
+    "target_vol": 0.5,
+    "riskx_components": [
+      [
+        "HYG",
+        "IEF"
+      ],
+      [
+        "XLY",
+        "XLP"
+      ],
+      [
+        "CPER",
+        "GLD"
+      ],
+      [
+        "IWM",
+        "SPY"
+      ],
+      [
+        "BTC-USD",
+        null
+      ]
+    ],
+    "defensive_assets": [
+      "GLD",
+      "TLT",
+      "XLU",
+      "XLP"
+    ],
+    "cash_sweep_etf": "SGOV",
+    "universe": [
+      "NVDA",
+      "AMD",
+      "AVGO",
+      "MU",
+      "AMAT",
+      "SMCI",
+      "MRVL",
+      "TSM",
+      "PLTR",
+      "COIN",
+      "MSTR",
+      "HOOD",
+      "SOFI",
+      "SNOW",
+      "CRWD",
+      "NET",
+      "DDOG",
+      "META",
+      "TSLA",
+      "SHOP",
+      "RBLX",
+      "TQQQ",
+      "SOXL",
+      "FNGU",
+      "TECL",
+      "LABU",
+      "FAS",
+      "TNA"
+    ]
   }
 }

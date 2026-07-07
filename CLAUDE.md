@@ -215,3 +215,45 @@ Per-cycle model transcripts and skill_5 outputs append to a **single monthly rol
 - **Trailing stop ("let winners run")** (`risk_management.trailing_stop_pct`, default `0.25`): a held position that gives back ≥ 25% from its post-entry high-water mark (`peak_price`, tracked every cycle by `update_position_peaks()`) is force-sold (`reason='trailing_stop'`, **not** tagged `stop_loss`) via the same deterministic `force_sell` path as the hard stop. This is the **primary momentum exit**. The old ribbon `SELL`-state forced exit is gated behind `risk_management.exit_on_ribbon_sell` (now **`false`**): a `SELL` state on a held name is **advisory** — `skill_2` may still exit a *broken thesis* (`reason='thesis_break'`), but the ribbon flip no longer auto-sells and no longer wakes the model (`_format_ema_sell_block` degrades to an advisory note; the `ema_sell_held`/`exit` skip-wakes are gated off). Set `exit_on_ribbon_sell: true` to restore the prior always-sell-on-`SELL`-state behavior. Rationale: a 10y/29-name backtest (`backtest.py` + `research/trail_probe.py`) showed the ribbon-state exit cut winners early (lost to buy-and-hold on 23/29 names); the trailing stop lifts portfolio ann. return ~18→20%, per-trade expectancy ~14→27–46%, PF ~4.2→5–7, at modestly higher drawdown. **A 15-min poller cannot beat an overnight gap — position sizing (esp. the leveraged-sleeve cap) is the real gap defense.**
 - **Account**: always use account `696283985` (Agentic cash, not the margin account).
 - **Core rule changes** require 3+ similar outcomes before applying; minor tweaks (weights, targets, sizing) auto-apply.
+
+## RX-3 (approved 2026-07-06) — deterministic rotation, paper phase
+
+The operator-approved next-generation strategy runs **paper-only** alongside the
+legacy live loop until its promotion ladder passes (2 weeks paper → 2 weeks half
+size → full; see `research/redesign_proposal_2026-07-06.md`).
+
+- **`rotation_engine.py`** — pure deterministic brain (no I/O): top-2 momentum
+  rotation (rank `0.5·r1m + 0.3·r1w + 0.2·r6m`, eligibility = momentum gate +
+  >SMA200) × vol throttle (`min(1, 0.50/realized_21d)`) × **RISKX** 5-signal
+  cross-asset risk-appetite gate (HYG/IEF, XLY/XLP, CPER/GLD, IWM/SPY, BTC 1m) +
+  **DEFENS** (RISKX-freed capital → strongest of GLD/TLT/XLU/XLP). All inputs are
+  closes **through yesterday** (strict lag discipline — three same-day look-ahead
+  bugs were caught in research; backtest and live share these exact functions).
+  Config lives in `strategy.json → rotation` (universe, `paper_enabled`, `mode`).
+- **`agent.process_rx3_paper()`** — once per market day (any cycle, incl. skips):
+  fetches daily closes from Yahoo (zero model tokens), computes the target book,
+  rebalances the paper portfolio at 5bps/side, appends the equity curve to
+  `shadow/rx3_paper.json`. Promotion gate #1 = ≥10 paper days whose decisions
+  match the engine and behavior consistent with the backtest envelope
+  (10y lagged: ~+51%/yr, Sharpe ~1.5, maxDD 33%; honest forward +25–40%/yr).
+- **`risk_guard.py`** — account-level kill-switch + heartbeat: every cycle writes
+  `logs/heartbeat`; `check_halt(broker_total)` tracks the month-peak equity in
+  `logs/risk_state.json` and on a ≥25% monthly drawdown writes the **`HALT`**
+  file, force-flattens the book (through the deterministic `force_sell` path) and
+  refuses to trade until the operator deletes `HALT`. The broker read
+  (`read_broker_state`) now also returns the account total, which feeds the halt
+  check and `sync_account_equity()` (auto-rebases `month_start_value` on
+  deposits/withdrawals ≥$25 and ≥5% — fixes the stale-denominator drift).
+- **`watchdog.py`** (launchd `com.tradingbot.watchdog`, every 5 min) — the
+  INDEPENDENT dead-man: alerts when the heartbeat is stale >30 min during market
+  hours, when a symbol in `logs/stops.json` (written every cycle by
+  `write_stop_snapshot`) trades at/through its stop, or when `HALT` exists.
+  Robinhood does not support GTC stop orders on fractional shares, so this
+  watchdog + `stops.json` is the stop-defense that survives the bot dying (the
+  2026-06-27..07-02 MU hole: −17% through a −10% stop with nobody watching).
+- **Alerts**: drop an ntfy/Slack/Discord webhook URL into `.alert_webhook_url`
+  (gitignored); `run.sh` and `watchdog.py` both pick it up. ntfy URLs get native
+  title/priority formatting in `notify_operator()`.
+- Research harnesses for all of the above: `research/edge_lab.py`,
+  `edge_lab2.py`, `edge_lab3.py` (28 mechanisms tested; survivors documented in
+  the proposal addendum). Every future strategy idea must win there first.

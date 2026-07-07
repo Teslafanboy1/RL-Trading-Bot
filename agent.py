@@ -85,14 +85,23 @@ def notify_operator(subject, body):
     if not url:
         return
     try:
-        payload = json.dumps({
-            "title": subject,
-            "message": body,
-            "text": f"*{subject}*\n{body}",  # Slack/Discord-compatible field
-        }).encode("utf-8")
-        req = urllib.request.Request(
-            url, data=payload, method="POST",
-            headers={"Content-Type": "application/json"})
+        if "ntfy" in url:
+            # ntfy-native publish: plain-text body, title/priority in headers, so
+            # the phone notification is readable instead of a raw JSON blob.
+            req = urllib.request.Request(
+                url, data=body.encode("utf-8"), method="POST",
+                headers={"Title": subject.encode("ascii", "ignore").decode(),
+                         "Priority": "high",
+                         "Content-Type": "text/plain"})
+        else:
+            payload = json.dumps({
+                "title": subject,
+                "message": body,
+                "text": f"*{subject}*\n{body}",  # Slack/Discord-compatible field
+            }).encode("utf-8")
+            req = urllib.request.Request(
+                url, data=payload, method="POST",
+                headers={"Content-Type": "application/json"})
         urllib.request.urlopen(req, timeout=10)
     except Exception as e:
         # Last resort: the stdout line above already fired; just note the miss.
@@ -113,6 +122,16 @@ try:
     import momentum_screen  # Phase B+ multi-timeframe momentum screener (optional)
 except Exception:
     momentum_screen = None
+
+try:
+    import rotation_engine  # RX-3 deterministic brain (paper mode until promoted)
+except Exception:
+    rotation_engine = None
+
+try:
+    import risk_guard  # account-level kill-switch + heartbeat (approved 2026-07-06)
+except Exception:
+    risk_guard = None
 
 DEFAULT_STOP_LOSS_PCT = 0.10  # hard 10% drawdown limit
 
@@ -1492,14 +1511,18 @@ def read_broker_state():
     both still held at full size and ZERO orders placed. Trusting that footer
     phantom-closed both positions and fired two bogus postmortems.
 
-    Returns (positions, sell_symbols_today):
+    Returns (positions, sell_symbols_today, account_total):
       positions          — list of {symbol, shares, avg_price, last_price}, or
                            None if the read itself failed (caller must then NOT
                            treat anything as closed — a failed read is unknown,
                            not "flat").
       sell_symbols_today — set of symbols with a SELL order placed today in any
                            state (used to avoid double-selling: don't force-sell a
-                           name the main turn already has a working order for)."""
+                           name the main turn already has a working order for).
+      account_total      — the broker's real total account value (get_portfolio),
+                           or None. Feeds the monthly-drawdown kill-switch and the
+                           deposit-aware equity rebase (the $255-vs-$395 sizing
+                           drift found in the 2026-07-06 audit)."""
     system = ("You are a read-only Robinhood query tool. Use only the MCP read "
               "tools. Do not place, modify, or cancel any order.")
     today = datetime.now(ET).strftime("%Y-%m-%d")
@@ -1508,20 +1531,26 @@ def read_broker_state():
         "1. Call get_equity_positions and list every currently held position.\n"
         f"2. Call get_equity_orders (created_at_gte={today}) and note which symbols "
         "have a SELL-side order placed today (any state).\n"
+        "3. Call get_portfolio and read total_value (the account's total value).\n"
         "Output ONLY one fenced ```json block, no prose:\n"
         '{"positions": [{"symbol": "X", "shares": <float>, "avg_price": <float>, '
-        '"last_price": <float|null>}], "sell_orders_today": ["SYM", ...]}\n'
+        '"last_price": <float|null>}], "sell_orders_today": ["SYM", ...], '
+        '"account_total": <float|null>}\n'
         "shares = quantity held (use 0 only if truly flat). If no positions, use []."
     )
     text, _ = run_model(system, user, mcp=True, read_only=True, model=CHECK_MODEL,
                         timeout=240)
     block = extract_last_json_block(text)
     if not (block and isinstance(block, dict) and isinstance(block.get("positions"), list)):
-        return None, set()
+        return None, set(), None
     positions = [p for p in block["positions"]
                  if p.get("symbol") and float(p.get("shares") or 0) > 0]
     sells = {s.upper() for s in (block.get("sell_orders_today") or []) if isinstance(s, str)}
-    return positions, sells
+    try:
+        total = float(block.get("account_total") or 0) or None
+    except (TypeError, ValueError):
+        total = None
+    return positions, sells, total
 
 
 def force_sell(symbol, shares, reason):
@@ -1893,6 +1922,10 @@ def _run_shadow_passes(raw_sigs, log):
         process_momentum_shadow(log)
     except Exception as e:
         print(f"  [momentum] momentum shadow pass failed: {e}")
+    try:
+        process_rx3_paper(log)
+    except Exception as e:
+        print(f"  [rx3] paper pass failed: {e}")
 
 
 def process_cycle_state(log, actions, broker_positions, exit_info=None):
@@ -1946,6 +1979,207 @@ def process_cycle_state(log, actions, broker_positions, exit_info=None):
     # 3. snapshot the authoritative broker positions for next cycle's diff.
     log["_state"]["last_positions"] = broker_positions
     save_trade_log(log)
+
+
+def sync_account_equity(log, broker_total):
+    """Deposit-aware equity sync off the REAL broker total (2026-07-06 audit fix).
+
+    If the broker total differs from the tracked current_value by enough to be
+    an external deposit/withdrawal (risk_guard.detect_deposit thresholds), the
+    delta is folded into month_start_value AND current_value so (a) deposits are
+    never counted as trading gains and (b) the risk-sizing denominator tracks
+    the real account instead of a stale manual rebase. Mirrors the operator's
+    manual 2026-06-24 rebase, automatically. Never raises."""
+    try:
+        if not (risk_guard and broker_total):
+            return
+        s = log.get("summary", {})
+        delta = risk_guard.detect_deposit(broker_total, s.get("current_value"))
+        if not delta:
+            return
+        s["month_start_value"] = round(float(s.get("month_start_value") or 0) + delta, 4)
+        s["current_value"] = round(float(s.get("current_value") or 0) + delta, 4)
+        strategy = load_strategy()
+        pt = strategy.get("progress_tracking")
+        if pt:
+            pt["month_start_value"] = s["month_start_value"]
+            pt["current_value"] = s["current_value"]
+            save_strategy(strategy)
+        save_trade_log(log)
+        print(f"  [equity-sync] external deposit/withdrawal detected: {delta:+.2f} "
+              f"(broker total {broker_total:.2f}) — month_start_value rebased, "
+              "not counted as trading P&L.")
+    except Exception as e:
+        print(f"  [equity-sync] skipped (non-fatal): {e}")
+
+
+def write_stop_snapshot(log, strategy):
+    """logs/stops.json — the per-position stop levels for the INDEPENDENT
+    watchdog (watchdog.sh), which prices them off Yahoo and alerts the operator
+    if a stop is breached while the bot may be dead. This file is the only
+    stop-defense that survives the process dying (fractional positions cannot
+    carry broker-side GTC stop orders on Robinhood). Never raises."""
+    try:
+        snap = {}
+        trail = trailing_stop_pct(strategy)
+        for p in log.get("open_positions", []):
+            entry = float(p.get("entry_price") or 0)
+            if entry <= 0:
+                continue
+            stop = entry * (1 - effective_stop_pct(p["symbol"], strategy))
+            peak = float(p.get("peak_price") or entry)
+            snap[p["symbol"]] = {
+                "stop": round(stop, 4),
+                "trail_stop": round(peak * (1 - trail), 4) if trail > 0 else None,
+                "shares": p.get("shares"),
+            }
+        d = os.path.join(ROOT, "logs")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "stops.json"), "w") as f:
+            json.dump({"updated": now_iso(), "stops": snap}, f, indent=2)
+    except Exception:
+        pass
+
+
+# ---------------- RX-3 paper track (approved 2026-07-06; promotion gate #1) ----
+RX3_STATE_PATH = os.path.join(ROOT, "shadow", "rx3_paper.json")
+
+
+def _rx3_universe(strategy):
+    r = (strategy.get("rotation") or {})
+    return r.get("universe") or [
+        "NVDA", "AMD", "AVGO", "MU", "AMAT", "SMCI", "MRVL", "TSM",
+        "PLTR", "COIN", "MSTR", "HOOD", "SOFI", "SNOW", "CRWD", "NET", "DDOG",
+        "META", "TSLA", "SHOP", "RBLX",
+        "TQQQ", "SOXL", "FNGU", "TECL", "LABU", "FAS", "TNA",
+    ]
+
+
+def _rx3_fetch_closes(symbols):
+    """Daily closes (~2y) per symbol via the same Yahoo layer signals uses.
+    Zero model tokens. Missing symbols are simply absent from the result."""
+    out = {}
+    for s in symbols:
+        try:
+            c = signals._fetch_yahoo(s, "1d", "2y")
+        except Exception:
+            c = None
+        if c and len(c) > 30:
+            out[s] = c
+    return out
+
+
+def process_rx3_paper(log):
+    """Daily RX-3 paper pass — the approved strategy running with ZERO real
+    dollars while it builds the promotion record (2 weeks paper -> half size ->
+    full; see research/redesign_proposal_2026-07-06.md).
+
+    Once per market day: fetch daily closes (Yahoo, no model tokens), make the
+    day's decision from closes THROUGH YESTERDAY (the engine's lag discipline —
+    the last Yahoo daily bar during market hours is today's partial, so it is
+    dropped for decisions and used only to MARK the paper book), rebalance the
+    paper portfolio to the engine's target book at latest prices with 5bps/side,
+    and append the equity curve to shadow/rx3_paper.json. Isolated + never
+    raises into the loop (same contract as the options shadow passes)."""
+    if not (rotation_engine and signals):
+        return
+    if not is_market_open():
+        return
+    strategy = load_strategy()
+    rcfg = strategy.get("rotation") or {}
+    if rcfg.get("paper_enabled") is False:
+        return
+    st = log.setdefault("_state", {})
+    h = _hours_since(st.get("last_rx3_ts"))
+    if h is not None and h < 20:
+        return
+    st["last_rx3_ts"] = now_iso()
+    save_trade_log(log)
+
+    universe = _rx3_universe(strategy)
+    comp_syms = [s for pair in rotation_engine.RISKX_COMPONENTS for s in pair if s]
+    def_syms = list(rotation_engine.DEFENSIVE_ASSETS)
+    closes = _rx3_fetch_closes(sorted(set(universe + comp_syms + def_syms)))
+    if len([s for s in universe if s in closes]) < 5:
+        print("  [rx3] data fetch too thin — skipping today's paper pass")
+        return
+
+    hist = lambda s: closes[s][:-1]          # decisions: through yesterday only
+    marks = {s: closes[s][-1] for s in closes}
+
+    paper = load_json("shadow/rx3_paper.json", None) or {
+        "_note": "RX-3 paper track record (approved 2026-07-06). No real money. "
+                 "Promotion gate: >=10 trading days, decisions match engine, "
+                 "behavior consistent with backtest envelope.",
+        "start_date": now_iso(), "start_equity": 100.0,
+        "cash": 100.0, "positions": {}, "leaders": [],
+        "sleeve_rets": [], "history": [],
+    }
+
+    # 1) raw sleeve return from yesterday's leaders (vol-throttle input)
+    prev_leaders = paper.get("leaders") or []
+    rets = []
+    for sym in prev_leaders:
+        c = closes.get(sym)
+        if c and len(c) >= 2 and c[-2] > 0:
+            rets.append(c[-1] / c[-2] - 1)
+    if rets:
+        paper["sleeve_rets"] = (paper.get("sleeve_rets", [])
+                                + [sum(rets) / len(rets)])[-60:]
+
+    # 2) the day's target book (pure engine call)
+    tb = rotation_engine.target_book(
+        {s: hist(s) for s in universe if s in closes},
+        {s: hist(s) for s in comp_syms if s in closes},
+        {s: hist(s) for s in def_syms if s in closes},
+        paper.get("sleeve_rets", []),
+        held=prev_leaders,
+        sector_of=lambda s: sector_for(s, strategy),
+        leverage_factor=lambda s: leverage_factor(s, strategy))
+    targets = {**tb["weights"], **tb["defensive"]}
+
+    # 3) mark + rebalance the paper book at latest prices, 5bps/side
+    positions = paper.get("positions", {})
+    cash = float(paper.get("cash") or 0)
+    equity = cash + sum(float(p.get("shares") or 0) * marks.get(s, float(p.get("last_px") or 0))
+                        for s, p in positions.items())
+    if equity <= 0:
+        equity = paper.get("start_equity", 100.0)
+    for sym in sorted(set(list(positions) + list(targets))):
+        px = marks.get(sym)
+        if not px or px <= 0:
+            continue
+        cur_val = float(positions.get(sym, {}).get("shares") or 0) * px
+        tgt_val = targets.get(sym, 0.0) * equity
+        delta = tgt_val - cur_val
+        if abs(delta) < 0.005 * equity:      # rebalance band: skip dust trades
+            if sym in positions:
+                positions[sym]["last_px"] = px
+            continue
+        cash -= delta + abs(delta) * 0.0005  # 5bps per side
+        if tgt_val <= 0:
+            positions.pop(sym, None)
+        else:
+            positions[sym] = {"shares": round(tgt_val / px, 6), "last_px": px}
+    equity = cash + sum(float(p["shares"]) * marks.get(s, float(p.get("last_px") or 0))
+                        for s, p in positions.items())
+
+    paper.update({"cash": round(cash, 4), "positions": positions,
+                  "leaders": tb["leaders"], "equity": round(equity, 4),
+                  "last_run": now_iso()})
+    paper.setdefault("history", []).append({
+        "date": datetime.now(ET).strftime("%Y-%m-%d"),
+        "equity": round(equity, 4), "leaders": tb["leaders"],
+        "defensive": list(tb["defensive"]), "riskx": tb["riskx"],
+        "vol_scale": tb["vol_scale"], "cash_w": tb["cash"]})
+    os.makedirs(os.path.dirname(RX3_STATE_PATH), exist_ok=True)
+    save_json("shadow/rx3_paper.json", paper)
+    ret_pct = (equity / paper.get("start_equity", 100.0) - 1) * 100
+    print(f"  [rx3] paper: equity {equity:.2f} ({ret_pct:+.2f}% since start) | "
+          f"leaders={tb['leaders']} defensive={list(tb['defensive'])} "
+          f"riskx={tb['riskx']} vol_scale={tb['vol_scale']} cash={tb['cash']}")
+    append_audit_log("rx3", f"RX-3 paper {datetime.now(ET):%Y-%m-%d}",
+                     json.dumps(paper["history"][-1], indent=2))
 
 
 def _format_stop_loss_block(alerts):
@@ -2127,6 +2361,16 @@ def _risk_block_impl(raw_sigs, log, strategy):
 
 def run_agent():
     log = load_trade_log()
+    # Heartbeat first — the independent watchdog alerts the operator when this
+    # goes stale during market hours (the "bot died with the market open" hole).
+    if risk_guard:
+        risk_guard.beat("cycle")
+        if risk_guard.halted():
+            stamp = datetime.now(ET).strftime("%Y-%m-%d_%H%M")
+            print(f"[{stamp}] HALTED — HALT file present (monthly-drawdown "
+                  "kill-switch). NO trading until the operator reviews and "
+                  "deletes the HALT file.")
+            return
     # Lean view (version_history elided) for the read-only cycle prompt; the full
     # file stays on disk for skill_5 and Phase 4. See strategy_for_prompt().
     strategy_text = strategy_for_prompt()
@@ -2154,6 +2398,8 @@ def run_agent():
     trail_prices = {s: v.get("last_close") for s, v in raw_sigs.items() if v.get("ok")}
     if update_position_peaks(log, trail_prices):
         save_trade_log(log)
+    # Refresh the watchdog's independent stop snapshot (survives process death).
+    write_stop_snapshot(log, strategy)
 
     # Hard forced-exit set (from pre-turn signals): stop-loss + trailing-stop breaches,
     # plus — only when exit_on_ribbon_sell is true — held names sitting in ribbon SELL
@@ -2360,11 +2606,26 @@ EXECUTION RULES:
     exit_info = {}
     market_open = is_market_open()
     if not market_open:
-        broker_positions, sell_orders_today = None, set()
+        broker_positions, sell_orders_today, broker_total = None, set(), None
         print(f"[{stamp}] off-hours run — skipping broker reconciliation "
               "(market closed; no opens/closes possible).")
     else:
-        broker_positions, sell_orders_today = read_broker_state()
+        broker_positions, sell_orders_today, broker_total = read_broker_state()
+    # Account-level guard off the REAL broker total: deposit-aware equity sync +
+    # the monthly-drawdown kill-switch. A fresh halt turns every held name into
+    # a forced exit through the same deterministic force_sell path below.
+    if broker_total:
+        sync_account_equity(log, broker_total)
+        if risk_guard:
+            g_status, g_detail = risk_guard.check_halt(broker_total)
+            if g_status == "halt":
+                print(f"[{stamp}] KILL-SWITCH: {g_detail} — flattening book and halting.")
+                notify_operator(
+                    "Trading bot: MONTHLY KILL-SWITCH TRIPPED — flattening",
+                    f"{g_detail}. All positions are being force-sold and the bot "
+                    "will not trade until you review and delete the HALT file.")
+                for p in (broker_positions or []):
+                    must_sell.setdefault(p["symbol"], "halt")
     if broker_positions is None and market_open:
         print(f"[{stamp}] WARNING: could not read authoritative broker state — "
               "skipping close detection this cycle (no phantom closes). Any "
@@ -2386,7 +2647,7 @@ EXECUTION RULES:
                 exit_info[sym] = {"reason": reason, "price": fill}
                 print(f"  [FORCED-SELL] {sym} placed={placed} fill={fill}")
             # re-read so close detection sees the post-forced-sell truth
-            reread, _ = read_broker_state()
+            reread, _, _ = read_broker_state()
             if reread is not None:
                 broker_positions = reread
 

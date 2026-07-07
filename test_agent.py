@@ -21,7 +21,13 @@ import shutil
 import sys
 import tempfile
 import unittest
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
+
+
+def _expiry(days):
+    """Contract expiry N calendar days from today — keeps DTE-window tests
+    stable as the calendar moves (hardcoded 2026-06/07 dates broke on 2026-07-06)."""
+    return (date.today() + timedelta(days=days)).isoformat()
 from unittest.mock import MagicMock, patch
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -796,7 +802,7 @@ class TestOptionsShadow(unittest.TestCase):
     TODAY = date(2026, 6, 22)
 
     def _contract(self, **kw):
-        c = {"type": "call", "strike": 100.0, "expiry": "2026-07-24",  # 32 DTE
+        c = {"type": "call", "strike": 100.0, "expiry": "2026-07-24",  # 32 DTE vs TODAY
              "bid": 4.8, "ask": 5.0}
         c.update(kw)
         return c
@@ -816,7 +822,7 @@ class TestOptionsShadow(unittest.TestCase):
         self.assertIn("illiquid", reason)
 
     def test_validate_dte_window(self):
-        c = self._contract(expiry="2026-06-29")  # 7 DTE < 30
+        c = self._contract(expiry="2026-06-29")  # 7 DTE < 30 vs TODAY
         ok, reason = osh.validate_contract(c, 100.0, self.CFG, self.TODAY)
         self.assertFalse(ok)
         self.assertIn("dte_out_of_window", reason)
@@ -854,7 +860,7 @@ class TestOptionsShadow(unittest.TestCase):
         self.assertEqual(reason, "premium_stop")
 
     def test_should_close_dte(self):
-        sh = {"entry_premium": 5.0, "expiry": "2026-06-26"}  # 4 DTE < 7
+        sh = {"entry_premium": 5.0, "expiry": "2026-06-26"}  # 4 DTE < 7 vs TODAY
         close, reason = osh.should_close(sh, "BUY", 5.0, self.CFG, self.TODAY)
         self.assertTrue(close)
         self.assertEqual(reason, "dte_expiry")
@@ -1034,7 +1040,7 @@ class TestMomentumShadowWiring(TmpDirMixin):
 
     def _contract(self, ask=0.40, strike=10.0):
         # 30-45 DTE from 2026-06-22 -> 2026-07-24 is 32 DTE; tight spread (<10% of mid)
-        return {"type": "call", "strike": strike, "expiry": "2026-07-24",
+        return {"type": "call", "strike": strike, "expiry": _expiry(35),
                 "bid": round(ask - 0.02, 2), "ask": ask, "underlying_price": strike}
 
     def _shadow_log(self):
@@ -2050,18 +2056,20 @@ class TestBrokerReconciliation(unittest.TestCase):
         than phantom-closing everything."""
         with patch.object(agent_module, "run_model",
                           return_value=("(claude -p error rc=1: session limit)", {})):
-            positions, sells = agent_module.read_broker_state()
+            positions, sells, total = agent_module.read_broker_state()
         self.assertIsNone(positions)
+        self.assertIsNone(total)
         self.assertEqual(sells, set())
 
     def test_read_broker_state_parses_positions_and_sells(self):
         payload = ('```json\n{"positions": [{"symbol": "CLOV", "shares": 4.18, '
                    '"avg_price": 4.89, "last_price": 4.59}, '
                    '{"symbol": "DEAD", "shares": 0, "avg_price": 1.0}], '
-                   '"sell_orders_today": ["clov"]}\n```')
+                   '"sell_orders_today": ["clov"], "account_total": 395.54}\n```')
         with patch.object(agent_module, "run_model", return_value=(payload, {})):
-            positions, sells = agent_module.read_broker_state()
-        self.assertEqual([p["symbol"] for p in positions], ["CLOV"])  # zero-share dropped
+            positions, sells, total = agent_module.read_broker_state()
+        self.assertEqual([p["symbol"] for p in positions], ["CLOV"])
+        self.assertEqual(total, 395.54)  # zero-share dropped
         self.assertEqual(sells, {"CLOV"})                              # upper-cased
 
     def test_force_sell_advisory_mode_is_noop(self):
@@ -2476,7 +2484,7 @@ class TestOffHoursBrokerGating(TmpDirMixin):
         return msig
 
     def test_market_closed_skips_broker_read(self):
-        rbs = MagicMock(return_value=([], set()))
+        rbs = MagicMock(return_value=([], set(), None))
         with patch.object(agent_module, "signals", self._mock_signals()), \
              patch.object(agent_module, "is_market_open", return_value=False), \
              patch.object(agent_module, "read_broker_state", rbs), \
@@ -2494,7 +2502,7 @@ class TestOffHoursBrokerGating(TmpDirMixin):
             "dollar_amount": 500.0}]
         self._flush_log()
         rbs = MagicMock(return_value=([{"symbol": "SPY", "shares": 1.0,
-                        "avg_price": 500.0, "last_price": 505.0}], set()))
+                        "avg_price": 500.0, "last_price": 505.0}], set(), None))
         with patch.object(agent_module, "signals", self._mock_signals()), \
              patch.object(agent_module, "is_market_open", return_value=True), \
              patch.object(agent_module, "read_broker_state", rbs), \
