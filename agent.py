@@ -136,6 +136,120 @@ except Exception:
 DEFAULT_STOP_LOSS_PCT = 0.10  # hard 10% drawdown limit
 
 
+# ------------------------------------------------- dashboard control plane
+# The TradeCommand dashboard (dashboard/) writes plain files under control/;
+# the bot reads them each cycle. All helpers resolve ROOT at call time (tests
+# patch agent.ROOT) and never raise — a missing/garbled control file must
+# degrade to "no directive", not crash the loop.
+
+def _control_paused():
+    """control/PAUSE exists → operator paused the bot from the dashboard:
+    no model turns, no new entries; protective exits + bookkeeping still run."""
+    return os.path.exists(os.path.join(ROOT, "control", "PAUSE"))
+
+
+def _do_not_trade():
+    """Operator blocklist (control/do_not_trade.json): the bot must never BUY
+    or add to these symbols. Selling/closing them stays allowed."""
+    try:
+        with open(os.path.join(ROOT, "control", "do_not_trade.json")) as f:
+            return {str(s).upper() for s in (json.load(f).get("symbols") or []) if s}
+    except Exception:
+        return set()
+
+
+def _stop_overrides():
+    """Per-symbol stop overrides (control/stop_overrides.json):
+    {SYM: {stop_price?, stop_pct?, trail_pct?}}. Consumed by the stop/trailing
+    alert checks and mirrored into logs/stops.json for the watchdog."""
+    try:
+        with open(os.path.join(ROOT, "control", "stop_overrides.json")) as f:
+            d = json.load(f)
+        return {k.upper(): v for k, v in d.items()
+                if isinstance(v, dict) and not k.startswith("_")}
+    except Exception:
+        return {}
+
+
+def _manual_lock_active(symbol, ttl=600):
+    """True while the dashboard holds a fresh in-flight order lock for symbol
+    (control/locks/SYM.manual.lock). force_sell defers that symbol for one
+    cycle instead of racing the operator's own order; stale locks are ignored."""
+    p = os.path.join(ROOT, "control", "locks", f"{symbol.upper()}.manual.lock")
+    try:
+        return (time.time() - os.path.getmtime(p)) < ttl
+    except OSError:
+        return False
+
+
+def _recent_manual_sells(hours=48):
+    """{SYMBOL: ts} of successful manual dashboard sells in the last N hours
+    (from logs/manual_actions.jsonl). Used to tag broker-detected closes as
+    exit_reason='manual' so they don't fire a bogus postmortem."""
+    out = {}
+    try:
+        with open(os.path.join(ROOT, "logs", "manual_actions.jsonl")) as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                if rec.get("action") != "order_place":
+                    continue
+                params = rec.get("params") or {}
+                if str(params.get("side", "")).lower() != "sell":
+                    continue
+                if (rec.get("result") or {}).get("ok") is False:
+                    continue
+                h = _hours_since(rec.get("ts"))
+                sym = str(params.get("symbol", "")).upper()
+                if sym and h is not None and h <= hours:
+                    out[sym] = rec.get("ts")
+    except Exception:
+        pass
+    return out
+
+
+def write_cycle_status(state, task=None, detail=""):
+    """logs/cycle_status.json — lets the dashboard warn 'bot cycle running now'
+    on its order-confirm screen. Best-effort, never raises."""
+    try:
+        d = os.path.join(ROOT, "logs")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "cycle_status.json"), "w") as f:
+            json.dump({"state": state, "task": task, "detail": detail,
+                       "ts": now_iso()}, f, indent=2)
+    except Exception:
+        pass
+
+
+def append_equity_point(total, cash=None):
+    """Append the broker-confirmed account total to logs/equity_curve.jsonl —
+    the dashboard's equity-curve series. Deduped to one point per minute;
+    never raises."""
+    try:
+        if not total:
+            return
+        path = os.path.join(ROOT, "logs", "equity_curve.jsonl")
+        stamp = now_iso()
+        try:
+            with open(path, "rb") as f:
+                f.seek(max(0, os.path.getsize(path) - 400))
+                last = f.read().decode("utf-8", "replace").strip().splitlines()[-1]
+            if json.loads(last).get("ts", "")[:16] == stamp[:16]:
+                return
+        except Exception:
+            pass
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        rec = {"ts": stamp, "total": round(float(total), 2), "source": "agent"}
+        if cash is not None:
+            rec["cash"] = round(float(cash), 2)
+        with open(path, "a") as f:
+            f.write(json.dumps(rec) + "\n")
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------- time helpers
 def now_iso():
     """ET wall-clock with UTC offset — the single timestamp format for all log
@@ -637,17 +751,26 @@ def check_stop_loss_alerts(log):
     the agent prompt can order immediate sells before any other logic runs.
 
     The threshold is per-symbol (effective_stop_pct): leveraged ETFs get a
-    tighter stop than the base 10%."""
+    tighter stop than the base 10%. An operator stop override from the
+    dashboard (control/stop_overrides.json: stop_pct or absolute stop_price)
+    replaces the computed threshold for that symbol."""
     if not signals:
         return []
     strategy = load_strategy()
+    overrides = _stop_overrides()
     alerts = []
     for pos in log.get("open_positions", []):
         symbol = pos["symbol"]
         entry = float(pos.get("entry_price") or 0)
         if entry <= 0:
             continue
+        ov = overrides.get(symbol, {})
         pct = effective_stop_pct(symbol, strategy)
+        try:
+            if ov.get("stop_pct"):
+                pct = float(ov["stop_pct"])
+        except (TypeError, ValueError):
+            pass
         try:
             sig = signals.signal_for(symbol)
         except Exception:
@@ -658,11 +781,18 @@ def check_stop_loss_alerts(log):
         if last <= 0:
             continue
         loss_pct = (last - entry) / entry
-        if loss_pct <= -pct:
+        thr = None
+        try:
+            if ov.get("stop_price"):
+                thr = float(ov["stop_price"])
+        except (TypeError, ValueError):
+            thr = None
+        triggered = (last <= thr) if thr else (loss_pct <= -pct)
+        if triggered:
             alerts.append({
                 "symbol": symbol,
                 "entry_price": entry,
-                "threshold_price": round(entry * (1 - pct), 4),
+                "threshold_price": round(thr if thr else entry * (1 - pct), 4),
                 "last_price": last,
                 "loss_pct": round(loss_pct * 100, 2),
                 "shares": pos.get("shares", 0),
@@ -717,16 +847,28 @@ def check_trailing_stop_alerts(log, prices=None):
 
     Inert (returns []) when trailing_stop_pct is absent/<=0. `prices` is an optional
     {symbol: last_close} map to avoid re-fetching (the cycle already has signals);
-    falls back to signals.signal_for() per symbol, exactly like the hard-stop check."""
+    falls back to signals.signal_for() per symbol, exactly like the hard-stop check.
+    A dashboard trail_pct override (control/stop_overrides.json) replaces the
+    global fraction for that symbol — and can enable trailing on one name even
+    when the global default is off."""
     if not signals:
         return []
-    trail = trailing_stop_pct(load_strategy())
-    if trail <= 0:
+    trail_default = trailing_stop_pct(load_strategy())
+    overrides = _stop_overrides()
+    if trail_default <= 0 and not any(v.get("trail_pct") for v in overrides.values()):
         return []
     prices = prices or {}
     alerts = []
     for pos in log.get("open_positions", []):
         symbol = pos["symbol"]
+        trail = trail_default
+        try:
+            if overrides.get(symbol, {}).get("trail_pct"):
+                trail = float(overrides[symbol]["trail_pct"])
+        except (TypeError, ValueError):
+            pass
+        if trail <= 0:
+            continue
         try:
             peak = float(pos.get("peak_price") or pos.get("entry_price") or 0)
         except (TypeError, ValueError):
@@ -799,12 +941,16 @@ def should_skip_model_call(raw_sigs, log):
     # again until NEWS_CHECK_HOURS pass — the BUY-state pending_buy gate below
     # still covers the ongoing opportunity.
     el_seen = log.get("_state", {}).get("enter_long_seen", {})
+    # Operator do-not-trade list: a blocked symbol's BUY opportunity must not
+    # wake the model (there is nothing it may do with it). Sell-side wakes on
+    # held names are unaffected — closing a blocked symbol stays allowed.
+    dnt = _do_not_trade()
     for sym, s in raw_sigs.items():
         if not s.get("ok"):
             # unknown signal — let the model decide
             return False, f"unknown_signal:{sym}"
         t = s.get("transition", "NO_ACTION")
-        if t == "ENTER_LONG":
+        if t == "ENTER_LONG" and sym not in dnt:
             h = _hours_since(el_seen.get(sym))
             if h is None or h >= NEWS_CHECK_HOURS:
                 return False, f"enter_long:{sym}"
@@ -819,9 +965,9 @@ def should_skip_model_call(raw_sigs, log):
         if s.get("state") == "SELL" and sym in held and exit_on_ribbon:
             return False, f"ema_sell_held:{sym}"
 
-    # Collect weekend picks that are in BUY zone and not yet held.
+    # Collect weekend picks that are in BUY zone, not yet held, and not blocked.
     picks = {s.upper() for s in weekend_pick_symbols()}
-    pending_buys = [sym for sym in picks - held
+    pending_buys = [sym for sym in picks - held - dnt
                     if raw_sigs.get(sym, {}).get("ok")
                     and raw_sigs.get(sym, {}).get("state") == "BUY"]
 
@@ -960,9 +1106,16 @@ def detect_closed_positions(open_positions, current_positions):
     return [op for op in open_positions if held.get(op["symbol"], 0) <= 0]
 
 
-def log_trade_outcome(log, open_pos, exit_price, exit_date, stop_loss=False):
+def log_trade_outcome(log, open_pos, exit_price, exit_date, stop_loss=False,
+                      exit_reason=None, skip_pipeline=False):
     """Close a position: compute P&L, append to trades, update summary, fire the
-    post-trade analysis pipeline. Returns the closed trade dict."""
+    post-trade analysis pipeline. Returns the closed trade dict.
+
+    skip_pipeline=True records the close but does NOT fire the postmortem/
+    victory + rewrite-queue pipeline — used for exit_reason='manual' (an
+    operator dashboard sell is not a bot decision, so it must not teach the
+    bot anything or spend an Opus analysis call). Monthly progress still
+    updates so the summary stays truthful."""
     entry = float(open_pos["entry_price"])
     shares = float(open_pos["shares"])
     exit_price = float(exit_price)
@@ -981,6 +1134,8 @@ def log_trade_outcome(log, open_pos, exit_price, exit_date, stop_loss=False):
         "sources_used": open_pos.get("sources_used", []), "thesis": open_pos.get("thesis", ""),
         "postmortem_filed": False, "victory_filed": False, "analysis_file": None,
     }
+    if exit_reason:
+        trade["exit_reason"] = exit_reason
 
     log["trades"].append(trade)
     s = log["summary"]
@@ -990,6 +1145,10 @@ def log_trade_outcome(log, open_pos, exit_price, exit_date, stop_loss=False):
     s["win_rate"] = round(s["wins"] / s["total_trades"], 4)
     log["open_positions"] = [p for p in log["open_positions"] if p["id"] != open_pos["id"]]
     save_trade_log(log)
+
+    if skip_pipeline:
+        update_monthly_progress(log)
+        return trade
 
     run_post_trade_pipeline(log, trade)
     return trade
@@ -1966,15 +2125,23 @@ def process_cycle_state(log, actions, broker_positions, exit_info=None):
     last_by_sym = {p.get("symbol"): p.get("last_price") for p in broker_positions}
     prev_last = {p.get("symbol"): p.get("last_price")
                  for p in log["_state"].get("last_positions", [])}
+    manual_sells = _recent_manual_sells()
     for op in detect_closed_positions(log["open_positions"], broker_positions):
         sym = op["symbol"]
         info = exit_info.get(sym, {})
         a = sell_actions.get(sym, {})
         reason = info.get("reason") or str(a.get("reason", "")).lower()
+        # A close with no bot-side reason that matches a journaled dashboard
+        # sell is the OPERATOR's trade: record it tagged 'manual' and skip the
+        # learning pipeline (not a bot decision — nothing to postmortem).
+        if not reason and sym in manual_sells:
+            reason = "manual"
         is_stop_loss = reason == "stop_loss"
         price = (info.get("price") or a.get("price")
                  or last_by_sym.get(sym) or prev_last.get(sym) or op["entry_price"])
-        log_trade_outcome(log, op, price, now, stop_loss=is_stop_loss)
+        log_trade_outcome(log, op, price, now, stop_loss=is_stop_loss,
+                          exit_reason=reason or None,
+                          skip_pipeline=(reason == "manual"))
 
     # 3. snapshot the authoritative broker positions for next cycle's diff.
     log["_state"]["last_positions"] = broker_positions
@@ -2022,15 +2189,29 @@ def write_stop_snapshot(log, strategy):
     try:
         snap = {}
         trail = trailing_stop_pct(strategy)
+        overrides = _stop_overrides()
         for p in log.get("open_positions", []):
             entry = float(p.get("entry_price") or 0)
             if entry <= 0:
                 continue
+            ov = overrides.get(p["symbol"], {})
             stop = entry * (1 - effective_stop_pct(p["symbol"], strategy))
+            t = trail
+            try:
+                # dashboard overrides — keep the watchdog's view identical to
+                # what check_stop_loss_alerts / check_trailing_stop_alerts fire on
+                if ov.get("stop_pct"):
+                    stop = entry * (1 - float(ov["stop_pct"]))
+                if ov.get("stop_price"):
+                    stop = float(ov["stop_price"])
+                if ov.get("trail_pct"):
+                    t = float(ov["trail_pct"])
+            except (TypeError, ValueError):
+                pass
             peak = float(p.get("peak_price") or entry)
             snap[p["symbol"]] = {
                 "stop": round(stop, 4),
-                "trail_stop": round(peak * (1 - trail), 4) if trail > 0 else None,
+                "trail_stop": round(peak * (1 - t), 4) if t > 0 else None,
                 "shares": p.get("shares"),
             }
         d = os.path.join(ROOT, "logs")
@@ -2370,12 +2551,14 @@ def run_agent():
             print(f"[{stamp}] HALTED — HALT file present (monthly-drawdown "
                   "kill-switch). NO trading until the operator reviews and "
                   "deletes the HALT file.")
+            write_cycle_status("halted")
             return
     # Lean view (version_history elided) for the read-only cycle prompt; the full
     # file stays on disk for skill_5 and Phase 4. See strategy_for_prompt().
     strategy_text = strategy_for_prompt()
     strategy = load_strategy()  # dict form for the deterministic risk/sizing block
     skill, task = active_skill()
+    write_cycle_status("running", task)  # dashboard: warn on manual-order collisions
     syms = watchlist_symbols(log)
 
     # Compute signals once; reuse raw dict for skip check and formatted block for prompt.
@@ -2416,6 +2599,58 @@ def run_agent():
             if sym in held_syms and s.get("ok") and s.get("state") == "SELL":
                 must_sell.setdefault(sym, "ema_exit")
 
+    # OPERATOR PAUSE (control/PAUSE, written by the dashboard): no model turn,
+    # no new entries — but the protective rails stay hot: heartbeat (above),
+    # peaks/stop snapshot (above), deterministic forced exits, kill-switch
+    # check, and broker bookkeeping (so a manual dashboard sell still
+    # reconciles into the trade log while paused).
+    if _control_paused():
+        stamp = datetime.now(ET).strftime("%Y-%m-%d_%H%M")
+        exit_info = {}
+        if is_market_open():
+            broker_positions, sell_orders_today, broker_total = read_broker_state()
+            if broker_total:
+                sync_account_equity(log, broker_total)
+                append_equity_point(broker_total)
+                if risk_guard:
+                    g_status, g_detail = risk_guard.check_halt(broker_total)
+                    if g_status == "halt":
+                        print(f"[{stamp}] KILL-SWITCH (while paused): {g_detail} — "
+                              "flattening book and halting.")
+                        notify_operator(
+                            "Trading bot: MONTHLY KILL-SWITCH TRIPPED — flattening",
+                            f"{g_detail}. Tripped during an operator pause; all "
+                            "positions are being force-sold and the bot will not "
+                            "trade until you review and delete the HALT file.")
+                        for p in (broker_positions or []):
+                            must_sell.setdefault(p["symbol"], "halt")
+            if broker_positions is not None:
+                held_at_broker = {p["symbol"]: p for p in broker_positions}
+                for sym, reason in must_sell.items():
+                    if sym not in held_at_broker or sym in sell_orders_today:
+                        continue
+                    if _manual_lock_active(sym):
+                        print(f"  [FORCED-SELL] {sym} deferred — manual dashboard "
+                              "order in flight (paused cycle)")
+                        continue
+                    placed, fill = force_sell(sym, held_at_broker[sym].get("shares"),
+                                              reason)
+                    exit_info[sym] = {"reason": reason, "price": fill}
+                    print(f"  [FORCED-SELL] {sym} placed={placed} fill={fill} "
+                          "(paused cycle)")
+                if must_sell:
+                    reread, _, _ = read_broker_state()
+                    if reread is not None:
+                        broker_positions = reread
+                process_cycle_state(log, [], broker_positions, exit_info)
+            elif must_sell:
+                print(f"[{stamp}] WARNING: paused + broker read failed with forced "
+                      f"exits pending for {sorted(must_sell)} — will retry next cycle.")
+        print(f"[{stamp}] task={task} PAUSED by operator — protective exits + "
+              "bookkeeping only, no model call.")
+        write_cycle_status("idle", task, "paused")
+        return
+
     # SMART SKIP: if every signal is NEUTRAL/HOLD and no stop-loss → no model call needed.
     # Research and midweek phases always run (they do web research, not just signal checks).
     if task == "market_hours_check":
@@ -2426,6 +2661,7 @@ def run_agent():
             # Still run the paper-options passes: the momentum edge fires on exactly
             # these flat-index cycles, and they no-op cheaply when nothing qualifies.
             _run_shadow_passes(raw_sigs, log)
+            write_cycle_status("idle", task, f"skipped:{skip_reason}")
             return
 
     # For market-hours execution checks, strip data the model doesn't need:
@@ -2489,8 +2725,18 @@ EXECUTION RULES:
 - Honor blackout windows + min_confidence_to_trade. Real scoreboard = beat SPY;
   100% monthly is the stretch ceiling, not a reason to oversize risk."""
 
+    # Operator do-not-trade list (dashboard): hard no-buy rule, injected as the
+    # first block so it outranks any pick/signal enthusiasm below.
+    _dnt = _do_not_trade()
+    _dnt_block = ("" if not _dnt else
+                  "OPERATOR DO-NOT-TRADE LIST (hard rule from the dashboard): "
+                  f"{', '.join(sorted(_dnt))} — NEVER buy or add to these symbols "
+                  "this cycle, regardless of signals or picks. Selling/closing "
+                  "them is still allowed.\n\n")
+
     user = (
         f"Task: {task}\nTime (ET): {datetime.now(ET):%Y-%m-%d %H:%M} ({datetime.now(ET):%A})\n\n"
+        + _dnt_block
         + _format_stop_loss_block(stop_loss_alerts)
         + _format_ema_sell_block(raw_sigs, log)
         + _format_risk_block(raw_sigs, log, strategy)
@@ -2563,6 +2809,7 @@ EXECUTION RULES:
                 f"sell may be required until it recovers. Detail: {text[:180]}")
         save_trade_log(log)  # preserve the pre-call stamps
         print(f"[{stamp}] task={task} done (model unavailable).")
+        write_cycle_status("idle", task, "model unavailable")
         return
 
     # persist midweek/research output to the file the phase routing checks for
@@ -2616,6 +2863,7 @@ EXECUTION RULES:
     # a forced exit through the same deterministic force_sell path below.
     if broker_total:
         sync_account_equity(log, broker_total)
+        append_equity_point(broker_total)  # dashboard equity-curve series
         if risk_guard:
             g_status, g_detail = risk_guard.check_halt(broker_total)
             if g_status == "halt":
@@ -2640,6 +2888,12 @@ EXECUTION RULES:
                     continue  # already gone (the main turn actually sold it)
                 if sym in sell_orders_today:
                     continue  # a sell order already exists — don't double-sell
+                if _manual_lock_active(sym):
+                    # the operator's own dashboard order for this symbol is in
+                    # flight RIGHT NOW — don't race it; retry next cycle
+                    print(f"  [FORCED-SELL] {sym} deferred — manual dashboard "
+                          "order in flight.")
+                    continue
                 shares = held_at_broker[sym].get("shares")
                 print(f"  [FORCED-SELL] {sym} still held after model turn "
                       f"(reason={reason}) — placing dedicated market sell.")
@@ -2680,6 +2934,7 @@ EXECUTION RULES:
     # whether or not the equity model was called this cycle.
     _run_shadow_passes(raw_sigs, log)
 
+    write_cycle_status("idle", task)
     print(f"[{stamp}] task={task} done.")
 
 

@@ -11,6 +11,7 @@
 - 2026-06-16T11:49:03-04:00 | T0010 SOXL LOSS -11.84% | analysis: postmortem_003.md | skill_5 review [DONE 2026-06-18T13:34:28-04:00]
 - 2026-06-17T09:33:51-04:00 | T0008 AMD LOSS -4.99% | analysis: postmortem_004.md | skill_5 review [DONE 2026-06-19T09:27:19-04:00]
 - 2026-06-26T13:20:26-04:00 | T0009 HOOD LOSS -2.6% | analysis: postmortem_005.md | skill_5 review [DONE 2026-06-26T13:30:25-04:00]
-- 2026-06-26T13:22:23-04:00 | T0011 CAT WIN 1.63% | analysis: victory_003.md | skill_5 review
+- 2026-06-26T13:22:23-04:00 | T0011 CAT WIN 1.63% | analysis: victory_003.md | skill_5 review [DONE 2026-07-10T09:37:17-04:00]
 - 2026-06-26T13:23:48-04:00 | T0013 AVGO LOSS -3.38% | analysis: postmortem_005.md | skill_5 review
 - 2026-06-26T13:24:57-04:00 | T0014 BTSG LOSS -0.04% | analysis: postmortem_005.md | skill_5 review
+- 2026-07-06T15:15:52-04:00 | T0015 MU LOSS -14.55% | analysis: postmortem_005.md | skill_5 review

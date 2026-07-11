@@ -22,3 +22,13 @@ __pycache__/
 HALT
 .alert_webhook_url
 research/_cache/
+
+# TradeCommand dashboard runtime state (secrets + operator control files)
+control/
+dashboard/.auth.json
+dashboard/.rh_tokens.json
+dashboard/watchlist.json
+
+# Xcode user state (RL Trading Bot app)
+xcuserdata/
+*.xcuserstate

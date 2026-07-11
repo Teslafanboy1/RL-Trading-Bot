@@ -257,3 +257,54 @@ size → full; see `research/redesign_proposal_2026-07-06.md`).
 - Research harnesses for all of the above: `research/edge_lab.py`,
   `edge_lab2.py`, `edge_lab3.py` (28 mechanisms tested; survivors documented in
   the proposal addendum). Every future strategy idea must win there first.
+
+## TradeCommand dashboard (`dashboard/`) — operator command center
+
+A stdlib-only server (no pip deps, no build step) that reads every bot state
+file, polls Yahoo for quotes/ribbons, talks to the Robinhood MCP, and serves
+JSON + a dark-mode PWA on `127.0.0.1:8787` (remote access via `tailscale
+serve` only — never bound to LAN). `bash run_dashboard.sh` to start;
+`--set-pin` first. Full setup + architecture + the tab→endpoint map:
+`dashboard/README.md`. Tests: `test_dashboard.py`.
+
+The **primary client is the native SwiftUI Mac app** in `RL Trading Bot/`
+(operator decision 2026-07-09: Mac app only from now on; it also builds for
+iPhone). Thin client — all logic stays server-side. Its sidebar has four
+sections × 21 tabs; beyond the original views it consumes the command-center
+endpoints `/api/signals` (ribbon lab), `/api/symbol` (Analyzer: chart + EMA
+overlay + stops), `/api/screen` (momentum screener with `fresh=1` re-run),
+`/api/orders?days=` (order center; deep history gated to direct-mcp),
+`/api/rx3` (rotation paper tracker), `/api/learning`, `/api/library`,
+`/api/logs` (unified activity feed), `/api/health` (state-file freshness +
+control plane), and `/api/calendar` (bot schedule + earnings + blackouts).
+The Xcode project uses filesystem-synchronized groups — new `.swift` files in
+`RL Trading Bot/RL Trading Bot/` are picked up without editing the project.
+Build check: `xcodebuild -project "RL Trading Bot.xcodeproj" -scheme "RL
+Trading Bot" -destination platform=macOS build`.
+
+- **Broker paths**: `direct-mcp` (dashboard's own OAuth client to
+  `agent.robinhood.com/mcp/trading` via `dashboard/mcp_client.py`; free 60s
+  polling, ~1s orders; login: `python3 -m dashboard.rh_login`) with automatic
+  fallback to `claude-cli` (the bot's proven `claude -p` pattern; **never
+  polls** — on-demand refresh/orders only, to protect plan usage).
+- **Every money/control action** requires a PIN-armed token (5-min TTL,
+  PBKDF2, lockout, IP-bound), a preview step (broker `review_equity_order` +
+  warnings: DNT, buying power, bot-cycle-running, market closed, oversell
+  block), and a hold-to-confirm. All manual actions journal to
+  `logs/manual_actions.jsonl`.
+- **Control plane the bot honors** (all under `control/`, gitignored, read
+  each cycle by agent.py): `PAUSE` (skip model turns/new entries; protective
+  exits + broker bookkeeping still run — see the paused branch in
+  `run_agent`), `do_not_trade.json` (blocks BUYs + BUY-signal wakes; sells
+  unaffected), `stop_overrides.json` (per-symbol stop_price/stop_pct/trail_pct
+  — honored by `check_stop_loss_alerts`/`check_trailing_stop_alerts` and
+  mirrored into `logs/stops.json` for the watchdog), `locks/SYM.manual.lock`
+  (in-flight dashboard order — `force_sell` defers that symbol one cycle).
+- **Manual-close reconciliation**: a broker-detected close matching a
+  journaled dashboard sell records with `exit_reason: "manual"` and **skips
+  the postmortem/rewrite pipeline** (operator trades must not teach the bot);
+  `update_monthly_progress` still runs.
+- **New agent-side artifacts**: `logs/cycle_status.json` (running/idle per
+  cycle, freshness-checked by the dashboard's collision warning) and
+  `logs/equity_curve.jsonl` (broker-total snapshots appended by both agent and
+  dashboard — the equity-curve chart's data source, deduped per minute).

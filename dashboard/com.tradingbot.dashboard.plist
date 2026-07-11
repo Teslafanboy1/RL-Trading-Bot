@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd job: keep the TradeCommand dashboard running across logins/reboots.
+  Install:
+    cp dashboard/com.tradingbot.dashboard.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.tradingbot.dashboard.plist
+  Remove:
+    launchctl unload ~/Library/LaunchAgents/com.tradingbot.dashboard.plist
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.tradingbot.dashboard</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/sankarshanbalaji/Downloads/Trading Bot  MAIN/run_dashboard.sh</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/sankarshanbalaji/Downloads/Trading Bot  MAIN</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key>
+  <string>/Users/sankarshanbalaji/Downloads/Trading Bot  MAIN/logs/dashboard_launchd.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/sankarshanbalaji/Downloads/Trading Bot  MAIN/logs/dashboard_launchd.log</string>
+</dict>
+</plist>

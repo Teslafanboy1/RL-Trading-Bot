@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>TradeCommand</title>
+<meta name="theme-color" content="#0b0e14">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="TradeCmd">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/icons/apple-touch-icon.png">
+<link rel="icon" href="/icons/icon-192.png" type="image/png">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div id="topbar">
+  <div class="brand">⌘ TradeCommand</div>
+  <div id="statusChips">
+    <span id="botChip" class="chip">bot: …</span>
+    <span id="mktChip" class="chip">mkt: …</span>
+    <span id="brokerChip" class="chip">broker: …</span>
+    <span id="armChip" class="chip arm" title="PIN-armed window for money/control actions">🔒 locked</span>
+  </div>
+</div>
+
+<div id="alertStrip" class="hidden"></div>
+
+<nav id="tabs">
+  <button data-tab="overview" class="active">⌂ Overview</button>
+  <button data-tab="thinking">🧠 Thinking</button>
+  <button data-tab="market">🌐 Market</button>
+  <button data-tab="performance">📈 Perf</button>
+  <button data-tab="trades">📜 Trades</button>
+  <button data-tab="risk">🛡 Risk</button>
+  <button data-tab="news">📰 News</button>
+  <button data-tab="strategy">⚙ Strategy</button>
+  <button data-tab="shadow">👻 Shadow</button>
+  <button data-tab="console">⌘ Console</button>
+</nav>
+
+<main id="view"><div class="loading">loading…</div></main>
+
+<div id="modalRoot"></div>
+<div id="toastRoot"></div>
+
+<script src="/app.js"></script>
+</body>
+</html>

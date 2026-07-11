@@ -1,0 +1,53 @@
+{
+  "_note": "RX-3 paper track record (approved 2026-07-06). No real money. Promotion gate: >=10 trading days, decisions match engine, behavior consistent with backtest envelope.",
+  "start_date": "2026-07-08T09:42:55-04:00",
+  "start_equity": 100.0,
+  "cash": 33.0713,
+  "positions": {
+    "AMAT": {
+      "shares": 0.085943,
+      "last_px": 577.6300048828125
+    },
+    "LABU": {
+      "shares": 0.055303,
+      "last_px": 299.2814025878906
+    }
+  },
+  "leaders": [
+    "LABU",
+    "AMAT"
+  ],
+  "sleeve_rets": [
+    -0.047885033218953266
+  ],
+  "history": [
+    {
+      "date": "2026-07-08",
+      "equity": 99.9625,
+      "leaders": [
+        "LABU",
+        "AMAT"
+      ],
+      "defensive": [
+        "XLU"
+      ],
+      "riskx": 0.75,
+      "vol_scale": 1.0,
+      "cash_w": 0.25
+    },
+    {
+      "date": "2026-07-10",
+      "equity": 99.2658,
+      "leaders": [
+        "LABU",
+        "AMAT"
+      ],
+      "defensive": [],
+      "riskx": 1.0,
+      "vol_scale": 1.0,
+      "cash_w": 0.3333
+    }
+  ],
+  "equity": 99.2658,
+  "last_run": "2026-07-10T09:38:48-04:00"
+}
