@@ -418,6 +418,16 @@ def do_not_trade():
     return sorted({str(s).upper() for s in d.get("symbols", []) if s})
 
 
+def cash_flows(limit=20):
+    """Operator-declared deposits/withdrawals (control/cash_flows.json),
+    newest first — written by controls.record_cash_flow, applied by
+    agent.process_manual_cash_flows."""
+    flows = load_json("control/cash_flows.json", [])
+    if not isinstance(flows, list):
+        return []
+    return list(reversed(flows[-limit:]))
+
+
 def watchdog_recent(limit=40):
     lines = load_text("logs/watchdog.log").splitlines()
     return lines[-limit:][::-1]

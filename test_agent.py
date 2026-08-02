@@ -36,6 +36,7 @@ sys.path.insert(0, PROJECT_ROOT)
 import signals as sig_module
 import agent as agent_module
 import options_shadow as osh
+import risk_guard
 
 # ─────────────────────────────────────────── synthetic price series ──────────
 
@@ -128,9 +129,24 @@ class TmpDirMixin(unittest.TestCase):
         self._flush_log()
         self._root_patch = patch.object(agent_module, "ROOT", self.tmpdir)
         self._root_patch.start()
+        # risk_guard resolves its file paths from its OWN module location, not
+        # agent.ROOT — without these, any test that exercises run_agent() writes
+        # mocked equity into the REAL repo's logs/risk_state.json / HALT
+        # (2026-08-03: this is what actually produced the "544/589.72 -> 322"
+        # false halt — leaked test fixture values, not a bad live broker read).
+        self._rg_patches = [
+            patch.object(risk_guard, "ROOT", self.tmpdir),
+            patch.object(risk_guard, "HALT_FILE", os.path.join(self.tmpdir, "HALT")),
+            patch.object(risk_guard, "STATE_FILE", os.path.join(self.tmpdir, "logs", "risk_state.json")),
+            patch.object(risk_guard, "HEARTBEAT_FILE", os.path.join(self.tmpdir, "logs", "heartbeat")),
+        ]
+        for p in self._rg_patches:
+            p.start()
 
     def tearDown(self):
         self._root_patch.stop()
+        for p in self._rg_patches:
+            p.stop()
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     def _flush_strategy(self):

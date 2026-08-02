@@ -467,6 +467,71 @@ struct StopOverrideSheet: View {
     }
 }
 
+// MARK: - Cash flow (deposit / withdrawal)
+
+struct CashFlowSheet: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.dismiss) private var dismiss
+    @State private var kind: Kind = .deposit
+    @State private var amountText = ""
+    @State private var note = ""
+    @State private var error: String?
+
+    enum Kind: String, CaseIterable, Identifiable {
+        case deposit = "Deposit", withdrawal = "Withdrawal"
+        var id: String { rawValue }
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    WarningBox(text: "Tells the bot exactly how much cash moved in/out so it never mistakes a deposit or withdrawal for trading performance (or vice versa). Applied next cycle to month_start_value, current_value, and the kill-switch peak — the exact amount you enter, not a guess from a broker read.")
+                    Picker("Type", selection: $kind) {
+                        ForEach(Kind.allCases) { Text($0.rawValue).tag($0) }
+                    }
+                    .pickerStyle(.segmented)
+                    TextField("Amount ($)", text: $amountText)
+                        .font(.body.monospaced())
+                        #if !os(macOS)
+                        .keyboardType(.decimalPad)
+                        #endif
+                    TextField("Note (optional)", text: $note)
+                } header: {
+                    Label("Declare cash movement", systemImage: "arrow.left.arrow.right.circle.fill")
+                }
+                Section {
+                    Button("Record \(kind.rawValue.lowercased())") { save() }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(Double(amountText) == nil || Double(amountText) == 0)
+                    if let error { ErrorBox(text: error) }
+                }
+            }
+            .formStyle(.grouped)
+            .navigationTitle("Deposit / withdrawal")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
+            }
+        }
+        #if os(macOS)
+        .frame(width: 440, height: 380)
+        #else
+        .presentationDetents([.medium])
+        #endif
+    }
+
+    private func save() {
+        guard let raw = Double(amountText), raw != 0 else { return }
+        let amount = kind == .withdrawal ? -abs(raw) : abs(raw)
+        model.requireArm {
+            Task {
+                error = await model.recordCashFlow(amount: amount, note: note)
+                if error == nil { dismiss() }
+            }
+        }
+    }
+}
+
 // MARK: - Settings
 
 struct SettingsSheet: View {

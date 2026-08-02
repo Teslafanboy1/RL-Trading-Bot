@@ -80,11 +80,11 @@
   },
   "progress_tracking": {
     "monthly_goal": "100%",
-    "month_start_value": 294.605,
-    "current_value": 266.8674,
-    "current_return": "-9.4%",
+    "month_start_value": 395.455,
+    "current_value": 367.7174,
+    "current_return": "-7.0%",
     "on_track": false,
-    "required_weekly_return": 120.79,
+    "required_weekly_return": 29.08,
     "_rebase_note": "2026-06-24: operator added ~$154.57 of new capital (account $102.28 -> broker total $256.85). month_start_value rebased UP by the deposit (100.17 -> 254.745) so the deposit is NOT counted as a trading gain and so the risk-based sizing denominator (agent.py reads summary.current_value = month_start_value + total_pnl) sees the full account. Without this rebase the sizing layer would keep trading against the stale ~$102 base and leave the new ~$150 idle. current_value = 254.745 + total_pnl(2.1087) = 256.8537 ~= broker total. required_weekly_return is stale and will be recomputed next cycle by update_monthly_progress; it is INFORMATIONAL only.",
     "_note": "2026-06-22 (Phase A): goal reframed - see goal_framing. 100%/mo is an aspirational ceiling; the operating mandate is risk-adjusted compounding under position_sizing + factor_exposure_limits. required_weekly_return is INFORMATIONAL, not a sizing input - never raise per-trade risk to chase it."
   },

@@ -2186,6 +2186,74 @@ def sync_account_equity(log, broker_total):
         print(f"  [equity-sync] skipped (non-fatal): {e}")
 
 
+def process_manual_cash_flows(log):
+    """Apply operator-declared deposits/withdrawals (control/cash_flows.json,
+    written by the dashboard's PIN-armed /api/cash_flow endpoint) to
+    month_start_value / current_value, the same bookkeeping sync_account_equity
+    does automatically off a broker-total diff — except keyed to an EXACT
+    dollar amount the operator typed in, not an inferred diff.
+
+    Why this exists (2026-08-03): sync_account_equity's detect_deposit only
+    fires when a broker-total diff clears $25/5% AND a broker read actually
+    happens (off-hours cycles skip the broker read entirely, and a single bad
+    self-reported broker total can misattribute the diff — see the 2026-08-02
+    false-halt incident). A manual declaration needs no broker call, applies
+    the exact amount the operator confirms, and runs every non-halted cycle
+    regardless of market hours, closing both gaps.
+
+    Each control/cash_flows.json entry is {amount, note, ts, applied}; only
+    un-applied entries are processed, then marked applied in place so a
+    replay never double-counts. Never raises."""
+    try:
+        path = os.path.join(ROOT, "control", "cash_flows.json")
+        try:
+            with open(path) as f:
+                flows = json.load(f)
+        except Exception:
+            return
+        if not isinstance(flows, list):
+            return
+        changed = False
+        for entry in flows:
+            if not isinstance(entry, dict) or entry.get("applied"):
+                continue
+            try:
+                delta = round(float(entry["amount"]), 2)
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not delta:
+                entry["applied"] = True
+                entry["applied_ts"] = now_iso()
+                changed = True
+                continue
+            s = log.setdefault("summary", {})
+            s["month_start_value"] = round(float(s.get("month_start_value") or 0) + delta, 4)
+            s["current_value"] = round(float(s.get("current_value") or 0) + delta, 4)
+            strategy = load_strategy()
+            pt = strategy.get("progress_tracking")
+            if pt:
+                pt["month_start_value"] = s["month_start_value"]
+                pt["current_value"] = s["current_value"]
+                save_strategy(strategy)
+            if risk_guard:
+                risk_guard.rebase_peak(delta)
+            entry["applied"] = True
+            entry["applied_ts"] = now_iso()
+            changed = True
+            print(f"  [cash-flow] applied operator-declared {delta:+.2f} "
+                  f"({entry.get('note') or 'no note'}) — month_start_value and "
+                  "current_value rebased, not counted as trading P&L.")
+        if changed:
+            save_trade_log(log)
+            update_monthly_progress(log)
+            tmp = path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(flows, f, indent=2)
+            os.replace(tmp, path)
+    except Exception as e:
+        print(f"  [cash-flow] skipped (non-fatal): {e}")
+
+
 def write_stop_snapshot(log, strategy):
     """logs/stops.json — the per-position stop levels for the INDEPENDENT
     watchdog (watchdog.sh), which prices them off Yahoo and alerts the operator
@@ -2559,6 +2627,11 @@ def run_agent():
                   "deletes the HALT file.")
             write_cycle_status("halted")
             return
+    # Operator-declared deposits/withdrawals (dashboard PIN-armed action): needs no
+    # broker call, so it runs every cycle before anything else touches progress
+    # tracking. See process_manual_cash_flows for why this exists alongside the
+    # automatic broker-diff heuristic in sync_account_equity.
+    process_manual_cash_flows(log)
     # Lean view (version_history elided) for the read-only cycle prompt; the full
     # file stays on disk for skill_5 and Phase 4. See strategy_for_prompt().
     strategy_text = strategy_for_prompt()

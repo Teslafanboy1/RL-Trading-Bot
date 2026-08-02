@@ -319,7 +319,8 @@ def risk_view():
             "overrides": {k: v for k, v in overrides.items() if not k.startswith("_")},
             "dnt": readers.do_not_trade(),
             "stops_file": stops_file,
-            "watchdog_log": readers.watchdog_recent(30)}
+            "watchdog_log": readers.watchdog_recent(30),
+            "cash_flows": readers.cash_flows(20)}
 
 
 def news_view():
@@ -974,6 +975,10 @@ class Handler(BaseHTTPRequestHandler):
                     sym, stop_price=body.get("stop_price"),
                     stop_pct=body.get("stop_pct"), trail_pct=body.get("trail_pct"),
                     clear=bool(body.get("clear")), ip=ip))
+            if path == "/api/cash_flow":
+                out = controls.record_cash_flow(body.get("amount"),
+                                                body.get("note", ""), ip)
+                return self._send(200 if out.get("ok") else 400, out)
             return self._send(404, {"error": "not found"})
         except Exception as e:
             import traceback
@@ -1005,6 +1010,7 @@ Handler.GETS = {
     "/api/learning": lambda h: learning_view(),
     "/api/calendar": lambda h: calendar_view(),
     "/api/meta": lambda h: meta_view(),
+    "/api/cash_flows": lambda h: {"flows": readers.cash_flows(50)},
     "/api/postmortem": lambda h: {"file": _q(h, "file"),
                                   "text": readers.postmortem_text(_q(h, "file"))},
     "/api/research_file": lambda h: {"file": _q(h, "file"),

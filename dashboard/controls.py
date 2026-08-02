@@ -32,6 +32,7 @@ LOCK_DIR = os.path.join(CONTROL_DIR, "locks")
 PAUSE_FILE = os.path.join(CONTROL_DIR, "PAUSE")
 DNT_FILE = os.path.join(CONTROL_DIR, "do_not_trade.json")
 OVERRIDES_FILE = os.path.join(CONTROL_DIR, "stop_overrides.json")
+CASH_FLOWS_FILE = os.path.join(CONTROL_DIR, "cash_flows.json")
 HALT_FILE = os.path.join(ROOT, "HALT")
 JOURNAL = os.path.join(ROOT, "logs", "manual_actions.jsonl")
 AUTH_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".auth.json")
@@ -171,6 +172,39 @@ def set_stop_override(symbol, stop_price=None, stop_pct=None, trail_pct=None,
             {"symbol": symbol, "stop_price": stop_price, "stop_pct": stop_pct,
              "trail_pct": trail_pct, "clear": clear}, {"ok": True}, ip)
     return {"ok": True, "overrides": {k: v for k, v in d.items() if not k.startswith("_")}}
+
+
+# ---------------------------------------------------------------- cash flows
+def record_cash_flow(amount, note="", ip=None):
+    """Declare a deposit (amount > 0) or withdrawal (amount < 0) into
+    control/cash_flows.json. agent.process_manual_cash_flows() applies each
+    un-applied entry to progress tracking + the kill-switch peak next cycle —
+    see that function for why a manual declaration exists alongside the
+    automatic broker-diff heuristic (sync_account_equity). Never guesses:
+    the operator's number is applied exactly, not inferred from a broker read
+    that may itself be wrong (the 2026-08-02 false-halt root cause)."""
+    try:
+        amount = round(float(amount), 2)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "amount must be a number"}
+    if not amount:
+        return {"ok": False, "error": "amount must be non-zero"}
+    flows = _load_json(CASH_FLOWS_FILE, [])
+    if not isinstance(flows, list):
+        flows = []
+    entry = {"ts": _now_iso(), "amount": amount, "note": str(note or "")[:200],
+              "applied": False}
+    flows.append(entry)
+    _save_json(CASH_FLOWS_FILE, flows)
+    kind = "deposit" if amount > 0 else "withdrawal"
+    journal("cash_flow", {"amount": amount, "note": note, "kind": kind},
+            {"ok": True}, ip)
+    return {"ok": True, "entry": entry}
+
+
+def list_cash_flows():
+    flows = _load_json(CASH_FLOWS_FILE, [])
+    return flows if isinstance(flows, list) else []
 
 
 # ---------------------------------------------------------------- locks

@@ -27,12 +27,13 @@ import sys
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, PROJECT_ROOT)
 
 import agent as agent_module
+import risk_guard
 from dashboard import readers, controls, broker as broker_mod, mcp_client
 from dashboard import server as server_mod
 
@@ -90,9 +91,20 @@ class TmpRootMixin(unittest.TestCase):
             patch.object(controls, "PAUSE_FILE", os.path.join(self.tmpdir, "control", "PAUSE")),
             patch.object(controls, "DNT_FILE", os.path.join(self.tmpdir, "control", "do_not_trade.json")),
             patch.object(controls, "OVERRIDES_FILE", os.path.join(self.tmpdir, "control", "stop_overrides.json")),
+            patch.object(controls, "CASH_FLOWS_FILE", os.path.join(self.tmpdir, "control", "cash_flows.json")),
             patch.object(controls, "HALT_FILE", os.path.join(self.tmpdir, "HALT")),
             patch.object(controls, "JOURNAL", os.path.join(self.tmpdir, "logs", "manual_actions.jsonl")),
             patch.object(controls, "AUTH_FILE", os.path.join(self.tmpdir, "dashboard", ".auth.json")),
+            # risk_guard resolves its file paths from its OWN module location, not
+            # agent.ROOT — without these, any test that exercises run_agent() (or
+            # calls risk_guard directly) writes mocked equity into the REAL repo's
+            # logs/risk_state.json / HALT (2026-08-03: this is what actually
+            # produced the "544/589.72 -> 322" false halt — test fixture values
+            # leaking into production state, not a bad live broker read).
+            patch.object(risk_guard, "ROOT", self.tmpdir),
+            patch.object(risk_guard, "HALT_FILE", os.path.join(self.tmpdir, "HALT")),
+            patch.object(risk_guard, "STATE_FILE", os.path.join(self.tmpdir, "logs", "risk_state.json")),
+            patch.object(risk_guard, "HEARTBEAT_FILE", os.path.join(self.tmpdir, "logs", "heartbeat")),
         ]
         for p in self._patches:
             p.start()
@@ -226,6 +238,12 @@ class TestReaders(TmpRootMixin):
         s = readers.realized_pnl_series()
         self.assertEqual([p["cum_pnl"] for p in s], [5.0, 3.0])
 
+    def test_cash_flows_newest_first(self):
+        controls.record_cash_flow(94.97, "deposit")
+        controls.record_cash_flow(-10, "withdrawal")
+        flows = readers.cash_flows()
+        self.assertEqual([f["amount"] for f in flows], [-10.0, 94.97])
+
     def test_postmortem_text_path_traversal_blocked(self):
         self._write("postmortems/postmortem_001.md", "# PM\nsecret ok")
         self.assertIn("secret ok", readers.postmortem_text("postmortem_001.md"))
@@ -282,6 +300,23 @@ class TestControls(TmpRootMixin):
         self.assertEqual(ov["AMAT"]["trail_pct"], 0.30)
         controls.set_stop_override("AMAT", clear=True)
         self.assertEqual(agent_module._stop_overrides(), {})
+
+    def test_record_cash_flow_roundtrip(self):
+        dep = controls.record_cash_flow(94.97, "operator deposit", ip="1.2.3.4")
+        self.assertTrue(dep["ok"])
+        self.assertEqual(dep["entry"]["amount"], 94.97)
+        self.assertFalse(dep["entry"]["applied"])
+        wd = controls.record_cash_flow(-30, "withdrawal")
+        self.assertTrue(wd["ok"])
+        flows = controls.list_cash_flows()
+        self.assertEqual(len(flows), 2)
+        self.assertEqual(flows[0]["amount"], 94.97)
+        self.assertEqual(flows[1]["amount"], -30.0)
+
+    def test_record_cash_flow_rejects_zero_and_non_numeric(self):
+        self.assertFalse(controls.record_cash_flow(0)["ok"])
+        self.assertFalse(controls.record_cash_flow("not-a-number")["ok"])
+        self.assertEqual(controls.list_cash_flows(), [])
 
     def test_manual_locks(self):
         controls.take_manual_lock("labu")
@@ -536,6 +571,49 @@ class TestAgentControlPlane(TmpRootMixin):
         snap = json.load(open(os.path.join(self.tmpdir, "logs", "stops.json")))
         self.assertEqual(snap["stops"]["AMAT"]["stop"], 97.5)
         self.assertEqual(snap["stops"]["AMAT"]["trail_stop"], 180.0)
+
+    def _with_progress_tracking(self):
+        self.strategy["progress_tracking"] = {
+            "monthly_goal": "100%", "month_start_value": 100.0,
+            "current_value": 100.0, "current_return": "0.0%", "on_track": True}
+        self._write("strategy/strategy.json", json.dumps(self.strategy))
+
+    def test_process_manual_cash_flows_applies_deposit(self):
+        self._with_progress_tracking()
+        controls.record_cash_flow(94.97, "deposit via app")
+        log = json.load(open(os.path.join(self.tmpdir, "trade_log.json")))
+        fake_rg = MagicMock()
+        with patch.object(agent_module, "risk_guard", fake_rg):
+            agent_module.process_manual_cash_flows(log)
+        s = json.load(open(os.path.join(self.tmpdir, "trade_log.json")))["summary"]
+        self.assertAlmostEqual(s["month_start_value"], 194.97)
+        self.assertAlmostEqual(s["current_value"], 194.97)
+        fake_rg.rebase_peak.assert_called_once_with(94.97)
+        strat = json.load(open(os.path.join(self.tmpdir, "strategy", "strategy.json")))
+        self.assertAlmostEqual(strat["progress_tracking"]["current_value"], 194.97)
+        flows = controls.list_cash_flows()
+        self.assertTrue(flows[0]["applied"])
+
+    def test_process_manual_cash_flows_withdrawal_and_idempotent(self):
+        self._with_progress_tracking()
+        controls.record_cash_flow(-25.5, "withdrawal")
+        log = json.load(open(os.path.join(self.tmpdir, "trade_log.json")))
+        with patch.object(agent_module, "risk_guard", MagicMock()):
+            agent_module.process_manual_cash_flows(log)
+            s1 = json.load(open(os.path.join(self.tmpdir, "trade_log.json")))["summary"]
+            self.assertAlmostEqual(s1["current_value"], 74.5)
+            # second call must not re-apply the already-applied entry
+            log2 = json.load(open(os.path.join(self.tmpdir, "trade_log.json")))
+            agent_module.process_manual_cash_flows(log2)
+        s2 = json.load(open(os.path.join(self.tmpdir, "trade_log.json")))["summary"]
+        self.assertAlmostEqual(s2["current_value"], 74.5)
+
+    def test_process_manual_cash_flows_no_file_is_noop(self):
+        log = json.load(open(os.path.join(self.tmpdir, "trade_log.json")))
+        with patch.object(agent_module, "risk_guard", MagicMock()):
+            agent_module.process_manual_cash_flows(log)   # must not raise
+        s = json.load(open(os.path.join(self.tmpdir, "trade_log.json")))["summary"]
+        self.assertAlmostEqual(s["current_value"], 100.0)
 
     def test_dnt_suppresses_enter_long_wake(self):
         raw = {"NVDA": {"ok": True, "state": "BUY", "transition": "ENTER_LONG"}}

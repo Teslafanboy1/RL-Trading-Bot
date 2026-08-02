@@ -40,6 +40,15 @@ HEARTBEAT_FILE = os.path.join(ROOT, "logs", "heartbeat")
 DEPOSIT_MIN_USD = 25.0
 DEPOSIT_MIN_PCT = 0.05
 
+# A single equity reading this far outside the last known-good value is more
+# likely a bad/hallucinated broker read than a real move (see 2026-08-02
+# false halt: peak 544 -> 322 with no corresponding trade, deposit, or
+# equity_curve entry anywhere — the account was flat cash at ~$273 the whole
+# time). Ratios: > IMPLAUSIBLE_HIGH or < IMPLAUSIBLE_LOW vs last_equity.
+IMPLAUSIBLE_HIGH_RATIO = 2.0
+IMPLAUSIBLE_LOW_RATIO = 0.5
+CORROBORATION_TOLERANCE = 0.10
+
 
 # ------------------------------------------------------------------ heartbeat
 def beat(note=""):
@@ -81,35 +90,74 @@ def check_halt(equity, now=None):
 
     equity — current REAL account value (broker total, not the trade log).
     Returns (status, detail) where status is one of:
-      "ok"      — within budget
+      "ok"      — within budget (includes a held "suspect_reading" — see below)
       "halt"    — threshold just breached; HALT file written NOW (caller must
                   flatten if live and alert the operator)
       "halted"  — HALT file already present (no state change)
     A None/zero equity returns ("ok", "no_equity") — never halt on missing data
     (a failed read is unknown, not a drawdown — same doctrine as the broker
-    reconciliation layer)."""
+    reconciliation layer).
+
+    PLAUSIBILITY GUARD (2026-08-03, added after a false halt): a reading more
+    than IMPLAUSIBLE_HIGH_RATIO above or IMPLAUSIBLE_LOW_RATIO below the last
+    accepted equity is held as "pending" for one cycle instead of being
+    trusted immediately — it does NOT move the peak, last_equity, or drawdown,
+    and cannot trip a halt. It is only accepted once a SECOND reading arrives
+    within CORROBORATION_TOLERANCE of the pending value, confirming it's real
+    (a genuine crash or a large undeclared deposit/withdrawal) rather than a
+    one-off bad/hallucinated broker read. A legitimate detected deposit is
+    unaffected: agent.sync_account_equity / process_manual_cash_flows call
+    rebase_peak() BEFORE this runs each cycle, which pre-aligns last_equity to
+    the new total so it never looks implausible in the first place. This
+    trades up to one extra poll cycle of halt latency on a genuine crash for
+    never again freezing the bot on a phantom reading (2026-08-02: peak
+    jumped to 544 and a later 322 tripped a 40.8% halt while the real account
+    sat flat at ~$273 the whole time — no trade, deposit, or equity_curve
+    entry anywhere corroborates either number)."""
     try:
         if halted():
             return "halted", "HALT file present"
         if not equity or equity <= 0:
             return "ok", "no_equity"
+        equity = float(equity)
         now = now or datetime.now(ET)
         month = now.strftime("%Y-%m")
         st = _load_state()
         if st.get("month") != month:
-            st = {"month": month, "peak": float(equity)}
-        peak = max(float(st.get("peak") or 0), float(equity))
+            st = {"month": month, "peak": equity, "last_equity": equity,
+                  "drawdown": 0.0, "updated": now.isoformat(timespec="seconds")}
+            _save_state(st)
+            return "ok", f"dd 0.0% of month peak {equity:.2f} (month reset)"
+
+        last_known = st.get("last_equity")
+        if last_known and float(last_known) > 0:
+            ratio = equity / float(last_known)
+            if ratio > IMPLAUSIBLE_HIGH_RATIO or ratio < IMPLAUSIBLE_LOW_RATIO:
+                pending = st.get("pending_reading") or {}
+                corroborated = (
+                    pending.get("last_known") == last_known
+                    and abs(pending.get("equity", 0) - equity) / max(equity, 1)
+                        <= CORROBORATION_TOLERANCE)
+                if not corroborated:
+                    st["pending_reading"] = {"equity": equity, "last_known": last_known,
+                                             "first_seen": now.isoformat(timespec="seconds")}
+                    _save_state(st)
+                    return "ok", (f"suspect_reading {equity:.2f} vs last-known "
+                                  f"{float(last_known):.2f} ({ratio:.2f}x) — held for "
+                                  "corroboration, NOT applied to peak/drawdown")
+        st.pop("pending_reading", None)
+        peak = max(float(st.get("peak") or 0), equity)
         st["peak"] = peak
-        st["last_equity"] = float(equity)
+        st["last_equity"] = equity
         st["updated"] = now.isoformat(timespec="seconds")
-        dd = (peak - float(equity)) / peak if peak > 0 else 0.0
+        dd = (peak - equity) / peak if peak > 0 else 0.0
         st["drawdown"] = round(dd, 4)
         _save_state(st)
         if dd >= HALT_DD_PCT:
             with open(HALT_FILE, "w") as f:
                 f.write(
                     f"HALTED {now.isoformat(timespec='seconds')}\n"
-                    f"month peak equity {peak:.2f} -> current {float(equity):.2f} "
+                    f"month peak equity {peak:.2f} -> current {equity:.2f} "
                     f"(drawdown {dd*100:.1f}% >= {HALT_DD_PCT*100:.0f}%)\n"
                     "The bot will not trade while this file exists.\n"
                     "Review what happened, then DELETE this file to resume.\n")

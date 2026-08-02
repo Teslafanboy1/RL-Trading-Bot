@@ -237,6 +237,60 @@ class TestRiskGuard:
         st, _ = rg.check_halt(272.75)
         assert st == "ok"
 
+    def test_implausible_high_reading_held_not_committed(self):
+        # 2026-08-02 scenario: a lone bad broker read (544 vs a real ~273
+        # account) must not become the new peak on the strength of one read.
+        rg.check_halt(272.75)
+        st, detail = rg.check_halt(600.0)   # ratio ~2.2x
+        assert st == "ok"
+        assert "suspect_reading" in detail
+        with open(rg.STATE_FILE) as f:
+            saved = json.load(f)
+        assert saved["peak"] == 272.75          # unmoved
+        assert saved["last_equity"] == 272.75   # unmoved
+
+    def test_implausible_low_reading_held_not_committed(self):
+        rg.check_halt(272.75)
+        st, detail = rg.check_halt(50.0)   # ratio 0.18x
+        assert st == "ok"
+        assert "suspect_reading" in detail
+        assert not rg.halted()             # must NOT trip on an unheld reading
+        with open(rg.STATE_FILE) as f:
+            saved = json.load(f)
+        assert saved["peak"] == 272.75
+        assert saved["last_equity"] == 272.75
+
+    def test_corroborated_implausible_reading_commits_and_can_halt(self):
+        # a genuine crash (or a large undeclared withdrawal) still halts once
+        # a second consistent reading confirms it wasn't a one-off bad read.
+        rg.check_halt(272.75)
+        st, _ = rg.check_halt(50.0)
+        assert st == "ok"
+        st, _ = rg.check_halt(52.0)        # within 10% of the pending 50.0
+        assert st == "halt"
+        assert rg.halted()
+
+    def test_uncorroborated_second_implausible_reading_stays_pending(self):
+        rg.check_halt(272.75)
+        rg.check_halt(50.0)                 # pending = 50.0
+        st, detail = rg.check_halt(900.0)   # different implausible value
+        assert st == "ok"
+        assert "suspect_reading" in detail
+        with open(rg.STATE_FILE) as f:
+            saved = json.load(f)
+        assert saved["last_equity"] == 272.75           # still unmoved
+        assert saved["pending_reading"]["equity"] == 900.0
+
+    def test_deposit_rebase_avoids_false_suspect_flag(self):
+        # sync_account_equity calls rebase_peak BEFORE check_halt each cycle,
+        # so a legitimate large deposit is pre-aligned and never looks
+        # implausible even though the raw jump exceeds the ratio thresholds.
+        rg.check_halt(272.75)
+        rg.rebase_peak(94.97)               # deposit detected/declared first
+        st, detail = rg.check_halt(367.72)
+        assert st == "ok"
+        assert "suspect_reading" not in detail
+
     def test_rebase_peak_deposit_shifts_peak_up(self):
         rg.check_halt(100.0)
         rg.rebase_peak(50.0)         # deposit

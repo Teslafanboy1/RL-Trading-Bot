@@ -365,6 +365,18 @@ final class AppModel {
                       success: clear ? "Override cleared" : "Override saved")
     }
 
+    /// Declares a deposit (amount > 0) or withdrawal (amount < 0). Applied by
+    /// the bot next cycle to month_start_value/current_value and the
+    /// kill-switch peak — see agent.process_manual_cash_flows. This is the
+    /// exact dollar amount, not a broker-diff guess, so it can't be thrown
+    /// off by a stale or bad broker read the way the automatic sync can.
+    func recordCashFlow(amount: Double, note: String) async -> String? {
+        await control("/api/cash_flow", body: ["amount": amount, "note": note],
+                      success: amount >= 0
+                        ? "Deposit of \(Fmt.usd(amount)) recorded"
+                        : "Withdrawal of \(Fmt.usd(abs(amount))) recorded")
+    }
+
     func brokerRefresh() async -> String? {
         do {
             struct R: Codable { var ok: Bool?; var error: String? }

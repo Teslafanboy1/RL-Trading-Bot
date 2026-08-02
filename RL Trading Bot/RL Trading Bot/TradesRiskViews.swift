@@ -141,6 +141,7 @@ struct RiskView: View {
     @State private var dntSymbol = ""
     @State private var showHalt = false
     @State private var showClearHalt = false
+    @State private var showCashFlow = false
     @State private var actionError: String?
 
     private var r: RiskPayload? { model.riskPayload }
@@ -151,6 +152,7 @@ struct RiskView: View {
                 if let err = model.tabErrors[.risk] { ErrorBox(text: err) }
                 if let err = actionError { ErrorBox(text: err) }
                 killswitchCard
+                cashFlowCard
                 stopsCard
                 dntCard
                 watchdogCard
@@ -163,6 +165,10 @@ struct RiskView: View {
         .sheet(item: $overrideRow) { row in StopOverrideSheet(row: row) }
         .sheet(isPresented: $showHalt) { HaltSheet() }
         .sheet(isPresented: $showClearHalt) { ClearHaltSheet() }
+        .sheet(isPresented: $showCashFlow) {
+            CashFlowSheet()
+                .onDisappear { Task { await model.load(.risk) } }
+        }
         .overlay {
             if r == nil { ContentUnavailableView("Loading risk…", systemImage: "shield") }
         }
@@ -200,6 +206,45 @@ struct RiskView: View {
                 }
             }
         } label: { Label("Kill-switch — monthly −25% drawdown", systemImage: "bolt.shield.fill") }
+    }
+
+    private var cashFlowCard: some View {
+        GroupBox {
+            VStack(alignment: .leading, spacing: 8) {
+                Button { showCashFlow = true } label: {
+                    Label("Log deposit / withdrawal", systemImage: "plus.forwardslash.minus")
+                }
+                .buttonStyle(.bordered)
+                let flows = r?.cashFlows ?? []
+                if flows.isEmpty {
+                    Text("no declared deposits/withdrawals yet")
+                        .font(.caption).foregroundStyle(.secondary)
+                } else {
+                    VStack(spacing: 0) {
+                        ForEach(flows.prefix(6)) { f in
+                            HStack {
+                                Text((f.ts ?? "").prefix(16))
+                                    .font(.caption2.monospaced()).foregroundStyle(.secondary)
+                                if let note = f.note, !note.isEmpty {
+                                    Text(note).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+                                }
+                                Spacer()
+                                Text(Fmt.usdSigned(f.amount))
+                                    .font(.caption.monospacedDigit().bold())
+                                    .foregroundStyle((f.amount ?? 0) >= 0 ? Color.up : Color.down)
+                                Text(f.applied == true ? "applied" : "pending")
+                                    .font(.caption2)
+                                    .foregroundStyle(f.applied == true ? .secondary : Color.caution)
+                            }
+                            .padding(.vertical, 4)
+                            if f.id != flows.prefix(6).last?.id { Divider() }
+                        }
+                    }
+                }
+            }
+        } label: {
+            Label("Deposits & withdrawals — keeps performance % honest", systemImage: "banknote.fill")
+        }
     }
 
     private var stopsCard: some View {

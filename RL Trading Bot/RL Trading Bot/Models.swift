@@ -400,6 +400,18 @@ struct RiskPayload: Codable {
     var dnt: [String]?
     var stopsFile: JSONValue?
     var watchdogLog: [String]?
+    var cashFlows: [CashFlowEntry]?
+}
+
+/// A single operator-declared deposit (positive amount) or withdrawal
+/// (negative amount) — see controls.record_cash_flow / agent.process_manual_cash_flows.
+struct CashFlowEntry: Codable, Hashable, Identifiable {
+    var ts: String?
+    var amount: Double?
+    var note: String?
+    var applied: Bool?
+    var appliedTs: String?
+    var id: String { (ts ?? "") + String(amount ?? 0) }
 }
 
 // MARK: /api/news
