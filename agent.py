@@ -2156,7 +2156,12 @@ def sync_account_equity(log, broker_total):
     delta is folded into month_start_value AND current_value so (a) deposits are
     never counted as trading gains and (b) the risk-sizing denominator tracks
     the real account instead of a stale manual rebase. Mirrors the operator's
-    manual 2026-06-24 rebase, automatically. Never raises."""
+    manual 2026-06-24 rebase, automatically. The same delta also rebases
+    risk_guard's kill-switch peak (risk_guard.rebase_peak) — before this, a
+    withdrawal only adjusted month_start_value, so the kill-switch's separate
+    peak tracker still saw the withdrawal as a straight equity drop and could
+    trip a false-positive halt (2026-07-22: a ~$100-120 withdrawal read as a
+    30.5% drawdown). Never raises."""
     try:
         if not (risk_guard and broker_total):
             return
@@ -2173,9 +2178,10 @@ def sync_account_equity(log, broker_total):
             pt["current_value"] = s["current_value"]
             save_strategy(strategy)
         save_trade_log(log)
+        risk_guard.rebase_peak(delta)
         print(f"  [equity-sync] external deposit/withdrawal detected: {delta:+.2f} "
-              f"(broker total {broker_total:.2f}) — month_start_value rebased, "
-              "not counted as trading P&L.")
+              f"(broker total {broker_total:.2f}) — month_start_value and "
+              "kill-switch peak rebased, not counted as trading P&L.")
     except Exception as e:
         print(f"  [equity-sync] skipped (non-fatal): {e}")
 

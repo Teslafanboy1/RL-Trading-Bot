@@ -119,6 +119,40 @@ def check_halt(equity, now=None):
         return "ok", f"guard_error:{e}"       # guard failure must not stop trading
 
 
+def rebase_peak(delta, now=None):
+    """Shift the tracked month-peak equity (and last_equity) by an external
+    deposit/withdrawal delta so a withdrawal is never mistaken for a trading
+    drawdown by check_halt (and a deposit never masks a real one). Mirrors the
+    month_start_value rebase in agent.sync_account_equity — same delta, same
+    call site, applied to the OTHER thing that tracks raw equity. Caused the
+    2026-07-22 false-positive halt: a ~$100-120 withdrawal read as a 30.5%
+    drawdown against the month peak because only month_start_value was
+    deposit-aware, not risk_guard's peak.
+
+    No-op if there's no state for the current month yet (check_halt will seed
+    it fresh next call, already net of the withdrawal) or if HALT is already
+    tripped (don't move the goalposts under an active halt under review)."""
+    try:
+        if not delta or halted():
+            return
+        now = now or datetime.now(ET)
+        month = now.strftime("%Y-%m")
+        st = _load_state()
+        if st.get("month") != month or "peak" not in st:
+            return
+        st["peak"] = round(float(st["peak"]) + float(delta), 4)
+        if "last_equity" in st:
+            st["last_equity"] = round(float(st["last_equity"]) + float(delta), 4)
+        peak = float(st["peak"])
+        last_equity = float(st.get("last_equity") or peak)
+        dd = (peak - last_equity) / peak if peak > 0 else 0.0
+        st["drawdown"] = round(max(dd, 0.0), 4)
+        st["updated"] = now.isoformat(timespec="seconds")
+        _save_state(st)
+    except Exception:
+        pass       # guard failure must not stop trading
+
+
 # ------------------------------------------------------------------ deposits
 def detect_deposit(broker_total, tracked_total):
     """Difference between the broker's real total and the tracked value that

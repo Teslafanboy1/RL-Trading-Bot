@@ -39,7 +39,12 @@
       "oversized_for_account": true,
       "max_loss_usd": 6615.0,
       "pct_of_account": 25.754,
-      "status": "open"
+      "status": "closed",
+      "exit_premium": 8.0,
+      "pnl_per_contract_usd": -5815.0,
+      "pnl_pct_on_premium": -87.91,
+      "exit_date": "2026-07-17T13:41:45-04:00",
+      "exit_reason": "underlying_sell"
     },
     {
       "id": "S0003",
@@ -57,17 +62,22 @@
       "oversized_for_account": true,
       "max_loss_usd": 6515.0,
       "pct_of_account": 25.3646,
-      "status": "open"
+      "status": "closed",
+      "exit_premium": 5.0,
+      "pnl_per_contract_usd": -6015.0,
+      "pnl_pct_on_premium": -92.33,
+      "exit_date": "2026-07-13T09:40:56-04:00",
+      "exit_reason": "underlying_sell"
     }
   ],
   "_next_id": 4,
   "_note": "Phase B shadow (paper) options track record. No real money. P&L is per 1 contract; % on premium is the size-independent metric.",
   "summary": {
-    "open": 2,
-    "closed": 1,
+    "open": 0,
+    "closed": 3,
     "wins": 0,
     "win_rate": 0.0,
-    "total_pnl_per_contract_usd": -1080.0,
-    "avg_pct_on_premium": -21.16
+    "total_pnl_per_contract_usd": -12910.0,
+    "avg_pct_on_premium": -67.13
   }
 }

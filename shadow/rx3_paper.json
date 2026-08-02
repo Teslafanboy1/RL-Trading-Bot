@@ -2,23 +2,39 @@
   "_note": "RX-3 paper track record (approved 2026-07-06). No real money. Promotion gate: >=10 trading days, decisions match engine, behavior consistent with backtest envelope.",
   "start_date": "2026-07-08T09:42:55-04:00",
   "start_equity": 100.0,
-  "cash": 33.0713,
+  "cash": -0.0457,
   "positions": {
-    "AMAT": {
-      "shares": 0.085943,
-      "last_px": 577.6300048828125
+    "NET": {
+      "shares": 0.126201,
+      "last_px": 279.17999267578125
     },
-    "LABU": {
-      "shares": 0.055303,
-      "last_px": 299.2814025878906
+    "XLP": {
+      "shares": 0.275784,
+      "last_px": 85.16999816894531
+    },
+    "SNOW": {
+      "shares": 0.118334,
+      "last_px": 297.739990234375
     }
   },
   "leaders": [
-    "LABU",
-    "AMAT"
+    "NET",
+    "SNOW"
   ],
   "sleeve_rets": [
-    -0.047885033218953266
+    -0.047885033218953266,
+    -0.062264508885931824,
+    -0.06649287805376503,
+    0.012706037732736764,
+    -0.0003194632337976122,
+    -0.0011158241657808765,
+    -0.03843278423877544,
+    -0.03031089236713813,
+    0.01884384327699412,
+    -0.036896756460220836,
+    -0.000439726485633507,
+    -0.0169513158446008,
+    -0.0011816676148210803
   ],
   "history": [
     {
@@ -46,8 +62,158 @@
       "riskx": 1.0,
       "vol_scale": 1.0,
       "cash_w": 0.3333
+    },
+    {
+      "date": "2026-07-13",
+      "equity": 97.2872,
+      "leaders": [
+        "LABU",
+        "AMAT"
+      ],
+      "defensive": [],
+      "riskx": 1.0,
+      "vol_scale": 1.0,
+      "cash_w": 0.3333
+    },
+    {
+      "date": "2026-07-13",
+      "equity": 96.9739,
+      "leaders": [
+        "LABU",
+        "AMAT"
+      ],
+      "defensive": [],
+      "riskx": 1.0,
+      "vol_scale": 1.0,
+      "cash_w": 0.3333
+    },
+    {
+      "date": "2026-07-14",
+      "equity": 99.2958,
+      "leaders": [
+        "LABU",
+        "AMAT"
+      ],
+      "defensive": [],
+      "riskx": 1.0,
+      "vol_scale": 1.0,
+      "cash_w": 0.3333
+    },
+    {
+      "date": "2026-07-15",
+      "equity": 98.3047,
+      "leaders": [
+        "LABU",
+        "AMD"
+      ],
+      "defensive": [],
+      "riskx": 1.0,
+      "vol_scale": 1.0,
+      "cash_w": 0.3333
+    },
+    {
+      "date": "2026-07-15",
+      "equity": 98.2145,
+      "leaders": [
+        "AMD",
+        "LABU"
+      ],
+      "defensive": [],
+      "riskx": 1.0,
+      "vol_scale": 1.0,
+      "cash_w": 0.3333
+    },
+    {
+      "date": "2026-07-16",
+      "equity": 94.9033,
+      "leaders": [
+        "LABU",
+        "DDOG"
+      ],
+      "defensive": [],
+      "riskx": 1.0,
+      "vol_scale": 1.0,
+      "cash_w": 0.3333
+    },
+    {
+      "date": "2026-07-16",
+      "equity": 94.9033,
+      "leaders": [
+        "LABU",
+        "DDOG"
+      ],
+      "defensive": [],
+      "riskx": 1.0,
+      "vol_scale": 1.0,
+      "cash_w": 0.3333
+    },
+    {
+      "date": "2026-07-17",
+      "equity": 95.0646,
+      "leaders": [
+        "DDOG",
+        "LABU"
+      ],
+      "defensive": [],
+      "riskx": 1.0,
+      "vol_scale": 1.0,
+      "cash_w": 0.3333
+    },
+    {
+      "date": "2026-07-22",
+      "equity": 91.8995,
+      "leaders": [
+        "DDOG",
+        "LABU"
+      ],
+      "defensive": [],
+      "riskx": 1.0,
+      "vol_scale": 1.0,
+      "cash_w": 0.3333
+    },
+    {
+      "date": "2026-07-23",
+      "equity": 91.5481,
+      "leaders": [
+        "DDOG",
+        "NET"
+      ],
+      "defensive": [
+        "XLU"
+      ],
+      "riskx": 0.75,
+      "vol_scale": 1.0,
+      "cash_w": 0.0
+    },
+    {
+      "date": "2026-07-28",
+      "equity": 91.582,
+      "leaders": [
+        "DDOG",
+        "NET"
+      ],
+      "defensive": [
+        "XLP"
+      ],
+      "riskx": 0.5,
+      "vol_scale": 1.0,
+      "cash_w": 0.0
+    },
+    {
+      "date": "2026-07-31",
+      "equity": 93.9084,
+      "leaders": [
+        "NET",
+        "SNOW"
+      ],
+      "defensive": [
+        "XLP"
+      ],
+      "riskx": 0.75,
+      "vol_scale": 1.0,
+      "cash_w": 0.0
     }
   ],
-  "equity": 99.2658,
-  "last_run": "2026-07-10T09:38:48-04:00"
+  "equity": 93.9084,
+  "last_run": "2026-07-31T12:35:52-04:00"
 }

@@ -228,3 +228,39 @@ class TestRiskGuard:
         assert rg.detect_deposit(101.0, 100.0) == 0.0          # noise, not deposit
         assert rg.detect_deposit(70.0, 100.0) == -30.0         # withdrawal
         assert rg.detect_deposit(None, 100.0) == 0.0
+
+    def test_rebase_peak_withdrawal_avoids_false_halt(self):
+        # 2026-07-22 scenario: peak 392.53, then a ~$120 withdrawal alone would
+        # read as a 30.5% drawdown and wrongly trip the halt.
+        rg.check_halt(392.53)
+        rg.rebase_peak(-119.78)      # withdrawal detected same cycle
+        st, _ = rg.check_halt(272.75)
+        assert st == "ok"
+
+    def test_rebase_peak_deposit_shifts_peak_up(self):
+        rg.check_halt(100.0)
+        rg.rebase_peak(50.0)         # deposit
+        st, _ = rg.check_halt(115.0)  # would be +15% from 100 but is -23% from 150
+        assert st == "ok"
+        st, _ = rg.check_halt(110.0)  # -26.7% from rebased 150 peak
+        assert st == "halt"
+
+    def test_rebase_peak_noop_without_existing_state(self):
+        rg.rebase_peak(-100.0)       # no state file yet this month
+        assert not os.path.exists(rg.STATE_FILE)
+
+    def test_rebase_peak_noop_while_halted(self):
+        rg.check_halt(100.0)
+        rg.check_halt(70.0)          # trips halt
+        assert rg.halted()
+        rg.rebase_peak(-50.0)        # must not move the goalposts mid-halt
+        with open(rg.STATE_FILE) as f:
+            st = json.load(f)
+        assert st["peak"] == 100.0
+
+    def test_rebase_peak_zero_delta_noop(self):
+        rg.check_halt(100.0)
+        rg.rebase_peak(0.0)
+        with open(rg.STATE_FILE) as f:
+            st = json.load(f)
+        assert st["peak"] == 100.0
