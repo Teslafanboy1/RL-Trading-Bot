@@ -614,6 +614,9 @@ def health_view():
         ("Watchdog log", "logs/watchdog.log"),
         ("Manual journal", "logs/manual_actions.jsonl"),
         ("Change events", "logs/change_events.jsonl"),
+        ("Usage window", "logs/usage_state.json"),
+        ("Preflight check", "logs/preflight.json"),
+        ("Analysis queue", "logs/analysis_queue.jsonl"),
     ]
     files = []
     for label, rel in state_files:
@@ -630,6 +633,7 @@ def health_view():
                         "halt": readers.halt_state(),
                         "dnt": readers.do_not_trade(),
                         "overrides": overrides},
+            "usage": _usage_status(),
             "watchdog_log": readers.watchdog_recent(50),
             "agent_warnings": readers.agent_log_warnings(20),
             "latest_picks": picks,
@@ -662,26 +666,65 @@ def learning_view():
 
 
 def _bot_schedule(now=None):
-    """Upcoming bot events over the next week: pre-market research 9:20,
-    open 9:30, midweek review Wed 12:00, close 16:00 (ET, weekdays)."""
+    """Upcoming bot events over the next week (ET, weekdays).
+
+    Mirrors the usage-window schedule in agent.py: each phase is placed so it
+    lands in its own rolling 5-hour Claude session window. Times are derived
+    from strategy.json → usage, so editing the config moves this view too."""
     from datetime import timedelta
     now = now or datetime.now(ET)
+    u = (readers.strategy().get("usage") or {})
+    anchor_min = int(u.get("anchor_minutes_before_open", 305))
+    research_min = int(u.get("research_minutes_before_open", 35))
+    maint_h = int(u.get("maintenance_hour_et", 19))
+    maint_m = int(u.get("maintenance_minute_et", 35))
     events = []
     for d in range(0, 8):
         day = (now + timedelta(days=d)).date()
         if day.weekday() >= 5:
             continue
-        for hh, mm, label, kind in ((9, 20, "Pre-market research (Opus)", "research"),
-                                    (9, 30, "Market open — trading loop", "open"),
-                                    (12, 0, "Midweek review", "midweek"),
-                                    (16, 0, "Market close — bot sleeps", "close")):
+        open_t = datetime(day.year, day.month, day.day, 9, 30, tzinfo=ET)
+        slots = [
+            (open_t - timedelta(minutes=anchor_min),
+             "Pre-market system check — anchors the 5h usage window", "preflight"),
+            (open_t - timedelta(minutes=research_min),
+             "Pre-market research (Opus)", "research"),
+            (open_t, "Market open — trading loop (fresh usage window)", "open"),
+            (datetime(day.year, day.month, day.day, 12, 0, tzinfo=ET),
+             "Midweek review", "midweek"),
+            (datetime(day.year, day.month, day.day, 16, 0, tzinfo=ET),
+             "Market close — trading stops", "close"),
+            (datetime(day.year, day.month, day.day, maint_h, maint_m, tzinfo=ET),
+             "Maintenance — postmortems + strategy rewrites", "maintenance"),
+        ]
+        for t, label, kind in slots:
             if kind == "midweek" and day.weekday() != 2:
                 continue
-            t = datetime(day.year, day.month, day.day, hh, mm, tzinfo=ET)
             if t > now:
                 events.append({"when": t.isoformat(timespec="seconds"),
                                "label": label, "kind": kind})
-    return events[:10]
+    events.sort(key=lambda e: e["when"])
+    return events[:12]
+
+
+def _usage_status():
+    """Claude 5h-session-window state for the operator: how much of the current
+    window is spent, when it expires, and whether a 429 cooldown is muting the
+    non-protective tiers. Read-only and never raises — the dashboard must render
+    even if the governor module is missing."""
+    try:
+        import usage_governor
+        st = usage_governor.status()
+        cfg = usage_governor.config()
+        st["schedule"] = {
+            "anchor_minutes_before_open": cfg.get("anchor_minutes_before_open"),
+            "research_minutes_before_open": cfg.get("research_minutes_before_open"),
+            "maintenance_et": (f"{cfg.get('maintenance_hour_et', 19):02d}:"
+                               f"{cfg.get('maintenance_minute_et', 35):02d}"),
+        }
+        return st
+    except Exception as e:
+        return {"enabled": False, "error": str(e)}
 
 
 def calendar_view():

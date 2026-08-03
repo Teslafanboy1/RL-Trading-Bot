@@ -24,6 +24,12 @@ Key env vars:
 | `RH_ACCOUNT` | `696283985` | Robinhood Agentic cash account number |
 | `NEWS_CHECK_HOURS` | `4` | Force a thesis/news check at least every N hours even when EMA is flat — catches news-driven thesis breaks before the lagging EMA can reflect them |
 | `ALERT_WEBHOOK_URL` | _(unset)_ | If set, `notify_operator()` POSTs an out-of-band alert (`{title, message, text}` JSON — Slack/Discord/ntfy-compatible) when a hard forced exit can't complete or `claude -p` is unavailable while one is pending. Unset → stdout only. |
+| `USAGE_GOVERNOR` | `1` | `0`/`false` disables the 5-hour-window governor entirely (every call admitted). |
+| `USAGE_STATE_FILE` | `logs/usage_state.json` | Overrides where window state lives. **Set this in any test/second instance** — a stray 429-shaped fixture would otherwise write a real multi-hour cooldown into the live bot's state. |
+| `USAGE_ANCHOR_MIN` | `305` | Minutes before the open to fire the preflight anchor (see [Usage governor](#usage-governor-usage_governorpy--the-5-hour-session-window)). |
+| `USAGE_RESEARCH_MIN` | `35` | Minutes before the open to run pre-market research. |
+| `USAGE_MAINT_HOUR` / `USAGE_MAINT_MIN` | `19` / `35` | ET wall-clock start of the nightly maintenance drain. |
+| `USAGE_MAX_CALLS` / `USAGE_MAX_TOKENS` | `120` / `900000` | Soft per-window budget the tier ceilings are fractions of. |
 
 Compute EMA signals directly (no full agent run):
 ```bash
@@ -49,15 +55,28 @@ SIGNAL_INTERVAL=1d python3 signals.py SPY    # daily-chart mode
 #### Startup behaviour and daily loop
 
 `bash run.sh` runs continuously until Ctrl-C — it does **not** exit at market close.
-Instead it loops: research at 9:20 AM ET → trade 9:30–16:00 ET → sleep overnight →
-research next morning → trade → repeat. This means fresh picks are generated **every
-trading day** at 9:20 AM ET, not just on weekends. Start it once and it runs all week.
+It loops through four phases a day, each deliberately placed in its **own rolling
+5-hour Claude session window** (see [Usage governor](#usage-governor-usage_governorpy--the-5-hour-session-window)):
 
-When invoked while the market is **closed**, it prompts `r` or `w`:
+| ET | Phase | Window |
+|---|---|---|
+| **04:25** | `run_preflight()` — tiny health-check call that **anchors** window A | A: 04:25–09:25 |
+| **08:55** | Pre-market research (`skill_1_research.md`, Opus) — 30 min of headroom before A expires | A |
+| **09:30** | Market open — the first cycle opens a **fresh** window | B: 09:30–14:30 |
+| 14:30 | (trading continues; the next cycle opens window C) | C: 14:30–19:30 |
+| 16:00 | Market close — trading stops | C |
+| **19:35** | `run_maintenance()` — deferred postmortems, victories, skill_5 rewrites | D: 19:35–00:35 |
+
+Fresh picks are generated **every trading day**, not just on weekends. Start it once
+and it runs all week. The maintenance step waits for the live window to actually
+expire (`usage_governor.window_end()`) rather than trusting the clock, so a quiet
+afternoon that opened window C late still gets a clean window for the heavy work.
+
+When invoked while the market is **closed**, it prompts `r`, `m`, or `w`:
 - **`r`** — run research now and exit (one-shot, no trading loop).
-- **`w`** (default) — enter the daily loop: wait until **9:20 AM ET**, run pre-market
-  research (`skill_1_research.md`, `claude-opus-4-8`), sleep the remaining 10 minutes,
-  start the trading loop at 9:30 AM ET, then repeat daily until Ctrl-C.
+- **`m`** — run the maintenance drain now and exit (postmortems + strategy rewrites,
+  unbounded). Useful for clearing a backlog by hand.
+- **`w`** (default) — enter the 24/7 schedule above until Ctrl-C.
 
 When invoked while the market is **open**, it enters the intraday trading loop
 immediately using the latest `weekend_picks_*.md` as today's picks.
@@ -165,17 +184,43 @@ Single JSON file tracking `open_positions`, closed `trades`, and a rolling `summ
 
 ### Post-trade learning loop
 
-Triggered by `run_post_trade_pipeline()` after every position close:
-1. `trigger_postmortem()` or `trigger_victory_analysis()` — runs the model with web search, writes structured markdown + machine-readable `verdicts` JSON to `postmortems/`. Stop-loss exits always route to `trigger_postmortem()` and include additional focus questions (what caused the drawdown, whether an EMA SELL was missed before the stop hit).
-2. `update_source_weights()` — credits/debits sources based on `verdicts.sources` accuracy flags.
-3. `update_monthly_progress()` — recomputes current return vs. 100% monthly goal.
-4. `flag_strategy_rewrite()` — appends a line to `research/strategy_rewrite_queue.md`; the next cycle, `process_strategy_rewrite_queue()` consumes it (see [Strategy rewrite processing](#strategy-rewrite-processing-process_strategy_rewrite_queue)).
+Triggered by `run_post_trade_pipeline()` after every position close. The cheap local parts run **immediately**; the expensive analysis call is **deferred out of market hours**:
+1. `update_monthly_progress()` — recomputes current return vs. 100% monthly goal. Immediate (pure local).
+2. `flag_strategy_rewrite()` — appends a line to `research/strategy_rewrite_queue.md`. Immediate (file append only; the skill_5 call it schedules runs at maintenance).
+3. `enqueue_trade_analysis()` — appends the trade id to `logs/analysis_queue.jsonl` **when the market is open**. The postmortem/victory call is Opus **with web search**, the single most expensive thing the bot does, and it used to fire inline the instant a position closed — i.e. always during market hours. So the event most likely to be followed by more trading (a stop-loss cascade, a rotation) also dumped the day's biggest call into the middle of the execution window. A close **off-hours** still analyses inline (`defer=False`).
+4. `drain_analysis_queue()` — run by `run_maintenance()` after the close: `trigger_postmortem()` / `trigger_victory_analysis()` write the structured markdown + machine-readable `verdicts` JSON to `postmortems/`, then `update_source_weights()` credits/debits sources from `verdicts.sources`. Stop-loss exits always route to `trigger_postmortem()` with additional focus questions (what caused the drawdown, whether an EMA SELL was missed before the stop hit). Bounded to `usage.max_analyses_per_drain` per run; an entry whose model call was refused stays queued for the next drain rather than being lost.
 
 Stop-loss forced exits are tagged `stop_loss: true` in the trade record so the pattern detector (skill_6) can identify systemic drawdown patterns over time.
 
+### Usage governor (`usage_governor.py`) — the 5-hour session window
+
+Claude subscription usage is metered in **rolling 5-hour session windows**: a window opens on the first request after the previous one expired, and closes exactly 5 hours later. That start time is therefore something the bot *chooses*, which is what makes the whole schedule above possible.
+
+The problem it fixes, observed live: on **2026-07-06** a `market_hours_check` got `api_error_status: 429 — "You've hit your session limit · resets 10:50pm (Asia/Calcutta)"` at 09:45, and the bot then fired the same failing call every 15 minutes until the close (~25 wasted subprocesses). The work that got starved was exactly the discretionary work the operator cares about — research, the midweek review, postmortems — because it is the biggest and the least defended.
+
+Three mechanisms:
+
+1. **Window tracking.** Every `claude -p` call goes through `run_model()`, which books it via `usage_governor.record()`. `window_end()` is the scheduler's source of truth for when the current window expires — used by `maintenance_time()` so the nightly drain opens a window of its own instead of finishing off the trading day's.
+2. **Tiered admission.** Each call declares a tier, and `allow(tier)` refuses it once the window is spent past that tier's ceiling (`strategy.json → usage.tier_ceiling_pct`). Ceilings bite bottom-up, so discretionary work drains first and **protective exits are never blocked by budget at all**:
+
+   | Tier | Ceiling | Calls |
+   |---|---|---|
+   | `TIER_PROTECTIVE` (0) | 100% | `force_sell()`, and the `read_broker_state()` behind a pending forced exit |
+   | `TIER_EXECUTION` (1) | 100% | the `market_hours_check` turn, routine broker read, preflight |
+   | `TIER_RESEARCH` (2) | 75% | `research_and_prep`, `midweek_validation` |
+   | `TIER_LEARNING` (3) | 55% | postmortems, victories, skill_5 rewrites |
+   | `TIER_SHADOW` (4) | 40% | paper-options quotes (zero real money at stake) |
+
+   The ceilings are fractions of a **soft** budget (`max_calls_per_window` / `max_tokens_per_window`) — not an attempt to model the plan's real quota, which the CLI does not expose. What matters is the *ratio*: whatever the true limit turns out to be, shadow work stops at 40% of the way through the window and execution keeps going.
+3. **Cooldown.** `is_limit_error()` recognises a 429 and `note_limit()` parses the reset moment straight out of the payload (honouring the parenthesised zone — this server runs on **IST, not ET**). Non-protective tiers are then refused until that moment, so a limited session costs *one* failed call instead of twenty-six. A 429 also **re-anchors `window_end`**, which is the only ground truth the bot ever gets about the real boundary — including usage the operator burned in their own Claude sessions. When the reset is unparseable the cooldown backs off geometrically (30m → 1h → 2h → 4h, capped at one window) rather than blacking out a full window on a guess, and any successful call clears a stale cooldown.
+
+**Protective exits always win.** `TIER_PROTECTIVE` gets a probe even mid-cooldown, and `run_agent()` treats a governor-deferred execution turn specially: when a forced exit is pending it does **not** early-return, it skips the chatty turn and goes straight to the deterministic `read_broker_state()` + `force_sell()` path. A governor bug can never be the reason a stop-loss doesn't fire — every public function in the module fails **open**.
+
+State lives in `logs/usage_state.json`. **`USAGE_STATE_FILE` must be redirected in tests** (the base class and `TestRunModelErrorCapture` both do): a 429-shaped fixture would otherwise write a real multi-hour cooldown into the running bot's state — the same class of leak as the 2026-08-03 `risk_guard` false halt. `logs/preflight.json` records the morning health check; the dashboard surfaces all of it under `/api/health → usage`.
+
 ### Strategy rewrite processing (`process_strategy_rewrite_queue()`)
 
-Phase 2 only **queues** rewrites; Phase 3's `process_strategy_rewrite_queue()` is what consumes them. It runs at the **end of every `run_agent()` cycle**, after `process_cycle_state()` and all broker reconciliation, wrapped in try/except so a rewrite failure can never crash the trading loop. Each cycle it processes **at most one** un-`[DONE]` entry from `research/strategy_rewrite_queue.md`:
+Phase 2 only **queues** rewrites; Phase 3's `process_strategy_rewrite_queue()` is what consumes them. It runs at the end of a `run_agent()` cycle **only when the market is closed**, and is drained in bulk (up to `usage.max_rewrites_per_drain`) by `run_maintenance()` at 19:35 ET. It used to fire at the end of *every* cycle including 15-minute execution cycles — a full-Opus call carrying `strategy.json` plus all eight skill files, the second-biggest payload the bot sends, for something that is never time-critical. It is wrapped in try/except so a rewrite failure can never crash the trading loop, returns `True` when an entry was consumed (so the drain loop knows to come back), and processes **at most one** un-`[DONE]` entry from `research/strategy_rewrite_queue.md` per call:
 
 1. Loads skill_5 + context and runs skill_5 headless on `MODEL` (Opus, no web). The context is **scoped to the trade under review** to keep the call from ballooning: the full `strategy.json` (skill_5 must echo it back complete) + the full text of all 8 skill files (so any can still be rewritten) are sent, but postmortems are slimmed to the **referenced analysis in full + a filename index of the rest** (`_postmortems_for_rewrite()`), and the trade log to a **compact view — summary + open positions + a one-line-per-close history + the focus trade in full** (`_compact_trade_log_for_rewrite()`). This cut the per-close payload ~28% (~6.9K tokens) with no loss of what the review needs; the skill files (~58% of the remaining payload) are the next lever if a two-pass design is ever added. skill_5 also emits a `SEVERITY: ROUTINE|MAJOR` tag (forward-compat for Phase 5's conditional auto-apply).
 2. The headless model has **no file-write tool**, so `agent.py` parses skill_5's output text and applies it itself: the **last fenced ```json block** replaces `strategy/strategy.json` (snapshotting the prior version into `strategy/history/strategy_v{N}.json` first, same convention as `snapshot_strategy()`), and every `## SKILL FILE UPDATE: <name> … ## END SKILL FILE UPDATE` block rewrites that skill file through `version_skill_file()`.

@@ -133,6 +133,20 @@ try:
 except Exception:
     risk_guard = None
 
+try:
+    import usage_governor  # Claude 5h-session-window governor (tiers + cooldown)
+except Exception:
+    usage_governor = None
+
+# Priority tiers for every `claude -p` call. Kept as module constants (rather
+# than reaching into usage_governor at each call site) so the agent still runs
+# with the governor absent — see run_model().
+TIER_PROTECTIVE = 0   # force_sell + the broker read backing a forced exit
+TIER_EXECUTION = 1    # market-hours execution turn, routine broker read
+TIER_RESEARCH = 2     # pre-market research, midweek review
+TIER_LEARNING = 3     # postmortems, victories, skill_5 strategy rewrites
+TIER_SHADOW = 4       # paper-options quotes — zero real money at stake
+
 DEFAULT_STOP_LOSS_PCT = 0.10  # hard 10% drawdown limit
 
 
@@ -450,7 +464,8 @@ _EMPTY_USAGE = {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0}
 
 
 def run_model(system, user, *, mcp=False, web=False, timeout=600, model=None,
-              read_only=False, allow_write=False, extra_tools=None):
+              read_only=False, allow_write=False, extra_tools=None,
+              tier=TIER_EXECUTION):
     """One agent turn via the `claude` CLI. Returns (text, usage_dict).
 
     usage_dict keys: input_tokens, output_tokens, cost_usd.
@@ -460,7 +475,20 @@ def run_model(system, user, *, mcp=False, web=False, timeout=600, model=None,
     read_only=True forces RH read tools only (no order placement) regardless of
     EXECUTION_MODE — used for the independent broker-state verification read.
     allow_write=True arms order placement (subject to EXECUTION_MODE=live) for a
-    dedicated forced-sell call even outside the main execution turn."""
+    dedicated forced-sell call even outside the main execution turn.
+
+    `tier` is the usage-governor priority (TIER_PROTECTIVE … TIER_SHADOW). Every
+    call funnels through here, which is what makes the governor's view of the
+    5-hour session window complete: it books each call, refuses low-priority
+    work once the window is spent, and — critically — suppresses everything but
+    protective sells while a 429 cooldown is active. Before this gate, a session
+    limit at 09:45 meant 26 more identical failing calls before the close
+    (2026-07-06). A refusal is returned in the same `(error: …)` shape as a CLI
+    failure, so every existing caller's error handling covers it unchanged."""
+    if usage_governor is not None:
+        ok, why = usage_governor.allow(tier)
+        if not ok:
+            return f"(error: usage-governor deferred this {usage_governor.TIER_NAMES.get(tier, tier)} call — {why})", _EMPTY_USAGE
     tools = []
     if mcp:
         tools += RH_READ
@@ -486,13 +514,28 @@ def run_model(system, user, *, mcp=False, web=False, timeout=600, model=None,
     except FileNotFoundError:
         return "(error: `claude` CLI not found — set CLAUDE_BIN or install Claude Code)", _EMPTY_USAGE
     except subprocess.TimeoutExpired:
+        # A timeout still burned real session usage — book it.
+        _governor_record(tier, None)
         return "(error: claude -p timed out)", _EMPTY_USAGE
     if res.returncode != 0:
         # With --output-format json the CLI reports failures (usage cap, auth,
         # model errors) on STDOUT; stderr is often empty. Capture both so the
         # run record shows WHY it failed instead of a blank "rc=1:".
         detail = (res.stderr or "").strip() or (res.stdout or "").strip()
-        return f"(claude -p error rc={res.returncode}: {detail[:500]})", _EMPTY_USAGE
+        err = f"(claude -p error rc={res.returncode}: {detail[:500]})"
+        # A 429 payload carries the exact reset time ("resets 10:50pm
+        # (Asia/Calcutta)") — the only ground truth we ever get about the real
+        # window boundary, including usage the OPERATOR burned in their own
+        # Claude sessions. Hand it to the governor so the rest of the session
+        # stops re-firing into a wall.
+        if usage_governor is not None and usage_governor.is_limit_error(err):
+            until = usage_governor.note_limit(err)
+            if until:
+                print(f"  [USAGE] session limit hit — pausing non-protective "
+                      f"model calls until {until:%H:%M} ET.")
+        else:
+            _governor_record(tier, None)
+        return err, _EMPTY_USAGE
     raw = (res.stdout or "").strip()
     try:
         parsed = json.loads(raw)
@@ -505,7 +548,22 @@ def run_model(system, user, *, mcp=False, web=False, timeout=600, model=None,
         }
     except (json.JSONDecodeError, AttributeError):
         text, usage = raw, _EMPTY_USAGE
+    _governor_record(tier, usage)
+    # A successful call proves the limit lifted — drop any stale cooldown so the
+    # protective probe that got through immediately re-opens the other tiers.
+    if usage_governor is not None and usage_governor.cooldown_until():
+        usage_governor.clear_cooldown()
     return text, usage
+
+
+def _governor_record(tier, usage):
+    """Book a completed call against the current 5h window. Never raises."""
+    if usage_governor is None:
+        return
+    try:
+        usage_governor.record(tier, usage)
+    except Exception:
+        pass
 
 
 def extract_last_json_block(text):
@@ -1179,7 +1237,7 @@ def _run_analysis(trade, skill_path, prefix, kind):
         "followed by the machine-readable JSON verdicts block. Today: "
         f"{date.today().isoformat()}."
     )
-    text, _usage = run_model(system, user, web=True)
+    text, _usage = run_model(system, user, web=True, tier=TIER_LEARNING)
     verdicts = extract_last_json_block(text) or {}
 
     idx = _next_index(prefix)
@@ -1311,8 +1369,91 @@ def flag_strategy_rewrite(trade):
         f.write(header + line)
 
 
-def run_post_trade_pipeline(log, trade):
-    """The full Phase 2 reaction to a close — fires automatically."""
+ANALYSIS_QUEUE = os.path.join("logs", "analysis_queue.jsonl")
+
+
+def enqueue_trade_analysis(trade):
+    """Defer a close's postmortem/victory analysis to the maintenance window.
+
+    The analysis call is the most expensive thing the bot does — Opus WITH web
+    search — and it used to fire inline, the instant a position closed, which is
+    by definition during market hours. So the single event most likely to be
+    followed by more trading (a stop-loss cascade, a rotation) was also the event
+    that dumped the biggest call of the day into the middle of the execution
+    window. Queue it instead; `drain_analysis_queue()` runs it after the close in
+    a session window of its own. Nothing about the trade record is lost — the
+    close itself, P&L, and the summary are all written synchronously as before."""
+    try:
+        path = os.path.join(ROOT, ANALYSIS_QUEUE)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a") as f:
+            f.write(json.dumps({
+                "trade_id": trade.get("id"),
+                "symbol": trade.get("symbol"),
+                "outcome": trade.get("outcome"),
+                "queued_at": now_iso(),
+            }) + "\n")
+        return True
+    except Exception as e:
+        print(f"  [analysis-queue] enqueue failed for {trade.get('id')}: {e}")
+        return False
+
+
+def pending_trade_analyses():
+    """Queued trade ids awaiting a postmortem/victory, oldest first."""
+    path = os.path.join(ROOT, ANALYSIS_QUEUE)
+    if not os.path.exists(path):
+        return []
+    out = []
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    e = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if e.get("trade_id") and not e.get("done"):
+                    out.append(e)
+    except Exception:
+        return []
+    return out
+
+
+def _mark_analysis_done(trade_id):
+    """Rewrite the queue with `trade_id` marked done (idempotent, never raises)."""
+    path = os.path.join(ROOT, ANALYSIS_QUEUE)
+    try:
+        with open(path) as f:
+            lines = f.readlines()
+        out = []
+        for line in lines:
+            s = line.strip()
+            if not s:
+                continue
+            try:
+                e = json.loads(s)
+            except json.JSONDecodeError:
+                out.append(s)
+                continue
+            if e.get("trade_id") == trade_id:
+                e["done"] = now_iso()
+            out.append(json.dumps(e))
+        with open(path, "w") as f:
+            f.write("\n".join(out) + ("\n" if out else ""))
+        return True
+    except Exception:
+        return False
+
+
+def _analyze_trade(log, trade):
+    """Run the analysis engine for one closed trade and fold the result back in.
+
+    This is the body that used to live inline in run_post_trade_pipeline; it is
+    now callable either immediately (off-hours close) or from the maintenance
+    drain."""
     if trade["outcome"] == "LOSS":
         verdicts, fname = trigger_postmortem(trade)
         trade["postmortem_filed"] = True
@@ -1324,14 +1465,79 @@ def run_post_trade_pipeline(log, trade):
     # persist the analysis flags onto the stored trade
     for t in log["trades"]:
         if t["id"] == trade["id"]:
-            t.update({"postmortem_filed": trade["postmortem_filed"],
-                      "victory_filed": trade["victory_filed"],
+            t.update({"postmortem_filed": trade.get("postmortem_filed", False),
+                      "victory_filed": trade.get("victory_filed", False),
                       "analysis_file": fname})
     save_trade_log(log)
-
     update_source_weights(trade, verdicts)
+    return fname
+
+
+def drain_analysis_queue(limit=None):
+    """Run the deferred postmortems/victories. Returns the number completed.
+
+    Bounded per drain so a day with many closes can't empty a fresh window in
+    one go, and fully isolated — an analysis failure must never break the loop.
+    An entry whose model call was refused (governor cooldown or budget) is left
+    in the queue for the next drain rather than being marked done."""
+    cfg = usage_governor.config() if usage_governor else {}
+    limit = limit if limit is not None else cfg.get("max_analyses_per_drain", 4)
+    pending = pending_trade_analyses()
+    if not pending:
+        return 0
+    log = load_trade_log()
+    by_id = {t.get("id"): t for t in log.get("trades", [])}
+    done = 0
+    for entry in pending[:limit]:
+        tid = entry["trade_id"]
+        trade = by_id.get(tid)
+        if trade is None:
+            print(f"  [analysis-queue] {tid} not found in trade log — dropping.")
+            _mark_analysis_done(tid)
+            continue
+        if trade.get("postmortem_filed") or trade.get("victory_filed"):
+            _mark_analysis_done(tid)
+            continue
+        try:
+            print(f"  [analysis-queue] running {trade['outcome']} analysis for "
+                  f"{tid} ({trade.get('symbol')})...")
+            fname = _analyze_trade(log, trade)
+            if not fname:
+                print(f"  [analysis-queue] {tid} produced no file — will retry "
+                      "next drain.")
+                break
+            _mark_analysis_done(tid)
+            done += 1
+        except Exception as e:
+            print(f"  [analysis-queue] {tid} failed: {e} — will retry next drain.")
+            break
+    if done:
+        update_monthly_progress(log)
+    return done
+
+
+def run_post_trade_pipeline(log, trade, *, defer=None):
+    """The full Phase 2 reaction to a close — fires automatically.
+
+    The cheap, local parts (monthly progress, queueing the strategy rewrite) run
+    immediately. The expensive analysis call is DEFERRED to the maintenance
+    window whenever the market is open, so a close never spends execution-window
+    budget on retrospection. Pass defer=False to force it inline (used by the
+    maintenance drain itself and by tests)."""
+    if defer is None:
+        defer = is_market_open()
+
     update_monthly_progress(log)
     flag_strategy_rewrite(trade)
+
+    if defer:
+        enqueue_trade_analysis(trade)
+        print(f"  [analysis-queue] {trade['id']} ({trade.get('symbol')}) queued — "
+              "analysis runs after the close, not against execution budget.")
+        return
+
+    _analyze_trade(log, trade)
+    update_monthly_progress(log)
 
 
 # ================================================================ PHASE 3
@@ -1457,13 +1663,19 @@ def process_strategy_rewrite_queue():
     marked [DONE]: run skill_5 (headless, no file-write tool), parse its output, and
     apply the strategy.json + skill-file updates from Python. Marks the entry [DONE].
 
-    Called at the end of every run_agent() cycle, after process_cycle_state().
+    Returns True when an entry was consumed (so a caller draining a backlog knows
+    to come back for the next one) and False when the queue is empty, the entry
+    was unusable, or the model call failed.
+
+    Called from run_maintenance() after the close — NOT during market hours: it
+    is a full-Opus call carrying strategy.json plus all eight skill files, and
+    nothing about a rule change is time-critical.
     Processes AT MOST ONE entry per cycle so one bad rewrite can't block the loop.
     Skips gracefully if the file is missing; never raises (the caller also wraps
     this in try/except — a rewrite failure must never crash the trading loop)."""
     queue_path = os.path.join(ROOT, "research", "strategy_rewrite_queue.md")
     if not os.path.exists(queue_path):
-        return
+        return False
 
     with open(queue_path) as f:
         lines = f.readlines()
@@ -1478,7 +1690,7 @@ def process_strategy_rewrite_queue():
             break
 
     if target_idx is None:
-        return  # all processed
+        return False  # all processed
 
     # Auto-skip entries whose referenced analysis file no longer exists —
     # no point burning an Opus call on a postmortem that was quarantined or
@@ -1492,7 +1704,7 @@ def process_strategy_rewrite_queue():
             lines[target_idx] = lines[target_idx].rstrip() + f" [DONE {now_iso()} SKIPPED-missing-analysis]\n"
             with open(queue_path, "w") as f:
                 f.writelines(lines)
-            return
+            return True  # an entry WAS consumed (skipped) — keep draining
 
     print(f"  [skill_5] processing rewrite queue entry: {target_line[:80]}")
 
@@ -1551,11 +1763,11 @@ Your job:
 7. Be conservative — one or two trades is noise, not signal.
 """
 
-        text, _usage = run_model(skill5, user, web=False)
+        text, _usage = run_model(skill5, user, web=False, tier=TIER_LEARNING)
 
         if text.startswith("(claude -p error") or text.startswith("(error:"):
             print(f"  [skill_5] model call failed: {text[:100]}")
-            return
+            return False
 
         # Severity tag skill_5 emits (forward-compat for Phase 5; recorded into the
         # change-event log so Phase 4 can see ROUTINE vs MAJOR per bump).
@@ -1607,9 +1819,11 @@ Your job:
             f.writelines(lines)
 
         print("  [skill_5] queue entry marked [DONE]")
+        return True
 
     except Exception as e:
         print(f"  [skill_5] ERROR processing rewrite queue: {e} — skipping this entry")
+        return False
 
 
 # ================================================================ MAIN RUN
@@ -1662,7 +1876,7 @@ def persist_phase_output(task, text):
     return fname
 
 
-def read_broker_state():
+def read_broker_state(tier=TIER_EXECUTION):
     """Independent, read-only broker snapshot via a dedicated `claude -p` call —
     the AUTHORITATIVE ground truth for close detection. The main execution turn's
     self-reported footer cannot be trusted: on 2026-06-12 the model reported CLOV
@@ -1698,7 +1912,7 @@ def read_broker_state():
         "shares = quantity held (use 0 only if truly flat). If no positions, use []."
     )
     text, _ = run_model(system, user, mcp=True, read_only=True, model=CHECK_MODEL,
-                        timeout=240)
+                        timeout=240, tier=tier)
     block = extract_last_json_block(text)
     if not (block and isinstance(block, dict) and isinstance(block.get("positions"), list)):
         return None, set(), None
@@ -1737,7 +1951,7 @@ def force_sell(symbol, shares, reason):
         "Set placed=true ONLY if place_equity_order returned an order id."
     )
     text, _ = run_model(system, user, mcp=True, allow_write=True, model=MODEL,
-                        timeout=240)
+                        timeout=240, tier=TIER_PROTECTIVE)
     block = extract_last_json_block(text) or {}
     fp = block.get("fill_price")
     try:
@@ -1767,7 +1981,8 @@ def select_shadow_contract(underlying, underlying_price, cfg):
         'If no such liquid contract exists, output {"type":null}.'
     )
     text, _ = run_model(system, user, mcp=True, read_only=True,
-                        extra_tools=RH_OPTION_READ, model=CHECK_MODEL, timeout=240)
+                        extra_tools=RH_OPTION_READ, model=CHECK_MODEL, timeout=240,
+                        tier=TIER_SHADOW)
     block = extract_last_json_block(text)
     if not (block and isinstance(block, dict) and block.get("type")):
         return None
@@ -1786,7 +2001,8 @@ def read_shadow_quote(shadow):
         'Output ONLY one fenced ```json block: {"bid":<float>,"ask":<float>}'
     )
     text, _ = run_model(system, user, mcp=True, read_only=True,
-                        extra_tools=RH_OPTION_READ, model=CHECK_MODEL, timeout=180)
+                        extra_tools=RH_OPTION_READ, model=CHECK_MODEL, timeout=180,
+                        tier=TIER_SHADOW)
     block = extract_last_json_block(text) or {}
     try:
         return float(block["bid"])
@@ -2687,7 +2903,8 @@ def run_agent():
         stamp = datetime.now(ET).strftime("%Y-%m-%d_%H%M")
         exit_info = {}
         if is_market_open():
-            broker_positions, sell_orders_today, broker_total = read_broker_state()
+            broker_positions, sell_orders_today, broker_total = read_broker_state(
+                TIER_PROTECTIVE if must_sell else TIER_EXECUTION)
             if broker_total:
                 sync_account_equity(log, broker_total)
                 append_equity_point(broker_total)
@@ -2705,6 +2922,7 @@ def run_agent():
                             must_sell.setdefault(p["symbol"], "halt")
             if broker_positions is not None:
                 held_at_broker = {p["symbol"]: p for p in broker_positions}
+                sold_any = False
                 for sym, reason in must_sell.items():
                     if sym not in held_at_broker or sym in sell_orders_today:
                         continue
@@ -2717,8 +2935,14 @@ def run_agent():
                     exit_info[sym] = {"reason": reason, "price": fill}
                     print(f"  [FORCED-SELL] {sym} placed={placed} fill={fill} "
                           "(paused cycle)")
-                if must_sell:
-                    reread, _, _ = read_broker_state()
+                    sold_any = True
+                # Only re-read when a sell was actually PLACED. `must_sell` being
+                # non-empty is not enough: a stop-loss alert re-fires every cycle
+                # until the position is gone, so a name with a working sell order
+                # (or one already flat) triggered a full extra broker call every
+                # 15 minutes for nothing.
+                if sold_any:
+                    reread, _, _ = read_broker_state(TIER_PROTECTIVE)
                     if reread is not None:
                         broker_positions = reread
                 process_cycle_state(log, [], broker_positions, exit_info)
@@ -2858,7 +3082,8 @@ EXECUTION RULES:
     # market_hours_check: use Haiku (fast, cheap) — signals are pre-computed, rules are explicit.
     # research_and_prep / midweek_validation: use Opus for deeper reasoning.
     call_model = CHECK_MODEL if task == "market_hours_check" else MODEL
-    text, usage = run_model(system, user, mcp=True, model=call_model)
+    call_tier = TIER_EXECUTION if task == "market_hours_check" else TIER_RESEARCH
+    text, usage = run_model(system, user, mcp=True, model=call_model, tier=call_tier)
 
     stamp = datetime.now(ET).strftime("%Y-%m-%d_%H%M")
     print(f"  tokens: in={usage['input_tokens']} out={usage['output_tokens']} cost=${usage['cost_usd']:.4f}")
@@ -2872,10 +3097,29 @@ EXECUTION RULES:
     # don't attempt them (no phantom closes), but surface WHY loudly. The session
     # limit (HTTP 429) is the common case and silently no-ops every cycle until it
     # resets — exactly when a pending forced exit can't be placed.
-    if text.startswith("(claude -p error") or text.startswith("(error:"):
+    model_failed = text.startswith("(claude -p error") or text.startswith("(error:")
+    # A governor deferral is OUR OWN decision, not Claude being down: the
+    # protective tier is still permitted (it gets a probe even mid-cooldown). So
+    # when the chatty execution turn is deferred but a stop-loss is pending, we
+    # must NOT bail out — we skip the turn and go straight to the deterministic
+    # broker-read + force_sell path, which is the part that actually matters.
+    governor_deferred = text.startswith("(error: usage-governor")
+    if model_failed and governor_deferred and must_sell and is_market_open():
+        print(f"[{stamp}] execution turn deferred by the usage governor, but a "
+              f"forced exit is pending for {sorted(must_sell)} — proceeding "
+              f"straight to the deterministic protective path. {text[:120]}")
+        # Empty text ⇒ no footer, no phase output; reconciliation below runs off
+        # the broker read alone, which is exactly what the protective path needs.
+        text, model_failed = "", False
+    if model_failed:
         session_limited = ("session limit" in text.lower()
                            or "429" in text or "usage limit" in text.lower())
-        why = "Claude SESSION/USAGE LIMIT hit" if session_limited else "model call FAILED"
+        if governor_deferred:
+            why = "usage governor DEFERRED this call (budget/cooldown)"
+        elif session_limited:
+            why = "Claude SESSION/USAGE LIMIT hit"
+        else:
+            why = "model call FAILED"
         print(f"[{stamp}] WARNING: {why} — this cycle did NOTHING. {text[:180]}")
         if must_sell:
             print(f"[{stamp}] WARNING: forced exit PENDING for {sorted(must_sell)} "
@@ -2936,7 +3180,11 @@ EXECUTION RULES:
         print(f"[{stamp}] off-hours run — skipping broker reconciliation "
               "(market closed; no opens/closes possible).")
     else:
-        broker_positions, sell_orders_today, broker_total = read_broker_state()
+        # When a forced exit is pending this read IS the protective path (it
+        # decides what force_sell fires on), so it rides the tier that a spent
+        # usage window can never block.
+        broker_positions, sell_orders_today, broker_total = read_broker_state(
+            TIER_PROTECTIVE if must_sell else TIER_EXECUTION)
     # Account-level guard off the REAL broker total: deposit-aware equity sync +
     # the monthly-drawdown kill-switch. A fresh halt turns every held name into
     # a forced exit through the same deterministic force_sell path below.
@@ -2962,6 +3210,7 @@ EXECUTION RULES:
         # with no working sell order this cycle, gets its own dedicated sell call.
         if must_sell and is_market_open():
             held_at_broker = {p["symbol"]: p for p in broker_positions}
+            sold_any = False
             for sym, reason in must_sell.items():
                 if sym not in held_at_broker:
                     continue  # already gone (the main turn actually sold it)
@@ -2979,10 +3228,16 @@ EXECUTION RULES:
                 placed, fill = force_sell(sym, shares, reason)
                 exit_info[sym] = {"reason": reason, "price": fill}
                 print(f"  [FORCED-SELL] {sym} placed={placed} fill={fill}")
-            # re-read so close detection sees the post-forced-sell truth
-            reread, _, _ = read_broker_state()
-            if reread is not None:
-                broker_positions = reread
+                sold_any = True
+            # Re-read so close detection sees the post-forced-sell truth — but
+            # ONLY when a sell was actually placed. `must_sell` stays populated
+            # every cycle until the position is gone, so re-reading on the mere
+            # presence of an alert burned an extra broker call every 15 minutes
+            # while a sell order was already working.
+            if sold_any:
+                reread, _, _ = read_broker_state(TIER_PROTECTIVE)
+                if reread is not None:
+                    broker_positions = reread
 
         process_cycle_state(log, footer_actions, broker_positions, exit_info)
 
@@ -3003,10 +3258,17 @@ EXECUTION RULES:
     # broker reconciliation so a rewrite never interferes with close detection or
     # forced exits, and is fully isolated — a rewrite failure must not crash the
     # trading loop.
-    try:
-        process_strategy_rewrite_queue()
-    except Exception as e:
-        print(f"  [skill_5] rewrite queue processing failed: {e}")
+    #
+    # Now gated to OUTSIDE market hours. skill_5 is a full-Opus call carrying the
+    # complete strategy.json plus all eight skill files — the second-biggest
+    # payload the bot sends — and it was firing at the end of every cycle,
+    # including 15-minute execution cycles. Nothing about a strategy rewrite is
+    # time-critical: the queue is drained by run_maintenance() after the close.
+    if not is_market_open():
+        try:
+            process_strategy_rewrite_queue()
+        except Exception as e:
+            print(f"  [skill_5] rewrite queue processing failed: {e}")
 
     # Phase B + B+: shadow (paper) options passes — isolated, read-only, never trade.
     # Same bundle the smart-skip path runs, so paper trading behaves identically
@@ -3015,6 +3277,171 @@ EXECUTION RULES:
 
     write_cycle_status("idle", task)
     print(f"[{stamp}] task={task} done.")
+
+
+# ================================================================ usage schedule
+# The bot runs 24/7 on a server, but Claude subscription usage is metered in
+# rolling 5-hour session windows that open on the FIRST call after the previous
+# one expired. That start time is therefore something the bot chooses, and the
+# daily schedule below places each phase in a window of its own so the phases
+# never compete:
+#
+#   window A  04:25–09:25 ET   preflight anchor (tiny) + pre-market research
+#   window B  09:30–14:30 ET   trading, first half   (opened by the 9:30 cycle)
+#   window C  14:30–19:30 ET   trading, second half + the 16:00 close
+#   window D  19:35–00:35 ET   maintenance: postmortems, victories, skill_5
+#
+# The anchor call at 04:25 exists purely to START window A far enough ahead that
+# it EXPIRES five minutes before the opening bell — which is what guarantees the
+# opening cycle gets a completely fresh window, rather than inheriting whatever
+# the overnight research left behind. Research at 08:55 then sits comfortably
+# inside window A with ~30 minutes of headroom for a long Opus web-search run.
+# Maintenance waits for the live window to actually expire (the governor knows
+# the real boundary) instead of trusting the clock, so a quiet afternoon that
+# opened window C late still gets its own window for the heavy learning work.
+
+
+def preflight_anchor_time(opens, cfg):
+    """When to fire the session-anchor call for a given market open."""
+    return opens - timedelta(minutes=cfg.get("anchor_minutes_before_open", 305))
+
+
+def premarket_research_time(opens, cfg):
+    """When to run pre-market research (inside the anchored window)."""
+    return opens - timedelta(minutes=cfg.get("research_minutes_before_open", 35))
+
+
+def next_maintenance_slot(now, cfg, last_run_date=None):
+    """Next wall-clock maintenance start (at most one per calendar day).
+
+    `last_run_date` is the date of the last completed drain, so a restart in the
+    evening doesn't re-run tonight's maintenance."""
+    slot = now.replace(hour=cfg.get("maintenance_hour_et", 19),
+                       minute=cfg.get("maintenance_minute_et", 35),
+                       second=0, microsecond=0)
+    for _ in range(8):
+        if slot > now and not (last_run_date and slot.date() <= last_run_date):
+            return slot
+        slot += timedelta(days=1)
+    return slot
+
+
+def maintenance_time(now, cfg):
+    """When tonight's maintenance drain may start.
+
+    The later of (a) the configured wall-clock hour and (b) one minute after the
+    CURRENT usage window expires — so the heavy learning calls always land in a
+    fresh window instead of finishing off the one the trading day was using."""
+    target = now.replace(hour=cfg.get("maintenance_hour_et", 19),
+                         minute=cfg.get("maintenance_minute_et", 35),
+                         second=0, microsecond=0)
+    if target < now:
+        target = now
+    if usage_governor is not None:
+        end = usage_governor.window_end(now=now)
+        if end and end + timedelta(minutes=1) > target:
+            target = end + timedelta(minutes=1)
+    return target
+
+
+def run_preflight():
+    """Tiny `claude -p` call whose real job is to OPEN the 5-hour session window
+    at a time of our choosing — everything else it does is a bonus.
+
+    It doubles as a genuine morning system test: the round trip proves the CLI is
+    on PATH, the subscription is not already limited, and the Robinhood MCP
+    connection is authorized — all hours before the opening bell, when there is
+    still time to fix it, instead of discovering it from a failed 9:30 order."""
+    system = ("You are a health-check probe. Answer in one short line. Do not "
+              "analyze markets, do not place any order.")
+    user = (
+        f"Pre-market system check for Robinhood account {ACCOUNT_NUMBER}. "
+        "Call get_accounts once to confirm the connection works, then reply with "
+        "exactly: OK <account-number> <one-word connection status>. Nothing else."
+    )
+    text, usage = run_model(system, user, mcp=True, read_only=True,
+                            model=CHECK_MODEL, timeout=120, tier=TIER_EXECUTION)
+    stamp = datetime.now(ET).strftime("%Y-%m-%d_%H%M")
+    healthy = not (text.startswith("(claude -p error") or text.startswith("(error:"))
+    if healthy:
+        print(f"[{stamp}] PREFLIGHT OK — {text.strip()[:120]}")
+    else:
+        print(f"[{stamp}] PREFLIGHT FAILED — {text[:200]}")
+        notify_operator(
+            "Trading bot: pre-market system check FAILED",
+            f"The 04:25 ET preflight could not reach Claude/Robinhood: "
+            f"{text[:300]}. Today's research and execution are at risk — check "
+            "the CLI auth and subscription limit before the open.")
+    if usage_governor is not None:
+        st = usage_governor.status()
+        if st.get("window_end"):
+            print(f"  [USAGE] session window anchored — expires "
+                  f"{st['window_end']} (target: before the 09:30 open).")
+    try:
+        os.makedirs(os.path.join(ROOT, "logs"), exist_ok=True)
+        with open(os.path.join(ROOT, "logs", "preflight.json"), "w") as f:
+            json.dump({"ts": now_iso(), "healthy": healthy,
+                       "detail": text[:300],
+                       "usage": usage_governor.status() if usage_governor else {}},
+                      f, indent=2)
+    except Exception:
+        pass
+    return healthy
+
+
+def run_maintenance(deep=False):
+    """After-hours learning drain, in its own session window.
+
+    This is where the deferred expensive work happens: postmortems and victory
+    analyses queued during the trading day, then the skill_5 strategy rewrites
+    they flagged. Both are bounded per run so one busy day cannot drain a whole
+    window, and both are individually isolated.
+
+    `deep=True` (weekends) lifts the bounds — there is no execution to protect,
+    so the backlog gets cleared in one pass."""
+    stamp = datetime.now(ET).strftime("%Y-%m-%d_%H%M")
+    cfg = usage_governor.config() if usage_governor else {}
+    print(f"\n[{stamp}] MAINTENANCE ({'deep/weekend' if deep else 'nightly'}) — "
+          "deferred learning work.")
+    if usage_governor is not None:
+        st = usage_governor.status()
+        print(f"  [USAGE] window={st.get('window_start')} → {st.get('window_end')} "
+              f"calls={st.get('calls')} used={st.get('used_pct')}")
+        cd = usage_governor.cooldown_until()
+        if cd:
+            print(f"  [USAGE] cooling down until {cd:%H:%M} ET — maintenance "
+                  "deferred to the next run.")
+            return
+
+    a_limit = None if deep else cfg.get("max_analyses_per_drain", 4)
+    try:
+        n = drain_analysis_queue(limit=a_limit)
+        print(f"  [analysis-queue] {n} analysis run(s) completed; "
+              f"{len(pending_trade_analyses())} still queued.")
+    except Exception as e:
+        print(f"  [analysis-queue] drain failed: {e}")
+
+    # Strategy rewrites: one entry per call, bounded per drain. Weekend-only mode
+    # is available for operators who would rather batch every rule change into a
+    # single weekly review.
+    if cfg.get("weekend_only_rewrites") and not deep:
+        print("  [skill_5] weekend_only_rewrites=true — rewrites deferred to the "
+              "weekend deep maintenance.")
+        return
+    max_rw = (cfg.get("max_rewrites_per_drain", 3) if not deep else 12)
+    for _ in range(max_rw):
+        if usage_governor is not None:
+            ok, why = usage_governor.allow(TIER_LEARNING)
+            if not ok:
+                print(f"  [skill_5] stopping rewrite drain — {why}")
+                break
+        try:
+            if not process_strategy_rewrite_queue():
+                break  # nothing left to do
+        except Exception as e:
+            print(f"  [skill_5] rewrite queue processing failed: {e}")
+            break
+    print(f"[{stamp}] maintenance done.")
 
 
 def next_market_open():
@@ -3064,46 +3491,99 @@ def main():
             shutil.copy(skill_path, v001_path)
             print(f"  [baseline] {sk}_v001.md created")
 
+    cfg = usage_governor.config() if usage_governor else {
+        "anchor_minutes_before_open": 305, "research_minutes_before_open": 35,
+        "maintenance_hour_et": 19, "maintenance_minute_et": 35}
+
+    if usage_governor is not None:
+        st = usage_governor.status()
+        print(f"  usage governor: enabled={st.get('enabled')} "
+              f"window_end={st.get('window_end')} used={st.get('used_pct')} "
+              f"cooldown={st.get('cooldown_until')}")
+
     if not is_market_open():
         now = datetime.now(ET)
         opens = next_market_open()
-        research_time = opens - timedelta(minutes=10)
+        anchor_t = preflight_anchor_time(opens, cfg)
+        research_t = premarket_research_time(opens, cfg)
         hours_away = (opens - now).total_seconds() / 3600
         print(f"\nMarket is currently closed. ({now:%A %Y-%m-%d %H:%M} ET)")
-        print(f"Next market open: {opens:%A %Y-%m-%d at %H:%M} ET ({hours_away:.1f} hours away)\n")
+        print(f"Next market open: {opens:%A %Y-%m-%d at %H:%M} ET ({hours_away:.1f} hours away)")
+        print("\nDaily usage schedule (each phase gets its own 5h Claude window):")
+        print(f"  {anchor_t:%H:%M} ET  preflight system check — anchors the window")
+        print(f"  {research_t:%H:%M} ET  pre-market research (inside that window)")
+        print(f"  {opens:%H:%M} ET  market open — trading starts on a FRESH window")
+        print(f"  {cfg.get('maintenance_hour_et', 19):02d}:"
+              f"{cfg.get('maintenance_minute_et', 35):02d} ET  maintenance — "
+              "postmortems + strategy rewrites\n")
 
         print("What would you like to do?")
         print("  r — run research now and exit")
-        print(f"  w — wait until {research_time:%H:%M} ET ({opens:%A}) for pre-market research, then trade all week")
-        choice = input("\nYour choice (r/w): ").strip().lower()
+        print(f"  m — run the maintenance drain now and exit (postmortems + rewrites)")
+        print(f"  w — enter the 24/7 schedule above (default)")
+        choice = input("\nYour choice (r/m/w): ").strip().lower()
 
         if choice == "r":
             print("Running research now...\n")
             run_agent()
             return
+        if choice == "m":
+            run_maintenance(deep=True)
+            return
         # w (or anything else): fall through — the daily loop below handles it
 
-    # Daily loop: research at 9:20 → trade → close → repeat. Runs until Ctrl-C.
+    # Daily loop: maintenance → anchor → research → trade → repeat. Until Ctrl-C.
+    last_maintenance_date = None
     while True:
-        # If market is closed (startup w-path or just closed), sleep until pre-market research.
-        if not is_market_open():
+        # ---------------- off-hours: run each scheduled phase in turn ----------
+        while not is_market_open():
+            now = datetime.now(ET)
             opens = next_market_open()
-            research_time = opens - timedelta(minutes=10)
-            _sleep_until(
-                research_time,
-                f"\nWaiting until {research_time:%A %Y-%m-%d at %H:%M} ET "
-                f"for pre-market research. (Ctrl-C to stop)",
-            )
-            print("Running pre-market research...\n")
-            run_agent()
-            opens = next_market_open()
-            _sleep_until(
-                opens,
-                f"Research done. Waiting until {opens:%H:%M} ET "
-                f"for market open. (Ctrl-C to cancel)",
-            )
-            print("Market is now open. Starting trading loop...\n")
+            anchor_t = preflight_anchor_time(opens, cfg)
+            research_t = premarket_research_time(opens, cfg)
 
+            events = []
+            maint_t = next_maintenance_slot(now, cfg, last_maintenance_date)
+            # Only if it comfortably clears the next morning's anchor — the
+            # anchor is the one appointment that must not slip, because the
+            # whole point of it is to expire before the opening bell.
+            if maint_t < anchor_t - timedelta(minutes=30):
+                events.append((maint_t, "maintenance"))
+            if now < anchor_t:
+                events.append((anchor_t, "anchor"))
+            if now < research_t:
+                events.append((research_t, "research"))
+
+            if not events:
+                _sleep_until(opens, f"\nWaiting until {opens:%H:%M} ET for the "
+                                    "market open. (Ctrl-C to stop)")
+                break
+
+            when, what = min(events, key=lambda e: e[0])
+            _sleep_until(when, f"\nNext: {what} at {when:%A %Y-%m-%d %H:%M} ET. "
+                               "(Ctrl-C to stop)")
+
+            if what == "maintenance":
+                # Let the trading day's window fully expire first, so the heavy
+                # learning calls open a window of their own.
+                ready = maintenance_time(datetime.now(ET), cfg)
+                if ready > datetime.now(ET):
+                    _sleep_until(ready, f"  holding until the current usage window "
+                                        f"expires at {ready:%H:%M} ET...")
+                run_maintenance(deep=datetime.now(ET).weekday() >= 5)
+                last_maintenance_date = datetime.now(ET).date()
+            elif what == "anchor":
+                print("\nRunning pre-market system check (anchors today's usage "
+                      "window)...\n")
+                run_preflight()
+            elif what == "research":
+                print("\nRunning pre-market research...\n")
+                run_agent()
+
+        if not is_market_open():
+            continue  # woke early / market still closed — re-evaluate
+
+        print("Market is now open. Starting trading loop...\n")
         # Intraday trading loop — clear any stale schedule jobs from the prior day.
         schedule.clear()
         schedule.every(POLL_MINUTES).minutes.do(run_agent)
@@ -3112,8 +3592,11 @@ def main():
             if not is_market_open():
                 opens = next_market_open()
                 print(
-                    f"Market just closed. Will run pre-market research at "
-                    f"{(opens - timedelta(minutes=10)):%H:%M} ET on "
+                    f"Market just closed. Next: maintenance at "
+                    f"{cfg.get('maintenance_hour_et', 19):02d}:"
+                    f"{cfg.get('maintenance_minute_et', 35):02d} ET, then the "
+                    f"pre-market system check at "
+                    f"{preflight_anchor_time(opens, cfg):%H:%M} ET on "
                     f"{opens:%A %Y-%m-%d}. (Ctrl-C to stop)"
                 )
                 break

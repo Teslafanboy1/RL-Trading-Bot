@@ -848,7 +848,21 @@ class TestCommandCenterEndpoints(TmpRootMixin):
         events = server_mod._bot_schedule(wed)
         self.assertTrue(events)
         kinds_today = [e["kind"] for e in events if e["when"].startswith("2026-07-08")]
-        self.assertEqual(kinds_today, ["research", "open", "midweek", "close"])
+        # 08:00 is past the 04:25 preflight anchor, so it is not listed again
+        self.assertEqual(kinds_today,
+                         ["research", "open", "midweek", "close", "maintenance"])
+
+    def test_bot_schedule_includes_the_preflight_anchor(self):
+        """The anchor is the appointment the whole usage schedule hangs off —
+        it must be visible to the operator, and it must fall ~5h before the
+        open so its window expires before the bell."""
+        from datetime import datetime as dt
+        pre = dt(2026, 7, 8, 1, 0, tzinfo=server_mod.ET)      # Wednesday, 1 AM
+        events = server_mod._bot_schedule(pre)
+        today = [e for e in events if e["when"].startswith("2026-07-08")]
+        self.assertEqual(today[0]["kind"], "preflight")
+        self.assertTrue(today[0]["when"].startswith("2026-07-08T04:25"),
+                        f"anchor at {today[0]['when']}, expected 04:25 ET")
         sat = dt(2026, 7, 11, 8, 0, tzinfo=server_mod.ET)     # Saturday
         events = server_mod._bot_schedule(sat)
         self.assertTrue(all(not e["when"].startswith("2026-07-11")

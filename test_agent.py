@@ -37,6 +37,7 @@ import signals as sig_module
 import agent as agent_module
 import options_shadow as osh
 import risk_guard
+import usage_governor
 
 # ─────────────────────────────────────────── synthetic price series ──────────
 
@@ -139,6 +140,16 @@ class TmpDirMixin(unittest.TestCase):
             patch.object(risk_guard, "HALT_FILE", os.path.join(self.tmpdir, "HALT")),
             patch.object(risk_guard, "STATE_FILE", os.path.join(self.tmpdir, "logs", "risk_state.json")),
             patch.object(risk_guard, "HEARTBEAT_FILE", os.path.join(self.tmpdir, "logs", "heartbeat")),
+        ]
+        # usage_governor has the SAME hazard, and it bites harder: any test that
+        # feeds run_model a 429-shaped error calls note_limit(), which would
+        # write a real multi-hour cooldown into the live logs/usage_state.json
+        # and mute the running bot's non-protective calls. Same fix as
+        # risk_guard — redirect the module's own paths at the tmpdir.
+        self._rg_patches += [
+            patch.object(usage_governor, "ROOT", self.tmpdir),
+            patch.object(usage_governor, "STATE_FILE",
+                         os.path.join(self.tmpdir, "logs", "usage_state.json")),
         ]
         for p in self._rg_patches:
             p.start()
@@ -1514,6 +1525,21 @@ class TestRunModelErrorCapture(unittest.TestCase):
     --output-format json the CLI reports errors on STDOUT (stderr is often
     empty) — a full trading day was lost to blind '(rc=1: )' records."""
 
+    def setUp(self):
+        # This class drives run_model() directly, so it goes through the usage
+        # governor. Redirect the governor's state file at a tmpdir: without it,
+        # the 429-shaped fixtures below write a REAL multi-hour cooldown into
+        # logs/usage_state.json and silence the live bot's non-protective calls.
+        self.tmpdir = tempfile.mkdtemp()
+        self._ug = patch.dict(
+            os.environ,
+            {"USAGE_STATE_FILE": os.path.join(self.tmpdir, "usage_state.json")})
+        self._ug.start()
+
+    def tearDown(self):
+        self._ug.stop()
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
     def _fake(self, rc, stdout="", stderr=""):
         return MagicMock(returncode=rc, stdout=stdout, stderr=stderr)
 
@@ -2724,6 +2750,508 @@ def run_token_report():
 # ═══════════════════════════════════════════════════════════════════════════════
 # MAIN — run tests + print token report
 # ═══════════════════════════════════════════════════════════════════════════════
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 17 — usage governor: 5h session windows, tiers, cooldown, scheduling
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class UsageGovernorMixin(unittest.TestCase):
+    """Isolates usage_governor state at a tmpdir for every test."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self._env = patch.dict(os.environ, {
+            "USAGE_STATE_FILE": os.path.join(self.tmpdir, "usage_state.json"),
+        })
+        self._env.start()
+        # config comes from the repo strategy.json unless overridden per test
+        self.addCleanup(self._env.stop)
+        self.addCleanup(shutil.rmtree, self.tmpdir, True)
+
+    def _cfg(self, **over):
+        base = {"enabled": True, "window_hours": 5.0, "max_calls": 100,
+                "max_tokens": 100000,
+                "tier_ceiling": dict(usage_governor.DEFAULT_TIER_CEILING),
+                "anchor_minutes_before_open": 305,
+                "research_minutes_before_open": 35,
+                "maintenance_hour_et": 19, "maintenance_minute_et": 35,
+                "max_analyses_per_drain": 4, "max_rewrites_per_drain": 3,
+                "weekend_only_rewrites": False}
+        base.update(over)
+        return patch.object(usage_governor, "_config", lambda strategy=None: base)
+
+
+class TestParseResetTime(UsageGovernorMixin):
+    """The 429 payload is the ONLY ground truth about where the real window
+    boundary sits — including usage the operator burned in their own sessions.
+    It must be parsed exactly."""
+
+    REAL = ('(claude -p error rc=1: {"type":"result","is_error":true,'
+            '"api_error_status":429,"result":"You\'ve hit your session limit '
+            '\u00b7 resets 10:50pm (Asia/Calcutta)"})')
+
+    def test_parses_the_real_payload_seen_live_on_2026_07_06(self):
+        now = datetime(2026, 7, 6, 9, 45, tzinfo=usage_governor.ET)
+        got = usage_governor.parse_reset(self.REAL, now=now)
+        self.assertIsNotNone(got)
+        # 10:50pm IST == 13:20 ET the same day
+        self.assertEqual(got.astimezone(usage_governor.ET).strftime("%H:%M"), "13:20")
+
+    def test_reset_is_always_in_the_future(self):
+        # every realistic hit time (the CLI only ever reports a FUTURE reset,
+        # i.e. within one window) must parse to a moment still ahead of us
+        for hhmm in ("09:45", "11:00", "12:30", "13:00"):
+            h, m = (int(x) for x in hhmm.split(":"))
+            now = datetime(2026, 7, 6, h, m, tzinfo=usage_governor.ET)
+            got = usage_governor.parse_reset(self.REAL, now=now)
+            self.assertIsNotNone(got, f"failed to parse at {hhmm}")
+            self.assertGreater(got, now)
+
+    def test_stale_reset_string_is_rejected_rather_than_guessed(self):
+        # 14:00 ET == 23:30 IST, i.e. AFTER the quoted 10:50pm IST reset. That
+        # string is stale; inventing a ~23h-out reset from it would blackout the
+        # bot for a day, so it must parse to None and take the backoff path.
+        now = datetime(2026, 7, 6, 14, 0, tzinfo=usage_governor.ET)
+        self.assertIsNone(usage_governor.parse_reset(self.REAL, now=now))
+
+    def test_reset_is_never_more_than_one_window_away(self):
+        # a naive "next occurrence" parse can land ~23h out; a session reset
+        # cannot be further than the window length.
+        for hour in range(0, 24):
+            now = datetime(2026, 7, 6, hour, 30, tzinfo=usage_governor.ET)
+            got = usage_governor.parse_reset(self.REAL, now=now)
+            if got is None:
+                continue
+            self.assertLessEqual(
+                (got - now).total_seconds(), usage_governor.WINDOW_HOURS * 3600 + 60,
+                f"reset parsed too far out from {now}")
+
+    def test_unparseable_text_returns_none(self):
+        self.assertIsNone(usage_governor.parse_reset("some other failure"))
+        self.assertIsNone(usage_governor.parse_reset(""))
+        self.assertIsNone(usage_governor.parse_reset(None))
+
+    def test_is_limit_error_recognises_the_real_payload(self):
+        self.assertTrue(usage_governor.is_limit_error(self.REAL))
+        self.assertFalse(usage_governor.is_limit_error(
+            "(claude -p error rc=1: connection refused)"))
+
+
+class TestTierAdmission(UsageGovernorMixin):
+    """As a window fills, discretionary work must drop off BEFORE execution —
+    that is the whole 'research won't collide with trading' guarantee."""
+
+    def test_everything_allowed_on_a_fresh_window(self):
+        with self._cfg():
+            for tier in (0, 1, 2, 3, 4):
+                ok, _ = usage_governor.allow(tier)
+                self.assertTrue(ok, f"tier {tier} refused on an empty window")
+
+    def test_tiers_drop_off_bottom_up_as_the_window_fills(self):
+        # ceilings: shadow .40, learning .55, research .75, execution 1.0
+        with self._cfg(max_calls=100):
+            for _ in range(45):
+                usage_governor.record(1, {"input_tokens": 0, "output_tokens": 0})
+            self.assertFalse(usage_governor.allow(usage_governor.TIER_SHADOW)[0])
+            self.assertTrue(usage_governor.allow(usage_governor.TIER_LEARNING)[0])
+            self.assertTrue(usage_governor.allow(usage_governor.TIER_RESEARCH)[0])
+            self.assertTrue(usage_governor.allow(usage_governor.TIER_EXECUTION)[0])
+
+            for _ in range(15):   # 60% used
+                usage_governor.record(1, {"input_tokens": 0, "output_tokens": 0})
+            self.assertFalse(usage_governor.allow(usage_governor.TIER_LEARNING)[0])
+            self.assertTrue(usage_governor.allow(usage_governor.TIER_RESEARCH)[0])
+
+            for _ in range(20):   # 80% used
+                usage_governor.record(1, {"input_tokens": 0, "output_tokens": 0})
+            self.assertFalse(usage_governor.allow(usage_governor.TIER_RESEARCH)[0])
+            self.assertTrue(usage_governor.allow(usage_governor.TIER_EXECUTION)[0])
+            self.assertTrue(usage_governor.allow(usage_governor.TIER_PROTECTIVE)[0])
+
+    def test_token_heavy_calls_throttle_like_call_count(self):
+        with self._cfg(max_calls=1000, max_tokens=10000):
+            usage_governor.record(2, {"input_tokens": 4500, "output_tokens": 100})
+            self.assertFalse(usage_governor.allow(usage_governor.TIER_SHADOW)[0])
+
+    def test_protective_is_never_blocked_by_budget(self):
+        with self._cfg(max_calls=10):
+            for _ in range(500):
+                usage_governor.record(1, {"input_tokens": 9999, "output_tokens": 9999})
+            ok, _ = usage_governor.allow(usage_governor.TIER_PROTECTIVE)
+            self.assertTrue(ok, "a spent window must never block a forced exit")
+
+    def test_disabled_governor_allows_everything(self):
+        with self._cfg(enabled=False, max_calls=1):
+            usage_governor.record(1, {})
+            usage_governor.record(1, {})
+            self.assertTrue(usage_governor.allow(usage_governor.TIER_SHADOW)[0])
+
+
+class TestCooldown(UsageGovernorMixin):
+    """A 429 must stop the bot re-firing into the wall — but never gag a sell."""
+
+    def test_limit_sets_a_cooldown_that_blocks_non_protective_work(self):
+        with self._cfg():
+            usage_governor.note_limit(TestParseResetTime.REAL)
+            for tier in (usage_governor.TIER_EXECUTION,
+                         usage_governor.TIER_RESEARCH,
+                         usage_governor.TIER_LEARNING,
+                         usage_governor.TIER_SHADOW):
+                ok, why = usage_governor.allow(tier)
+                self.assertFalse(ok, f"tier {tier} admitted during cooldown")
+                self.assertIn("cooldown", why)
+
+    def test_protective_still_probes_during_cooldown(self):
+        with self._cfg():
+            usage_governor.note_limit(TestParseResetTime.REAL)
+            ok, _ = usage_governor.allow(usage_governor.TIER_PROTECTIVE)
+            self.assertTrue(ok, "a stop-loss must still get an attempt")
+
+    def test_unparseable_limit_backs_off_instead_of_blacking_out_the_day(self):
+        # A full-window blackout on an unreadable 429 risks sitting out an
+        # afternoon that already freed up; a short first backoff self-corrects.
+        with self._cfg():
+            now = datetime(2026, 8, 3, 10, 0, tzinfo=usage_governor.ET)
+            until = usage_governor.note_limit(
+                "(claude -p error rc=1: 429 usage limit)", now=now)
+            self.assertIsNotNone(until)
+            self.assertLessEqual((until - now).total_seconds() / 60, 31)
+
+    def test_repeated_unparseable_limits_escalate_the_backoff(self):
+        with self._cfg():
+            now = datetime(2026, 8, 3, 10, 0, tzinfo=usage_governor.ET)
+            err = "(claude -p error rc=1: 429 usage limit)"
+            spans = []
+            for _ in range(3):
+                until = usage_governor.note_limit(err, now=now)
+                spans.append((until - now).total_seconds() / 60)
+            self.assertEqual(spans, sorted(spans))
+            self.assertGreater(spans[-1], spans[0])
+            self.assertLessEqual(spans[-1], 5 * 60)
+
+    def test_a_parseable_reset_resets_the_backoff(self):
+        with self._cfg():
+            now = datetime(2026, 8, 3, 10, 0, tzinfo=usage_governor.ET)
+            usage_governor.note_limit("(429 usage limit)", now=now)
+            usage_governor.note_limit("(429 usage limit)", now=now)
+            usage_governor.note_limit(TestParseResetTime.REAL, now=now)
+            after = usage_governor.note_limit("(429 usage limit)", now=now)
+            self.assertLessEqual((after - now).total_seconds() / 60, 31)
+
+    def test_clear_cooldown_reopens_every_tier(self):
+        with self._cfg():
+            usage_governor.note_limit(TestParseResetTime.REAL)
+            usage_governor.clear_cooldown()
+            self.assertTrue(usage_governor.allow(usage_governor.TIER_SHADOW)[0])
+
+
+class TestWindowRolling(UsageGovernorMixin):
+    """A window opens on the first call and expires 5h later."""
+
+    def test_window_opens_on_first_recorded_call(self):
+        with self._cfg():
+            self.assertIsNone(usage_governor.window_end())
+            usage_governor.record(1, {})
+            self.assertIsNotNone(usage_governor.window_end())
+
+    def test_expired_window_resets_the_budget(self):
+        with self._cfg(max_calls=10):
+            t0 = datetime(2026, 8, 3, 9, 30, tzinfo=usage_governor.ET)
+            for _ in range(9):
+                usage_governor.record(4, {}, now=t0)
+            self.assertFalse(usage_governor.allow(usage_governor.TIER_SHADOW, now=t0)[0])
+            later = t0 + timedelta(hours=5, minutes=1)
+            self.assertTrue(usage_governor.allow(usage_governor.TIER_SHADOW, now=later)[0])
+
+    def test_status_never_raises(self):
+        st = usage_governor.status()
+        self.assertIn("enabled", st)
+
+
+class TestRunModelGovernorGate(UsageGovernorMixin):
+    """run_model() is the single choke point every claude -p call passes."""
+
+    def test_deferred_call_never_spawns_the_cli(self):
+        with self._cfg():
+            usage_governor.note_limit(TestParseResetTime.REAL)
+            spawn = MagicMock()
+            with patch.object(agent_module.subprocess, "run", spawn):
+                text, usage = agent_module.run_model(
+                    "s", "u", tier=agent_module.TIER_SHADOW)
+            self.assertEqual(spawn.call_count, 0)
+            self.assertTrue(text.startswith("(error: usage-governor"))
+            self.assertEqual(usage, agent_module._EMPTY_USAGE)
+
+    def test_protective_call_still_spawns_during_cooldown(self):
+        with self._cfg():
+            usage_governor.note_limit(TestParseResetTime.REAL)
+            fake = MagicMock(returncode=0,
+                             stdout=json.dumps({"result": "done", "usage": {}}),
+                             stderr="")
+            with patch.object(agent_module.subprocess, "run",
+                              return_value=fake) as spawn:
+                text, _ = agent_module.run_model(
+                    "s", "u", tier=agent_module.TIER_PROTECTIVE)
+            self.assertEqual(spawn.call_count, 1)
+            self.assertEqual(text, "done")
+
+    def test_429_response_arms_the_cooldown(self):
+        with self._cfg():
+            fake = MagicMock(returncode=1, stdout=TestParseResetTime.REAL, stderr="")
+            with patch.object(agent_module.subprocess, "run", return_value=fake):
+                agent_module.run_model("s", "u", tier=agent_module.TIER_EXECUTION)
+            self.assertIsNotNone(usage_governor.cooldown_until())
+
+    def test_successful_call_clears_a_stale_cooldown(self):
+        with self._cfg():
+            usage_governor.note_limit(TestParseResetTime.REAL)
+            fake = MagicMock(returncode=0,
+                             stdout=json.dumps({"result": "ok", "usage": {}}),
+                             stderr="")
+            with patch.object(agent_module.subprocess, "run", return_value=fake):
+                agent_module.run_model("s", "u", tier=agent_module.TIER_PROTECTIVE)
+            self.assertIsNone(usage_governor.cooldown_until())
+
+
+class TestUsageSchedule(UsageGovernorMixin):
+    """The daily schedule must give each phase its own 5h window."""
+
+    OPEN = datetime(2026, 8, 3, 9, 30, tzinfo=usage_governor.ET)
+
+    def test_anchor_window_expires_before_the_opening_bell(self):
+        cfg = usage_governor.config()
+        anchor = agent_module.preflight_anchor_time(self.OPEN, cfg)
+        expiry = anchor + timedelta(hours=cfg["window_hours"])
+        self.assertLessEqual(expiry, self.OPEN,
+                             "window A must expire by the open so the 9:30 "
+                             "cycle starts a FRESH window")
+
+    def test_research_runs_inside_the_anchored_window(self):
+        cfg = usage_governor.config()
+        anchor = agent_module.preflight_anchor_time(self.OPEN, cfg)
+        research = agent_module.premarket_research_time(self.OPEN, cfg)
+        expiry = anchor + timedelta(hours=cfg["window_hours"])
+        self.assertGreater(research, anchor)
+        self.assertLess(research, expiry)
+        # and with real headroom for a long Opus web-search run
+        self.assertGreaterEqual((expiry - research).total_seconds() / 60, 20)
+
+    def test_research_still_finishes_before_the_open(self):
+        cfg = usage_governor.config()
+        self.assertLess(agent_module.premarket_research_time(self.OPEN, cfg), self.OPEN)
+
+    def test_maintenance_waits_for_the_live_window_to_expire(self):
+        cfg = usage_governor.config()
+        now = datetime(2026, 8, 3, 19, 0, tzinfo=usage_governor.ET)
+        with patch.object(usage_governor, "window_end",
+                          return_value=now + timedelta(hours=2)):
+            t = agent_module.maintenance_time(now, cfg)
+        self.assertGreater(t, now + timedelta(hours=2),
+                           "maintenance must open a window of its own")
+
+    def test_maintenance_slot_runs_at_most_once_per_day(self):
+        cfg = usage_governor.config()
+        now = datetime(2026, 8, 3, 20, 0, tzinfo=usage_governor.ET)
+        nxt = agent_module.next_maintenance_slot(now, cfg, last_run_date=now.date())
+        self.assertEqual(nxt.date(), now.date() + timedelta(days=1))
+
+
+class TestDeferredLearningWork(TmpDirMixin):
+    """The heaviest calls (postmortem/victory, skill_5) must not fire during
+    market hours — they are queued and drained after the close."""
+
+    def _closed_trade(self, tid="T0001", outcome="LOSS"):
+        return {"id": tid, "symbol": "MU", "outcome": outcome,
+                "entry_price": 100.0, "exit_price": 90.0, "shares": 1.0,
+                "pnl_dollar": -10.0, "pnl_pct": -10.0,
+                "entry_date": "2026-08-01T10:00:00-04:00",
+                "exit_date": "2026-08-03T10:00:00-04:00",
+                "postmortem_filed": False, "victory_filed": False,
+                "analysis_file": None, "sources_used": [], "thesis": ""}
+
+    def test_close_during_market_hours_queues_instead_of_analysing(self):
+        trade = self._closed_trade()
+        self.tradelog["trades"] = [trade]
+        self._flush_log()
+        log = agent_module.load_trade_log()
+        pm = MagicMock()
+        with patch.object(agent_module, "is_market_open", return_value=True), \
+             patch.object(agent_module, "trigger_postmortem", pm):
+            agent_module.run_post_trade_pipeline(log, trade)
+        self.assertEqual(pm.call_count, 0, "postmortem must not run intraday")
+        pending = agent_module.pending_trade_analyses()
+        self.assertEqual([e["trade_id"] for e in pending], ["T0001"])
+
+    def test_close_off_hours_analyses_immediately(self):
+        trade = self._closed_trade()
+        self.tradelog["trades"] = [trade]
+        self._flush_log()
+        log = agent_module.load_trade_log()
+        pm = MagicMock(return_value=({}, "postmortem_001.md"))
+        with patch.object(agent_module, "is_market_open", return_value=False), \
+             patch.object(agent_module, "trigger_postmortem", pm), \
+             patch.object(agent_module, "update_source_weights", MagicMock()):
+            agent_module.run_post_trade_pipeline(log, trade)
+        self.assertEqual(pm.call_count, 1)
+        self.assertEqual(agent_module.pending_trade_analyses(), [])
+
+    def test_drain_runs_the_queued_analysis_and_marks_it_done(self):
+        trade = self._closed_trade()
+        self.tradelog["trades"] = [trade]
+        self._flush_log()
+        agent_module.enqueue_trade_analysis(trade)
+        pm = MagicMock(return_value=({}, "postmortem_001.md"))
+        with patch.object(agent_module, "trigger_postmortem", pm), \
+             patch.object(agent_module, "update_source_weights", MagicMock()):
+            n = agent_module.drain_analysis_queue()
+        self.assertEqual(n, 1)
+        self.assertEqual(pm.call_count, 1)
+        self.assertEqual(agent_module.pending_trade_analyses(), [])
+
+    def test_failed_drain_leaves_the_entry_queued_for_retry(self):
+        trade = self._closed_trade()
+        self.tradelog["trades"] = [trade]
+        self._flush_log()
+        agent_module.enqueue_trade_analysis(trade)
+        pm = MagicMock(return_value=({}, None))   # model call refused/failed
+        with patch.object(agent_module, "trigger_postmortem", pm), \
+             patch.object(agent_module, "update_source_weights", MagicMock()):
+            n = agent_module.drain_analysis_queue()
+        self.assertEqual(n, 0)
+        self.assertEqual([e["trade_id"] for e in agent_module.pending_trade_analyses()],
+                         ["T0001"])
+
+    def test_drain_is_bounded_per_run(self):
+        trades = [self._closed_trade(f"T000{i}") for i in range(1, 5)]
+        self.tradelog["trades"] = trades
+        self._flush_log()
+        for t in trades:
+            agent_module.enqueue_trade_analysis(t)
+        pm = MagicMock(return_value=({}, "postmortem_001.md"))
+        with patch.object(agent_module, "trigger_postmortem", pm), \
+             patch.object(agent_module, "update_source_weights", MagicMock()):
+            n = agent_module.drain_analysis_queue(limit=2)
+        self.assertEqual(n, 2)
+        self.assertEqual(len(agent_module.pending_trade_analyses()), 2)
+
+
+class TestRewriteQueueNotDuringMarketHours(TmpDirMixin):
+    """skill_5 is a full-Opus call carrying strategy.json + all 8 skill files.
+    It must never fire on a 15-minute execution cycle."""
+
+    def _mock_signals(self):
+        sig = {"ok": True, "state": "NEUTRAL", "transition": "NO_ACTION",
+               "last_close": 505.0,
+               "lines": {"red": 1, "blue": 2, "green": 3, "yellow": 4}}
+        msig = MagicMock()
+        msig.signals_with_raw.return_value = ({"SPY": sig}, "SPY: NEUTRAL")
+        msig.signal_for.return_value = sig
+        return msig
+
+    def _run(self, market_open):
+        self.tradelog["open_positions"] = [{"id": "T0009", "symbol": "SPY",
+            "entry_price": 500.0, "shares": 1.0,
+            "entry_date": "2026-08-01T10:00:00-04:00", "dollar_amount": 500.0}]
+        self._flush_log()
+        rewrite = MagicMock(return_value=False)
+        footer = ('ok\n```json\n{"cash":100,"positions":[{"symbol":"SPY",'
+                  '"shares":1.0,"avg_price":500.0,"last_price":505.0}],'
+                  '"actions_taken":[]}\n```')
+        with patch.object(agent_module, "signals", self._mock_signals()), \
+             patch.object(agent_module, "is_market_open", return_value=market_open), \
+             patch.object(agent_module, "read_broker_state",
+                          MagicMock(return_value=([{"symbol": "SPY", "shares": 1.0,
+                              "avg_price": 500.0, "last_price": 505.0}], set(), None))), \
+             patch.object(agent_module, "run_model",
+                          return_value=(footer, agent_module._EMPTY_USAGE)), \
+             patch.object(agent_module, "process_strategy_rewrite_queue", rewrite):
+            agent_module.run_agent()
+        return rewrite
+
+    def test_not_processed_while_the_market_is_open(self):
+        self.assertEqual(self._run(market_open=True).call_count, 0)
+
+    def test_processed_off_hours(self):
+        self.assertGreaterEqual(self._run(market_open=False).call_count, 1)
+
+
+class TestForcedExitSurvivesGovernor(TmpDirMixin):
+    """The governor deferring the chatty execution turn must NOT stop a
+    deterministic forced exit — the protective tier is still admitted."""
+
+    def _mock_signals(self):
+        sig = {"ok": True, "state": "NEUTRAL", "transition": "NO_ACTION",
+               "last_close": 80.0,
+               "lines": {"red": 1, "blue": 2, "green": 3, "yellow": 4}}
+        msig = MagicMock()
+        msig.signals_with_raw.return_value = ({"MU": sig}, "MU: NEUTRAL")
+        msig.signal_for.return_value = sig
+        return msig
+
+    def test_deferred_turn_still_force_sells_a_stop_loss(self):
+        # 20% under entry → hard stop-loss must fire
+        self.tradelog["open_positions"] = [{"id": "T0010", "symbol": "MU",
+            "entry_price": 100.0, "peak_price": 100.0, "shares": 1.0,
+            "entry_date": "2026-08-01T10:00:00-04:00", "dollar_amount": 100.0}]
+        self._flush_log()
+        fs = MagicMock(return_value=(True, 80.0))
+        deferred = ("(error: usage-governor deferred this execution call — "
+                    "cooldown_120m_until_12:00_ET)")
+        with patch.object(agent_module, "signals", self._mock_signals()), \
+             patch.object(agent_module, "is_market_open", return_value=True), \
+             patch.object(agent_module, "read_broker_state",
+                          MagicMock(return_value=([{"symbol": "MU", "shares": 1.0,
+                              "avg_price": 100.0, "last_price": 80.0}], set(), None))), \
+             patch.object(agent_module, "run_model",
+                          return_value=(deferred, agent_module._EMPTY_USAGE)), \
+             patch.object(agent_module, "force_sell", fs), \
+             patch.object(agent_module, "process_strategy_rewrite_queue",
+                          MagicMock(return_value=False)):
+            agent_module.run_agent()
+        self.assertEqual(fs.call_count, 1,
+                         "a governor deferral must not swallow a stop-loss")
+        self.assertEqual(fs.call_args[0][0], "MU")
+
+
+class TestBrokerRereadOnlyAfterASell(TmpDirMixin):
+    """A stop-loss alert re-fires every cycle until the name is gone. Re-reading
+    the broker on the mere PRESENCE of an alert burned an extra call every 15
+    minutes while a sell order was already working."""
+
+    def _mock_signals(self):
+        sig = {"ok": True, "state": "NEUTRAL", "transition": "NO_ACTION",
+               "last_close": 80.0,
+               "lines": {"red": 1, "blue": 2, "green": 3, "yellow": 4}}
+        msig = MagicMock()
+        msig.signals_with_raw.return_value = ({"MU": sig}, "MU: NEUTRAL")
+        msig.signal_for.return_value = sig
+        return msig
+
+    def test_no_reread_when_a_sell_order_is_already_working(self):
+        self.tradelog["open_positions"] = [{"id": "T0011", "symbol": "MU",
+            "entry_price": 100.0, "peak_price": 100.0, "shares": 1.0,
+            "entry_date": "2026-08-01T10:00:00-04:00", "dollar_amount": 100.0}]
+        self._flush_log()
+        # broker says: MU still held, but a SELL order already exists today
+        rbs = MagicMock(return_value=([{"symbol": "MU", "shares": 1.0,
+            "avg_price": 100.0, "last_price": 80.0}], {"MU"}, None))
+        fs = MagicMock(return_value=(True, 80.0))
+        footer = ('ok\n```json\n{"cash":0,"positions":[{"symbol":"MU",'
+                  '"shares":1.0,"avg_price":100.0,"last_price":80.0}],'
+                  '"actions_taken":[]}\n```')
+        with patch.object(agent_module, "signals", self._mock_signals()), \
+             patch.object(agent_module, "is_market_open", return_value=True), \
+             patch.object(agent_module, "read_broker_state", rbs), \
+             patch.object(agent_module, "run_model",
+                          return_value=(footer, agent_module._EMPTY_USAGE)), \
+             patch.object(agent_module, "force_sell", fs), \
+             patch.object(agent_module, "process_strategy_rewrite_queue",
+                          MagicMock(return_value=False)):
+            agent_module.run_agent()
+        self.assertEqual(fs.call_count, 0, "must not double-sell")
+        self.assertEqual(rbs.call_count, 1, "no wasted re-read when nothing sold")
+
 
 if __name__ == "__main__":
     # 1. Run token report first (always visible)
