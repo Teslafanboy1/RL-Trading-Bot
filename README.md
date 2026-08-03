@@ -39,11 +39,14 @@ Three independent sell triggers — any one fires a sell:
 
 ## The 4 phases
 
-**A — Pre-market research (Mon, 9:20 AM ET)** (`skill_1_research.md`)
+**A — Pre-market research (8:55 AM ET, every trading day)** (`skill_1_research.md`)
 
-Runs automatically 10 minutes before market open on Monday. When you start the script
-while the market is closed, press `w` to wait — the script wakes at 9:20 AM ET, runs
-research, then starts the trading loop at 9:30 AM. Uses `claude-opus-4-8`.
+Runs automatically 35 minutes before market open. When you start the script while the
+market is closed, press `w` to enter the daily schedule — it wakes at **4:25 AM ET** for
+a tiny preflight system check (which deliberately *anchors* the rolling 5-hour Claude
+session window so it expires just before the bell), runs research at **8:55 AM ET**
+inside that window, then starts the trading loop at 9:30 AM on a **fresh** window.
+Uses `claude-opus-4-8`. See "Usage governor" in `CLAUDE.md` for why the timing matters.
 
 1. Goal-pace check: compute how much each position needs to move to matter.
 2. **Open-position review**: re-score every held position 0–100 from scratch. Compare each
@@ -85,10 +88,15 @@ Fires automatically once at noon on Wednesday during market hours. Uses `claude-
 Output → `research/midweek_review_YYYY-MM-DD.md` (existence of this file prevents the
 review from re-firing on subsequent 15-minute polls the same day).
 
-**D — Post-trade analysis** (`skill_4_postmortem.md` / `skill_4b_victory.md`)
+**D — Post-trade analysis (19:35 ET maintenance drain)** (`skill_4_postmortem.md` / `skill_4b_victory.md`)
 - Loss → postmortem (root cause, which source misled, preventive rule).
 - Win → victory (repeatable feature, guard against crediting luck, source weight nudge).
 - Followed by strategy + skill rewrite and confidence calibration.
+- A close during market hours **queues** the analysis (`logs/analysis_queue.jsonl`)
+  instead of running it inline: it is an Opus + web-search call, and firing it the
+  moment a position closes spent execution-window budget on retrospection. The drain
+  runs after the close, in a session window of its own, along with the skill_5
+  strategy rewrites. A close outside market hours is analysed immediately.
 
 ## Capital allocation (of total portfolio value)
 
