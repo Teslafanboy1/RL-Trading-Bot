@@ -2856,9 +2856,9 @@ EXECUTION RULES:
     save_trade_log(log)
 
     # market_hours_check: use Haiku (fast, cheap) — signals are pre-computed, rules are explicit.
-    # research_and_prep / midweek_validation: use Opus for deeper reasoning.
+    # research_and_prep / midweek_validation: use Opus for deeper reasoning + web search.
     call_model = CHECK_MODEL if task == "market_hours_check" else MODEL
-    text, usage = run_model(system, user, mcp=True, model=call_model)
+    text, usage = run_model(system, user, mcp=True, web=(task != "market_hours_check"), model=call_model)
 
     stamp = datetime.now(ET).strftime("%Y-%m-%d_%H%M")
     print(f"  tokens: in={usage['input_tokens']} out={usage['output_tokens']} cost=${usage['cost_usd']:.4f}")
