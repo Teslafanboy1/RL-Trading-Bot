@@ -48,6 +48,23 @@ NEWS_CHECK_HOURS = int(os.environ.get("NEWS_CHECK_HOURS", "4"))
 # advisory = read-only (cannot place orders); live = may place/cancel orders
 EXECUTION_MODE = os.environ.get("EXECUTION_MODE", "advisory").strip().lower()
 
+# Per-call subprocess ceilings for `claude -p`. These are DEADLINES, not budgets:
+# a call that hits one is killed mid-analysis and its work is lost, so each is set
+# well above what the call actually takes (2–5 min observed) and sized to the
+# window the phase runs in.
+#   EXEC     — the market-hours turn. Deliberately the tightest: it runs inside a
+#              POLL_MINUTES cycle, so a wedged call must not outlive its cycle.
+#   RESEARCH — pre-market research + midweek. Opus with web search over 60+
+#              candidates. Bounded by the 08:55 start and the 09:30 bell (35 min),
+#              so 30 min is the most it can have without spilling into the open.
+#   LEARNING — postmortems, victories, skill_5 rewrites. These run in the 19:35
+#              maintenance window with ~5 hours of headroom and are the calls the
+#              operator most wants to survive; at the old shared 10-minute default
+#              a deep Opus + web-search postmortem could be cut off mid-analysis.
+EXEC_TIMEOUT = int(os.environ.get("EXEC_TIMEOUT", "600"))
+RESEARCH_TIMEOUT = int(os.environ.get("RESEARCH_TIMEOUT", "1800"))
+LEARNING_TIMEOUT = int(os.environ.get("LEARNING_TIMEOUT", "1800"))
+
 SOURCES = ["news", "social", "fundamental", "macro", "rss"]
 WATCHLIST = [s.strip().upper() for s in os.environ.get("WATCHLIST", "SPY").split(",") if s.strip()]
 
@@ -1237,7 +1254,20 @@ def _run_analysis(trade, skill_path, prefix, kind):
         "followed by the machine-readable JSON verdicts block. Today: "
         f"{date.today().isoformat()}."
     )
-    text, _usage = run_model(system, user, web=True, tier=TIER_LEARNING)
+    text, _usage = run_model(system, user, web=True, tier=TIER_LEARNING,
+                             timeout=LEARNING_TIMEOUT)
+
+    # A failed call must NOT consume the queue entry. Without this guard the
+    # error string itself ("(error: claude -p timed out)", a governor deferral, a
+    # 429) was written to postmortems/postmortem_NNN.md and returned as a
+    # perfectly good filename — the trade was then flagged postmortem_filed and
+    # the analysis was lost for good. skill_5 has always checked this; the
+    # analysis engines never did. Return empty so the caller re-queues instead.
+    if text.startswith("(claude -p error") or text.startswith("(error:"):
+        print(f"  [{kind}] {trade.get('symbol')} analysis call failed: "
+              f"{text[:120]} — leaving it queued to retry.")
+        return {}, None
+
     verdicts = extract_last_json_block(text) or {}
 
     idx = _next_index(prefix)
@@ -1456,9 +1486,17 @@ def _analyze_trade(log, trade):
     drain."""
     if trade["outcome"] == "LOSS":
         verdicts, fname = trigger_postmortem(trade)
-        trade["postmortem_filed"] = True
     else:
         verdicts, fname = trigger_victory_analysis(trade)
+
+    # No file => the model call failed. Leave the trade unflagged so the drain
+    # retries it next window instead of recording a postmortem that never ran.
+    if not fname:
+        return None
+
+    if trade["outcome"] == "LOSS":
+        trade["postmortem_filed"] = True
+    else:
         trade["victory_filed"] = True
     trade["analysis_file"] = fname
 
@@ -1536,7 +1574,14 @@ def run_post_trade_pipeline(log, trade, *, defer=None):
               "analysis runs after the close, not against execution budget.")
         return
 
-    _analyze_trade(log, trade)
+    # Off-hours close: analyse inline. If that call fails (timeout, 429, governor
+    # deferral) the trade would otherwise never be analysed at all — there is no
+    # queue entry to retry from — so fall back to queueing it for the next drain.
+    if _analyze_trade(log, trade) is None:
+        enqueue_trade_analysis(trade)
+        print(f"  [analysis-queue] {trade['id']} ({trade.get('symbol')}) inline "
+              "analysis failed — queued for the next maintenance drain.")
+        return
     update_monthly_progress(log)
 
 
@@ -1763,7 +1808,8 @@ Your job:
 7. Be conservative — one or two trades is noise, not signal.
 """
 
-        text, _usage = run_model(skill5, user, web=False, tier=TIER_LEARNING)
+        text, _usage = run_model(skill5, user, web=False, tier=TIER_LEARNING,
+                                 timeout=LEARNING_TIMEOUT)
 
         if text.startswith("(claude -p error") or text.startswith("(error:"):
             print(f"  [skill_5] model call failed: {text[:100]}")
@@ -3083,7 +3129,11 @@ EXECUTION RULES:
     # research_and_prep / midweek_validation: use Opus for deeper reasoning.
     call_model = CHECK_MODEL if task == "market_hours_check" else MODEL
     call_tier = TIER_EXECUTION if task == "market_hours_check" else TIER_RESEARCH
-    text, usage = run_model(system, user, mcp=True, model=call_model, tier=call_tier)
+    # Research/midweek are Opus + web search over a large candidate set; the
+    # execution turn stays on the tight cycle-bounded ceiling.
+    call_timeout = EXEC_TIMEOUT if task == "market_hours_check" else RESEARCH_TIMEOUT
+    text, usage = run_model(system, user, mcp=True, model=call_model, tier=call_tier,
+                            timeout=call_timeout)
 
     stamp = datetime.now(ET).strftime("%Y-%m-%d_%H%M")
     print(f"  tokens: in={usage['input_tokens']} out={usage['output_tokens']} cost=${usage['cost_usd']:.4f}")

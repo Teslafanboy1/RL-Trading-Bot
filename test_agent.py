@@ -3122,6 +3122,73 @@ class TestDeferredLearningWork(TmpDirMixin):
         self.assertEqual([e["trade_id"] for e in agent_module.pending_trade_analyses()],
                          ["T0001"])
 
+    def test_a_failed_model_call_writes_no_postmortem_and_stays_queued(self):
+        """The regression this class exists for. _run_analysis used to write the
+        error string itself into postmortems/postmortem_NNN.md and hand back a
+        real filename, so a timed-out/429'd/deferred analysis was marked filed
+        and lost forever. It must produce no file and no flag."""
+        trade = self._closed_trade()
+        self.tradelog["trades"] = [trade]
+        self._flush_log()
+        agent_module.enqueue_trade_analysis(trade)
+        for failure in ("(error: claude -p timed out)",
+                        "(claude -p error rc=1: api_error_status: 429)",
+                        "(error: usage-governor deferred this learning call — cooldown)"):
+            with self.subTest(failure=failure):
+                with patch.object(agent_module, "run_model",
+                                  return_value=(failure, dict(agent_module._EMPTY_USAGE))), \
+                     patch.object(agent_module, "update_source_weights", MagicMock()):
+                    n = agent_module.drain_analysis_queue()
+                self.assertEqual(n, 0)
+                pm_dir = os.path.join(agent_module.ROOT, "postmortems")
+                written = [f for f in os.listdir(pm_dir)] if os.path.isdir(pm_dir) else []
+                self.assertEqual([f for f in written if f.startswith("postmortem_")], [],
+                                 "a failed analysis must not leave a postmortem file")
+                self.assertEqual(
+                    [e["trade_id"] for e in agent_module.pending_trade_analyses()],
+                    ["T0001"], "the entry must stay queued for the next drain")
+                stored = next(t for t in agent_module.load_trade_log()["trades"]
+                              if t["id"] == "T0001")
+                self.assertFalse(stored.get("postmortem_filed"))
+
+    def test_failed_inline_analysis_falls_back_to_the_queue(self):
+        """An off-hours close analyses inline with no queue entry behind it, so a
+        failure there had nothing to retry from — it must enqueue itself."""
+        trade = self._closed_trade()
+        self.tradelog["trades"] = [trade]
+        self._flush_log()
+        log = agent_module.load_trade_log()
+        with patch.object(agent_module, "is_market_open", return_value=False), \
+             patch.object(agent_module, "run_model",
+                          return_value=("(error: claude -p timed out)",
+                                        dict(agent_module._EMPTY_USAGE))), \
+             patch.object(agent_module, "update_source_weights", MagicMock()):
+            agent_module.run_post_trade_pipeline(log, trade)
+        self.assertEqual([e["trade_id"] for e in agent_module.pending_trade_analyses()],
+                         ["T0001"])
+
+    def test_heavy_learning_calls_get_the_long_timeout(self):
+        """Postmortems/victories and skill_5 are the calls the operator most
+        wants to survive; they must not inherit the tight execution ceiling."""
+        self.assertGreaterEqual(agent_module.LEARNING_TIMEOUT, 1800)
+        self.assertGreaterEqual(agent_module.RESEARCH_TIMEOUT, 1800)
+        trade = self._closed_trade()
+        rm = MagicMock(return_value=("no verdicts", dict(agent_module._EMPTY_USAGE)))
+        with patch.object(agent_module, "run_model", rm):
+            agent_module.trigger_postmortem(trade)
+        self.assertEqual(rm.call_args.kwargs["timeout"], agent_module.LEARNING_TIMEOUT)
+        self.assertEqual(rm.call_args.kwargs["tier"], agent_module.TIER_LEARNING)
+
+    def test_research_gets_more_time_than_the_execution_turn(self):
+        """A 15-minute execution cycle must not be able to wedge on one call,
+        while research (Opus + web over 60+ candidates) gets real room."""
+        self.assertLess(agent_module.EXEC_TIMEOUT, agent_module.RESEARCH_TIMEOUT)
+        # research must still fit between the 08:55 start and the 09:30 bell
+        cfg = usage_governor.config()
+        gap_min = cfg["research_minutes_before_open"]
+        self.assertLessEqual(agent_module.RESEARCH_TIMEOUT / 60.0, gap_min,
+                             "research could overrun the opening bell")
+
     def test_drain_is_bounded_per_run(self):
         trades = [self._closed_trade(f"T000{i}") for i in range(1, 5)]
         self.tradelog["trades"] = trades

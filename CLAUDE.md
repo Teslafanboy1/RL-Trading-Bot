@@ -30,6 +30,9 @@ Key env vars:
 | `USAGE_RESEARCH_MIN` | `35` | Minutes before the open to run pre-market research. |
 | `USAGE_MAINT_HOUR` / `USAGE_MAINT_MIN` | `19` / `35` | ET wall-clock start of the nightly maintenance drain. |
 | `USAGE_MAX_CALLS` / `USAGE_MAX_TOKENS` | `120` / `900000` | Soft per-window budget the tier ceilings are fractions of. |
+| `EXEC_TIMEOUT` | `600` | Subprocess ceiling for the market-hours turn. Tightest of the three — it runs inside a `POLL_MINUTES` cycle and must not outlive it. |
+| `RESEARCH_TIMEOUT` | `1800` | Ceiling for pre-market research / midweek (Opus + web over 60+ candidates). Bounded above by `USAGE_RESEARCH_MIN` so research cannot overrun the opening bell. |
+| `LEARNING_TIMEOUT` | `1800` | Ceiling for postmortems, victories, and skill_5 rewrites. These run in the 19:35 maintenance window with ~5h of headroom; at the old shared 600s default a deep Opus + web-search postmortem could be killed mid-analysis. |
 
 Compute EMA signals directly (no full agent run):
 ```bash
@@ -189,6 +192,8 @@ Triggered by `run_post_trade_pipeline()` after every position close. The cheap l
 2. `flag_strategy_rewrite()` — appends a line to `research/strategy_rewrite_queue.md`. Immediate (file append only; the skill_5 call it schedules runs at maintenance).
 3. `enqueue_trade_analysis()` — appends the trade id to `logs/analysis_queue.jsonl` **when the market is open**. The postmortem/victory call is Opus **with web search**, the single most expensive thing the bot does, and it used to fire inline the instant a position closed — i.e. always during market hours. So the event most likely to be followed by more trading (a stop-loss cascade, a rotation) also dumped the day's biggest call into the middle of the execution window. A close **off-hours** still analyses inline (`defer=False`).
 4. `drain_analysis_queue()` — run by `run_maintenance()` after the close: `trigger_postmortem()` / `trigger_victory_analysis()` write the structured markdown + machine-readable `verdicts` JSON to `postmortems/`, then `update_source_weights()` credits/debits sources from `verdicts.sources`. Stop-loss exits always route to `trigger_postmortem()` with additional focus questions (what caused the drawdown, whether an EMA SELL was missed before the stop hit). Bounded to `usage.max_analyses_per_drain` per run; an entry whose model call was refused stays queued for the next drain rather than being lost.
+
+**A failed analysis must never be recorded as a completed one.** `_run_analysis()` checks the returned text for the `(error: …)` / `(claude -p error …)` shape *before* writing anything and returns `({}, None)` on failure. Without that guard — the behaviour up to 2026-08-03 — the error string itself was written to `postmortems/postmortem_NNN.md`, a valid-looking filename was returned, the trade was flagged `postmortem_filed`, and the entry was marked done: a timed-out, 429'd, or governor-deferred postmortem was **silently lost forever** and replaced by a file containing `(error: claude -p timed out)`. `_analyze_trade()` now returns `None` on that path so `drain_analysis_queue()` re-queues, and `run_post_trade_pipeline()`'s inline (off-hours) path enqueues on failure too — that path has no queue entry behind it to retry from. skill_5 always had this check; the analysis engines did not.
 
 Stop-loss forced exits are tagged `stop_loss: true` in the trade record so the pattern detector (skill_6) can identify systemic drawdown patterns over time.
 
