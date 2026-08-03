@@ -8,7 +8,7 @@ command -v "${CLAUDE_BIN:-claude}" >/dev/null || { echo "claude CLI not found (s
 # .alert_webhook_url (gitignored) once; the bot and watchdog.py both pick it up.
 [ -z "${ALERT_WEBHOOK_URL:-}" ] && [ -f .alert_webhook_url ] && export ALERT_WEBHOOK_URL="$(cat .alert_webhook_url)"
 export SIGNAL_INTERVAL="${SIGNAL_INTERVAL:-30m}"      # 1-week chart
-export WATCHLIST="${WATCHLIST:-SPY,BTSG,CAT}"
+export WATCHLIST="${WATCHLIST:-SPY,NET,SNOW,COIN}"
 export EXECUTION_MODE="${EXECUTION_MODE:-advisory}"   # set 'live' to arm real orders
 echo "interval=$SIGNAL_INTERVAL watchlist=$WATCHLIST mode=$EXECUTION_MODE"
 # -u (unbuffered) so per-cycle status + critical warnings (forced-exit-not-

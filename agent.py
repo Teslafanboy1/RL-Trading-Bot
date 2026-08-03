@@ -53,7 +53,17 @@ WATCHLIST = [s.strip().upper() for s in os.environ.get("WATCHLIST", "SPY").split
 
 # robinhood-cli MCP tools (authorized via the `claude` CLI). Read tools are always
 # allowed; order-placing tools only when EXECUTION_MODE=live.
-_RH = "mcp__robinhood-cli__"
+# The tool-name prefix depends on how this machine's `claude` CLI registered the
+# Robinhood MCP connection: a named global server (`claude mcp add robinhood-cli ...`,
+# used on the dev Mac) yields `mcp__robinhood-cli__*`; the account-level claude.ai
+# connector flow (what the Oracle VM ended up using) auto-names it from the
+# connector's display name instead (e.g. `mcp__claude_ai_Trading__*`). A mismatch
+# here doesn't error — it just means every MCP tool call the model attempts gets
+# silently permission-denied under headless --permission-mode default (no TTY to
+# approve an unlisted tool), which is exactly what happened on the VM from
+# 2026-08-02 onward. Override via RH_MCP_SERVER to match whatever `claude mcp list`
+# actually shows connected on this machine.
+_RH = "mcp__" + os.environ.get("RH_MCP_SERVER", "robinhood-cli") + "__"
 RH_READ = [_RH + t for t in ("get_accounts", "get_portfolio", "get_equity_positions",
            "get_equity_orders", "get_equity_quotes", "get_equity_tradability",
            "search", "get_watchlists", "get_watchlist_items", "review_equity_order")]
@@ -470,6 +480,24 @@ def run_model(system, user, *, mcp=False, web=False, timeout=600, model=None,
         tools += ["WebSearch", "WebFetch"]
     if extra_tools:
         tools += list(extra_tools)
+    if tools:
+        # When several claude.ai connectors share this account (Gmail/Calendar/
+        # Drive/Trading — the VM's actual setup), the CLI defers most MCP tools
+        # behind ToolSearch to keep the base tool list small. A granted-but-deferred
+        # tool is invisible until searched for, and a headless model with no human
+        # to approve anything was observed just stalling ("Would you like me to
+        # proceed?") instead of resolving that itself — every MCP read silently
+        # no-op'd this way from 2026-08-02 onward. Spelling out that it must
+        # self-serve via ToolSearch and never wait for approval fixes it.
+        system = (
+            "You are running fully autonomously and headlessly — there is no "
+            "human available to approve or confirm anything. Every tool you were "
+            "granted is already pre-authorized: if one is not immediately visible "
+            "in your tool list, call ToolSearch yourself (e.g. `select:<tool_name>`) "
+            "to load it, then call it directly. Never pause to ask for "
+            "confirmation or permission — that question would go unanswered.\n\n"
+            + system
+        )
     # Skill/Task/Agent are explicitly disallowed: user-level skills (e.g. the
     # trading-agent-* skills) leak into the -p context, and the model has tried
     # to "launch" one instead of doing the work inline — the invocation is
