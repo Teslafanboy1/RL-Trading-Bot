@@ -88,6 +88,16 @@ RH_WRITE = [_RH + "place_equity_order", _RH + "cancel_equity_order"]
 # Option READ tools for the Phase B shadow pass (read-only — never place_option_order).
 RH_OPTION_READ = [_RH + t for t in ("get_option_chains", "get_option_quotes",
                   "get_option_instruments", "get_option_positions")]
+# Research/midweek-only extras (never granted to the execution turn, which has no
+# use for them): the "Dynamic MCP scan" + momentum/blackout math skill_1/skill_3
+# describe in CLAUDE.md — daily-movers scans, 1w/1m/6m historicals, fundamentals
+# for source scoring, and the earnings calendar for the blackout-window check.
+# All read-only. Missing until 2026-08-04, research silently fell back to
+# WebSearch + the pre-supplied watchlist ribbon only (still correct, just narrow).
+RH_RESEARCH_EXTRA = [_RH + t for t in (
+    "get_equity_historicals", "get_equity_technical_indicators", "get_equity_fundamentals",
+    "get_popular_watchlists", "create_scan", "run_scan", "get_scans",
+    "get_scanner_filter_specs", "get_earnings_calendar", "get_earnings_results")]
 
 
 def notify_operator(subject, body):
@@ -3160,8 +3170,10 @@ EXECUTION RULES:
     # Research/midweek are Opus + web search over a large candidate set; the
     # execution turn stays on the tight cycle-bounded ceiling.
     call_timeout = EXEC_TIMEOUT if task == "market_hours_check" else RESEARCH_TIMEOUT
+    research_extras = RH_RESEARCH_EXTRA if task != "market_hours_check" else None
     text, usage = run_model(system, user, mcp=True, web=(task != "market_hours_check"),
-                            model=call_model, tier=call_tier, timeout=call_timeout)
+                            model=call_model, tier=call_tier, timeout=call_timeout,
+                            extra_tools=research_extras)
 
     stamp = datetime.now(ET).strftime("%Y-%m-%d_%H%M")
     print(f"  tokens: in={usage['input_tokens']} out={usage['output_tokens']} cost=${usage['cost_usd']:.4f}")
