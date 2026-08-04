@@ -1,9 +1,84 @@
 //
 //  ActionSheets.swift — PIN arming, the order ticket, halt/clear-halt,
-//  stop-override editor, and Settings.
+//  stop-override editor, cash flow, and Settings — all in the Organic shell.
 //
 
 import SwiftUI
+
+// MARK: - Sheet scaffolding
+
+/// Shared chrome for every modal: warm surface header, scrolling body,
+/// consistent sizing on Mac and iPhone.
+struct SheetShell<Content: View>: View {
+    let title: String
+    var subtitle: String? = nil
+    var icon: String? = nil
+    var iconTint: Color = DS.accent
+    var width: CGFloat = 470
+    var height: CGFloat = 560
+    let onClose: () -> Void
+    @ViewBuilder var content: () -> Content
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(alignment: .center, spacing: DS.s3) {
+                if let icon {
+                    Image(systemName: icon)
+                        .font(.system(size: 17, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .frame(width: 36, height: 36)
+                        .background(iconTint,
+                                    in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                }
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title).font(DSFont.heading(19)).foregroundStyle(DS.text)
+                    if let subtitle {
+                        Text(subtitle).font(DSFont.body(12)).foregroundStyle(DS.textMuted)
+                            .lineLimit(2)
+                    }
+                }
+                Spacer(minLength: DS.s2)
+                Button("Close") { onClose() }
+                    .buttonStyle(.organicSoft)
+            }
+            .padding(DS.s4)
+            .background(DS.surface)
+            Rectangle().fill(DS.divider).frame(height: 1)
+            ScrollView {
+                VStack(alignment: .leading, spacing: DS.s4) { content() }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(DS.s4)
+            }
+            .background(DS.bg)
+        }
+        .background(DS.bg)
+        .tint(DS.accent)
+        #if os(macOS)
+        .frame(width: width, height: height)
+        #else
+        .presentationDetents([.large])
+        #endif
+    }
+}
+
+/// A labelled field group inside a sheet.
+struct SheetField<Content: View>: View {
+    let label: String
+    var hint: String? = nil
+    @ViewBuilder var content: () -> Content
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(label.uppercased())
+                .font(DSFont.label(10)).kerning(0.5)
+                .foregroundStyle(DS.textFaint)
+            content()
+            if let hint {
+                Text(hint).font(DSFont.body(11)).foregroundStyle(DS.textMuted)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
 
 // MARK: - Arm sheet
 
@@ -17,52 +92,59 @@ struct ArmSheet: View {
     @FocusState private var focused: Bool
 
     var body: some View {
-        NavigationStack {
-            VStack(spacing: 18) {
-                Image(systemName: "lock.shield.fill")
-                    .font(.system(size: 44))
-                    .foregroundStyle(Color.accentColor)
-                Text("Arm control actions")
-                    .font(.title3.bold())
-                Text("Money-moving and bot-control actions need your PIN. Arms this device for 5 minutes.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
+        SheetShell(title: "Arm control actions",
+                   subtitle: "Money-moving and bot-control actions need your PIN.",
+                   icon: "lock.shield.fill", width: 430, height: 470,
+                   onClose: { model.pendingArmedAction = nil; dismiss() }) {
+            Text("Arms this device for 5 minutes. The token is bound to this IP and expires on its own.")
+                .font(DSFont.body(14)).foregroundStyle(DS.textMuted)
+                .fixedSize(horizontal: false, vertical: true)
 
-                SecureField("PIN", text: $pin)
-                    .textFieldStyle(.roundedBorder)
-                    .font(.title2.monospaced())
+            SheetField(label: "PIN") {
+                SecureField("••••", text: $pin)
+                    .textFieldStyle(.plain)
+                    .font(DSFont.mono(20))
                     .multilineTextAlignment(.center)
-                    .frame(maxWidth: 220)
+                    .padding(.vertical, 12)
+                    .frame(maxWidth: .infinity)
+                    .background(DS.neutral(1), in: Capsule())
+                    .overlay(Capsule().strokeBorder(DS.divider, lineWidth: 1))
                     .focused($focused)
                     .onSubmit { submit() }
                     #if !os(macOS)
                     .keyboardType(.numberPad)
                     #endif
+            }
 
-                if let error { ErrorBox(text: error) }
+            if let error { ErrorBox(text: error) }
 
-                if offerSave {
-                    VStack(spacing: 10) {
+            if offerSave {
+                Card {
+                    VStack(alignment: .leading, spacing: DS.s3) {
                         Text("Save this PIN for Face ID / Touch ID quick-arm?")
-                            .font(.callout)
-                        HStack {
+                            .font(DSFont.semibold(14)).foregroundStyle(DS.text)
+                        Text("It's stored in the Keychain behind biometrics — never in the app.")
+                            .font(DSFont.body(12)).foregroundStyle(DS.textMuted)
+                        HStack(spacing: DS.s2) {
                             Button("Not now") { dismiss() }
+                                .buttonStyle(.organicSoft)
                             Button("Enable quick-arm") {
                                 try? PINStore.save(pin: pin)
                                 dismiss()
                             }
-                            .buttonStyle(.borderedProminent)
+                            .buttonStyle(.organicPrimary)
                         }
                     }
-                } else {
+                }
+            } else {
+                VStack(spacing: DS.s2) {
                     Button {
                         submit()
                     } label: {
                         if busy { ProgressView().controlSize(.small) }
-                        else { Text("Arm").frame(maxWidth: 220) }
+                        else { Text("Arm").frame(maxWidth: .infinity) }
                     }
-                    .buttonStyle(.borderedProminent)
+                    .buttonStyle(.organicPrimary)
                     .disabled(pin.count < 4 || busy)
 
                     if model.quickArmAvailable {
@@ -74,29 +156,15 @@ struct ArmSheet: View {
                                 if error == nil { dismiss() }
                             }
                         } label: {
-                            Label("Quick-arm with Face ID / Touch ID",
-                                  systemImage: "faceid")
+                            Label("Quick-arm with Face ID / Touch ID", systemImage: "faceid")
+                                .frame(maxWidth: .infinity)
                         }
-                        .buttonStyle(.bordered)
-                    }
-                }
-            }
-            .padding(28)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel") {
-                        model.pendingArmedAction = nil
-                        dismiss()
+                        .buttonStyle(.organicSoft)
                     }
                 }
             }
         }
         .onAppear { focused = true }
-        #if os(macOS)
-        .frame(width: 380, height: offerSave ? 380 : 360)
-        #else
-        .presentationDetents([.medium])
-        #endif
     }
 
     private func submit() {
@@ -127,6 +195,7 @@ struct OrderTicketSheet: View {
     @State private var limitText = ""
     @State private var stopText = ""
     @State private var tif = "gfd"
+    @State private var showBrokerReview = false
 
     @State private var phase: Phase = .form
     @State private var errorText: String?
@@ -142,127 +211,148 @@ struct OrderTicketSheet: View {
     }
 
     var body: some View {
-        NavigationStack {
-            Form {
-                Section {
-                    HStack {
-                        TextField("Symbol", text: $symbol)
-                            .font(.title3.weight(.bold).monospaced())
-                            .textCase(.uppercase)
-                            #if !os(macOS)
-                            .textInputAutocapitalization(.characters)
-                            .autocorrectionDisabled()
-                            #endif
-                        Picker("", selection: $side) {
-                            Text("BUY").tag("buy")
-                            Text("SELL").tag("sell")
-                        }
-                        .pickerStyle(.segmented)
-                        .frame(maxWidth: 160)
-                    }
-                    Picker("Size by", selection: $useDollars) {
-                        Text("$ amount").tag(true)
-                        Text("# shares").tag(false)
-                    }
-                    .pickerStyle(.segmented)
-                    if useDollars {
-                        TextField("USD notional (e.g. 50)", text: $dollarsText)
-                            .font(.body.monospaced())
-                    } else {
-                        TextField("Shares (fractional OK)", text: $quantityText)
-                            .font(.body.monospaced())
-                    }
-                    Picker("Type", selection: $orderType) {
-                        ForEach(["market", "limit", "stop_market", "stop_limit"], id: \.self) {
-                            Text($0).tag($0)
-                        }
-                    }
-                    if orderType.contains("limit") {
-                        TextField("Limit price", text: $limitText).font(.body.monospaced())
-                    }
-                    if orderType.hasPrefix("stop") {
-                        TextField("Stop trigger price", text: $stopText).font(.body.monospaced())
-                    }
-                    Picker("Time in force", selection: $tif) {
-                        Text("Day (gfd)").tag("gfd")
-                        Text("GTC").tag("gtc")
-                    }
-                } header: {
-                    Label("Real-money order · account \(model.meta?.broker?.account ?? "—")",
-                          systemImage: "bolt.fill")
+        SheetShell(title: "Order ticket",
+                   subtitle: "Real money · account \(model.meta?.broker?.account ?? "—")",
+                   icon: "bolt.fill", width: 500, height: 680,
+                   onClose: { dismiss() }) {
+            ticketForm
+            switch phase {
+            case .form:
+                Button { preview() } label: {
+                    Text("Preview order").frame(maxWidth: .infinity)
                 }
-
-                switch phase {
-                case .form:
-                    Section {
-                        Button {
-                            preview()
-                        } label: {
-                            Text("Preview order").frame(maxWidth: .infinity)
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .disabled(symbol.isEmpty || (useDollars ? dollarsText.isEmpty : quantityText.isEmpty))
-                    }
-                case .previewing:
-                    Section { HStack { Spacer(); ProgressView("Previewing…"); Spacer() } }
-                case .preview(let p):
-                    previewSection(p)
-                case .placing:
-                    Section { HStack { Spacer(); ProgressView("Placing…"); Spacer() } }
-                case .placed(let ref):
-                    Section {
-                        Label("Order placed (\(ref))", systemImage: "checkmark.circle.fill")
-                            .foregroundStyle(Color.up)
-                    }
-                }
-
-                if let errorText {
-                    Section { ErrorBox(text: errorText) }
-                }
+                .buttonStyle(.organicPrimary)
+                .disabled(symbol.isEmpty || (useDollars ? dollarsText.isEmpty : quantityText.isEmpty))
+            case .previewing:
+                HStack { Spacer(); ProgressView("Previewing…"); Spacer() }
+            case .preview(let p):
+                previewSection(p)
+            case .placing:
+                HStack { Spacer(); ProgressView("Placing…"); Spacer() }
+            case .placed(let ref):
+                Label("Order placed (\(ref))", systemImage: "checkmark.circle.fill")
+                    .font(DSFont.semibold(15))
+                    .foregroundStyle(DS.up)
             }
-            .formStyle(.grouped)
-            .navigationTitle("Order ticket")
-            #if !os(macOS)
-            .navigationBarTitleDisplayMode(.inline)
-            #endif
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Close") { dismiss() }
+            if let errorText { ErrorBox(text: errorText) }
+        }
+    }
+
+    private var ticketForm: some View {
+        Card {
+            VStack(alignment: .leading, spacing: DS.s3) {
+                HStack(spacing: DS.s2) {
+                    TextField("Symbol", text: $symbol)
+                        .textFieldStyle(.plain)
+                        .font(DSFont.mono(18, .bold))
+                        .foregroundStyle(DS.text)
+                        .padding(.horizontal, 14).padding(.vertical, 8)
+                        .background(DS.neutral(1), in: Capsule())
+                        .overlay(Capsule().strokeBorder(DS.divider, lineWidth: 1))
+                        #if !os(macOS)
+                        .textInputAutocapitalization(.characters)
+                        .autocorrectionDisabled()
+                        #endif
+                    FilterPills(options: [("buy", "BUY"), ("sell", "SELL")], selection: $side)
+                        .frame(maxWidth: 170)
+                }
+                SheetField(label: "Size by") {
+                    FilterPills(options: [(true, "$ amount"), (false, "# shares")],
+                                selection: $useDollars)
+                }
+                if useDollars {
+                    SheetField(label: "USD notional",
+                               hint: "Fractional dollar orders — the broker converts to shares.") {
+                        OrganicField(prompt: "e.g. 50", text: $dollarsText, mono: true)
+                    }
+                } else {
+                    SheetField(label: "Shares", hint: "Fractional quantities are allowed.") {
+                        OrganicField(prompt: "e.g. 1.25", text: $quantityText, mono: true)
+                    }
+                }
+                SheetField(label: "Order type") {
+                    FilterPills(options: [("market", "Market"), ("limit", "Limit"),
+                                          ("stop_market", "Stop"), ("stop_limit", "Stop limit")],
+                                selection: $orderType)
+                }
+                if orderType.contains("limit") {
+                    SheetField(label: "Limit price") {
+                        OrganicField(prompt: "0.00", text: $limitText, mono: true)
+                    }
+                }
+                if orderType.hasPrefix("stop") {
+                    SheetField(label: "Stop trigger price") {
+                        OrganicField(prompt: "0.00", text: $stopText, mono: true)
+                    }
+                }
+                SheetField(label: "Time in force") {
+                    FilterPills(options: [("gfd", "Day (gfd)"), ("gtc", "GTC")], selection: $tif)
                 }
             }
         }
-        #if os(macOS)
-        .frame(width: 480, height: 620)
-        #endif
     }
 
     @ViewBuilder
     private func previewSection(_ p: OrderPreview) -> some View {
-        Section("Confirm") {
-            let params = p.params
-            KeyValueRow(key: "Order",
-                        value: "\(params?.side?.uppercased() ?? "") \(params?.symbol ?? "") · \(params?.type ?? "")")
-            if let q = params?.quantity { KeyValueRow(key: "Shares", value: Fmt.num(q, dp: 6)) }
-            if let d = params?.dollarAmount { KeyValueRow(key: "Notional", value: Fmt.usd(d)) }
-            if let lp = params?.limitPrice { KeyValueRow(key: "Limit", value: Fmt.usd(lp)) }
-            if let px = p.quote?.price { KeyValueRow(key: "Last price", value: Fmt.usd(px)) }
-            if let est = p.estCost {
-                KeyValueRow(key: params?.side == "buy" ? "Est. cost" : "Est. proceeds",
-                            value: Fmt.usd(est))
-            }
-            ForEach(p.warnings ?? [], id: \.self) { WarningBox(text: $0) }
-            HoldToConfirmButton(
-                title: "HOLD to \(params?.side?.uppercased() ?? "PLACE") \(params?.symbol ?? "")",
-                tint: params?.side == "buy" ? .up : .down
-            ) {
-                place(previewId: p.previewId ?? "")
-            }
-            .listRowInsets(EdgeInsets(top: 6, leading: 6, bottom: 6, trailing: 6))
-            if let review = p.brokerReview {
-                DisclosureGroup("Broker pre-trade review") {
-                    Text(review.pretty)
-                        .font(.caption2.monospaced())
-                        .frame(maxWidth: .infinity, alignment: .leading)
+        Card("Confirm", subtitle: "reviewed by the broker before anything is sent") {
+            VStack(alignment: .leading, spacing: DS.s3) {
+                let params = p.params
+                VStack(spacing: DS.s2) {
+                    KeyValueRow(key: "Order",
+                                value: "\(params?.side?.uppercased() ?? "") \(params?.symbol ?? "") · \(params?.type ?? "")")
+                    if let q = params?.quantity {
+                        KeyValueRow(key: "Shares", value: Fmt.num(q, dp: 6))
+                    }
+                    if let d = params?.dollarAmount {
+                        KeyValueRow(key: "Notional", value: Fmt.usd(d))
+                    }
+                    if let lp = params?.limitPrice {
+                        KeyValueRow(key: "Limit", value: Fmt.usd(lp))
+                    }
+                    if let sp = params?.stopPrice {
+                        KeyValueRow(key: "Stop trigger", value: Fmt.usd(sp))
+                    }
+                    if let px = p.quote?.price {
+                        KeyValueRow(key: "Last price", value: Fmt.usd(px))
+                    }
+                    if let est = p.estCost {
+                        KeyValueRow(key: params?.side == "buy" ? "Est. cost" : "Est. proceeds",
+                                    value: Fmt.usd(est))
+                    }
+                    KeyValueRow(key: "Time in force",
+                                value: (params?.timeInForce ?? tif).uppercased())
+                }
+                ForEach(p.warnings ?? [], id: \.self) { WarningBox(text: $0) }
+                HoldToConfirmButton(
+                    title: "HOLD to \(params?.side?.uppercased() ?? "PLACE") \(params?.symbol ?? "")",
+                    tint: params?.side == "buy" ? DS.up : DS.down
+                ) {
+                    place(previewId: p.previewId ?? "")
+                }
+                if let review = p.brokerReview {
+                    Button { showBrokerReview.toggle() } label: {
+                        HStack(spacing: 8) {
+                            Image(systemName: showBrokerReview ? "chevron.down" : "chevron.right")
+                                .font(.system(size: 10, weight: .bold))
+                            Text("Broker pre-trade review").font(DSFont.semibold(13))
+                            Spacer()
+                        }
+                        .foregroundStyle(DS.textMuted)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    if showBrokerReview {
+                        ScrollView {
+                            Text(review.pretty)
+                                .font(DSFont.mono(11))
+                                .foregroundStyle(DS.consoleText)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(DS.s3)
+                        }
+                        .frame(maxHeight: 200)
+                        .background(DS.consoleBG,
+                                    in: RoundedRectangle(cornerRadius: DS.rMd, style: .continuous))
+                    }
                 }
             }
         }
@@ -324,36 +414,24 @@ struct HaltSheet: View {
     @State private var error: String?
 
     var body: some View {
-        NavigationStack {
-            Form {
-                Section {
-                    WarningBox(text: "Writes the HALT file. The bot will NOT trade — including its own stop-loss enforcement — until you clear it. Positions are NOT auto-sold; the independent watchdog keeps alerting.")
-                    TextField("Reason (logged)", text: $reason)
-                    HoldToConfirmButton(title: "HOLD to HALT the bot") {
-                        model.requireArm {
-                            Task {
-                                error = await model.haltBot(reason: reason)
-                                if error == nil { dismiss() }
-                            }
-                        }
+        SheetShell(title: "Force kill-switch HALT",
+                   subtitle: "Writes the HALT file the bot reads every cycle",
+                   icon: "octagon.fill", iconTint: DS.down,
+                   width: 460, height: 430, onClose: { dismiss() }) {
+            WarningBox(text: "The bot will NOT trade — including its own stop-loss enforcement — until you clear this. Positions are NOT auto-sold; the independent watchdog keeps alerting.")
+            SheetField(label: "Reason", hint: "Logged with the halt so the next session knows why.") {
+                OrganicField(prompt: "e.g. broker feed looks wrong", text: $reason)
+            }
+            HoldToConfirmButton(title: "HOLD to HALT the bot", tint: DS.down) {
+                model.requireArm {
+                    Task {
+                        error = await model.haltBot(reason: reason)
+                        if error == nil { dismiss() }
                     }
-                    if let error { ErrorBox(text: error) }
-                } header: {
-                    Label("Force kill-switch HALT", systemImage: "octagon.fill")
-                        .foregroundStyle(Color.down)
                 }
             }
-            .formStyle(.grouped)
-            .navigationTitle("Halt bot")
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
-            }
+            if let error { ErrorBox(text: error) }
         }
-        #if os(macOS)
-        .frame(width: 420, height: 330)
-        #else
-        .presentationDetents([.medium])
-        #endif
     }
 }
 
@@ -364,39 +442,25 @@ struct ClearHaltSheet: View {
     @State private var error: String?
 
     var body: some View {
-        NavigationStack {
-            Form {
-                Section {
-                    WarningBox(text: "Re-arms the bot to trade on its next cycle. Understand why it halted first — the HALT reason is on the Risk tab.")
-                    TextField("Type CLEAR to confirm", text: $confirm)
-                        .font(.body.monospaced())
-                        #if !os(macOS)
-                        .textInputAutocapitalization(.characters)
-                        #endif
-                    HoldToConfirmButton(title: "HOLD to CLEAR halt", tint: .up) {
-                        model.requireArm {
-                            Task {
-                                error = await model.clearHalt(confirm: confirm.trimmingCharacters(in: .whitespaces))
-                                if error == nil { dismiss() }
-                            }
-                        }
+        SheetShell(title: "Clear HALT",
+                   subtitle: "Re-arms the bot on its next cycle",
+                   icon: "checkmark.shield.fill", iconTint: DS.up,
+                   width: 460, height: 430, onClose: { dismiss() }) {
+            WarningBox(text: "Understand why it halted first — the HALT reason is on the Risk tab.")
+            SheetField(label: "Type CLEAR to confirm") {
+                OrganicField(prompt: "CLEAR", text: $confirm, mono: true)
+            }
+            HoldToConfirmButton(title: "HOLD to CLEAR halt", tint: DS.up) {
+                model.requireArm {
+                    Task {
+                        error = await model.clearHalt(
+                            confirm: confirm.trimmingCharacters(in: .whitespaces))
+                        if error == nil { dismiss() }
                     }
-                    if let error { ErrorBox(text: error) }
-                } header: {
-                    Label("Clear HALT", systemImage: "checkmark.shield.fill")
                 }
             }
-            .formStyle(.grouped)
-            .navigationTitle("Clear halt")
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
-            }
+            if let error { ErrorBox(text: error) }
         }
-        #if os(macOS)
-        .frame(width: 420, height: 320)
-        #else
-        .presentationDetents([.medium])
-        #endif
     }
 }
 
@@ -412,39 +476,39 @@ struct StopOverrideSheet: View {
     @State private var error: String?
 
     var body: some View {
-        NavigationStack {
-            Form {
-                Section {
-                    KeyValueRow(key: "Current stop", value: Fmt.usd(row.stopPrice))
-                    KeyValueRow(key: "Current trail", value: Fmt.usd(row.trailPrice))
+        SheetShell(title: "Stop override — \(row.symbol)",
+                   subtitle: "Honored by the bot next cycle; the watchdog snapshot follows",
+                   icon: "shield.lefthalf.filled", iconTint: DS.caution,
+                   width: 470, height: 560, onClose: { dismiss() }) {
+            Card("Current levels") {
+                VStack(spacing: DS.s2) {
                     KeyValueRow(key: "Price", value: Fmt.usd(row.price))
-                } header: {
-                    Text("\(row.symbol) — bot reads overrides next cycle; the watchdog snapshot follows")
-                }
-                Section("Override") {
-                    TextField("Absolute stop $ (e.g. 550)", text: $stopPriceText)
-                        .font(.body.monospaced())
-                    TextField("Stop % as fraction (0.10 = 10%)", text: $stopPctText)
-                        .font(.body.monospaced())
-                    TextField("Trailing % as fraction (0.25 = 25%)", text: $trailPctText)
-                        .font(.body.monospaced())
-                }
-                Section {
-                    Button("Save override") { save(clear: false) }
-                        .buttonStyle(.borderedProminent)
-                    Button("Clear override", role: .destructive) { save(clear: true) }
-                    if let error { ErrorBox(text: error) }
+                    KeyValueRow(key: "Entry", value: Fmt.usd(row.entry))
+                    KeyValueRow(key: "Peak", value: Fmt.usd(row.peak))
+                    KeyValueRow(key: "Hard stop", value: Fmt.usd(row.stopPrice),
+                                valueColor: DS.down)
+                    KeyValueRow(key: "Trailing stop", value: Fmt.usd(row.trailPrice),
+                                valueColor: DS.caution)
                 }
             }
-            .formStyle(.grouped)
-            .navigationTitle("Stop override")
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
+            SheetField(label: "Absolute stop $",
+                       hint: "Overrides the computed hard stop for this symbol only.") {
+                OrganicField(prompt: "e.g. 550", text: $stopPriceText, mono: true)
             }
+            SheetField(label: "Stop % as fraction", hint: "0.10 = 10% below entry.") {
+                OrganicField(prompt: "0.10", text: $stopPctText, mono: true)
+            }
+            SheetField(label: "Trailing % as fraction", hint: "0.25 = 25% giveback from peak.") {
+                OrganicField(prompt: "0.25", text: $trailPctText, mono: true)
+            }
+            HStack(spacing: DS.s2) {
+                Button("Save override") { save(clear: false) }
+                    .buttonStyle(.organicPrimary)
+                Button("Clear override") { save(clear: true) }
+                    .buttonStyle(.organicSoft(DS.down))
+            }
+            if let error { ErrorBox(text: error) }
         }
-        #if os(macOS)
-        .frame(width: 440, height: 460)
-        #endif
         .onAppear {
             if let ov = row.override_?.objectValue {
                 if let v = ov["stop_price"]?.numberValue { stopPriceText = Fmt.num(v, dp: 4) }
@@ -477,47 +541,31 @@ struct CashFlowSheet: View {
     @State private var note = ""
     @State private var error: String?
 
-    enum Kind: String, CaseIterable, Identifiable {
+    enum Kind: String, CaseIterable, Identifiable, Hashable {
         case deposit = "Deposit", withdrawal = "Withdrawal"
         var id: String { rawValue }
     }
 
     var body: some View {
-        NavigationStack {
-            Form {
-                Section {
-                    WarningBox(text: "Tells the bot exactly how much cash moved in/out so it never mistakes a deposit or withdrawal for trading performance (or vice versa). Applied next cycle to month_start_value, current_value, and the kill-switch peak — the exact amount you enter, not a guess from a broker read.")
-                    Picker("Type", selection: $kind) {
-                        ForEach(Kind.allCases) { Text($0.rawValue).tag($0) }
-                    }
-                    .pickerStyle(.segmented)
-                    TextField("Amount ($)", text: $amountText)
-                        .font(.body.monospaced())
-                        #if !os(macOS)
-                        .keyboardType(.decimalPad)
-                        #endif
-                    TextField("Note (optional)", text: $note)
-                } header: {
-                    Label("Declare cash movement", systemImage: "arrow.left.arrow.right.circle.fill")
-                }
-                Section {
-                    Button("Record \(kind.rawValue.lowercased())") { save() }
-                        .buttonStyle(.borderedProminent)
-                        .disabled(Double(amountText) == nil || Double(amountText) == 0)
-                    if let error { ErrorBox(text: error) }
-                }
+        SheetShell(title: "Declare cash movement",
+                   subtitle: "Keeps the performance % and kill-switch honest",
+                   icon: "arrow.left.arrow.right.circle.fill",
+                   width: 470, height: 500, onClose: { dismiss() }) {
+            WarningBox(text: "Tells the bot exactly how much cash moved in/out so it never mistakes a deposit or withdrawal for trading performance. Applied next cycle to month_start_value, current_value and the kill-switch peak — the exact amount you enter, not a guess from a broker read.")
+            SheetField(label: "Type") {
+                FilterPills(options: Kind.allCases.map { ($0, $0.rawValue) }, selection: $kind)
             }
-            .formStyle(.grouped)
-            .navigationTitle("Deposit / withdrawal")
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
+            SheetField(label: "Amount ($)") {
+                OrganicField(prompt: "0.00", text: $amountText, mono: true)
             }
+            SheetField(label: "Note (optional)") {
+                OrganicField(prompt: "e.g. monthly top-up", text: $note)
+            }
+            Button("Record \(kind.rawValue.lowercased())") { save() }
+                .buttonStyle(.organicPrimary)
+                .disabled(Double(amountText) == nil || Double(amountText) == 0)
+            if let error { ErrorBox(text: error) }
         }
-        #if os(macOS)
-        .frame(width: 440, height: 380)
-        #else
-        .presentationDetents([.medium])
-        #endif
     }
 
     private func save() {
@@ -542,17 +590,14 @@ struct SettingsSheet: View {
 
     var body: some View {
         @Bindable var model = model
-        NavigationStack {
-            Form {
-                Section("Server") {
-                    TextField("URL", text: $model.serverURLString,
-                              prompt: Text("https://your-mac.tailnet.ts.net"))
-                        .font(.body.monospaced())
-                        #if !os(macOS)
-                        .keyboardType(.URL)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        #endif
+        return SheetShell(title: "Settings",
+                          subtitle: "Server, quick-arm and connection status",
+                          icon: "slider.horizontal.3",
+                          width: 520, height: 600, onClose: { dismiss() }) {
+            Card("Server", subtitle: "where the TradeCommand dashboard is listening") {
+                VStack(alignment: .leading, spacing: DS.s3) {
+                    OrganicField(prompt: "https://your-mac.tailnet.ts.net",
+                                 text: $model.serverURLString, mono: true)
                     Button("Test connection") {
                         Task {
                             do {
@@ -560,23 +605,35 @@ struct SettingsSheet: View {
                                 testResult = "✓ connected — broker \(m.broker?.mode ?? "?"), market \(m.marketOpen == true ? "open" : "closed")"
                                 await model.refreshTick()
                             } catch {
-                                testResult = "✗ " + ((error as? APIError)?.errorDescription ?? error.localizedDescription)
+                                testResult = "✗ " + ((error as? APIError)?.errorDescription
+                                                     ?? error.localizedDescription)
                             }
                         }
                     }
+                    .buttonStyle(.organicSoft)
                     if let testResult {
                         Text(testResult)
-                            .font(.callout)
-                            .foregroundStyle(testResult.hasPrefix("✓") ? Color.up : Color.down)
+                            .font(DSFont.body(13))
+                            .foregroundStyle(testResult.hasPrefix("✓") ? DS.up : DS.down)
                     }
                     #if os(macOS)
                     Text("Local server: run `bash run_dashboard.sh` in the bot repo. On iPhone, use the Tailscale HTTPS URL (`tailscale serve --bg --https=443 http://127.0.0.1:8787`).")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .font(DSFont.body(12)).foregroundStyle(DS.textMuted)
+                        .fixedSize(horizontal: false, vertical: true)
                     #endif
                 }
-                Section("Quick-arm") {
+            }
+
+            Card("Appearance", subtitle: "the cream \u{201C}Organic\u{201D} palette is the design default") {
+                FilterPills(options: AppModel.Appearance.allCases.map { ($0, $0.label) },
+                            selection: $model.appearance)
+            }
+
+            Card("Quick-arm", subtitle: "biometric shortcut for the 5-minute arm token") {
+                VStack(alignment: .leading, spacing: DS.s2) {
                     Toggle("Face ID / Touch ID quick-arm", isOn: $quickArmEnabled)
+                        .font(DSFont.body(14))
+                        .tint(DS.accent2)
                         .onChange(of: quickArmEnabled) { _, on in
                             if !on { PINStore.delete() }
                             // enabling happens from the arm sheet after a
@@ -585,31 +642,38 @@ struct SettingsSheet: View {
                     Text(quickArmEnabled
                          ? "PIN is stored in the Keychain behind biometrics."
                          : "Enable by arming once with your PIN — you'll be offered to save it.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .font(DSFont.body(12)).foregroundStyle(DS.textMuted)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
-                Section("Status") {
-                    KeyValueRow(key: "Broker path", value: model.meta?.broker?.mode ?? "—")
+            }
+
+            Card("Status", subtitle: "what this app currently sees") {
+                VStack(spacing: DS.s2) {
+                    KeyValueRow(key: "Broker path", value: model.meta?.broker?.mode ?? "—",
+                                valueColor: model.meta?.broker?.mode == "direct-mcp"
+                                    ? DS.up : DS.caution)
                     if let reason = model.meta?.broker?.reason, !reason.isEmpty {
-                        Text(reason).font(.caption).foregroundStyle(.secondary)
+                        Text(reason).font(DSFont.body(12)).foregroundStyle(DS.textMuted)
+                            .frame(maxWidth: .infinity, alignment: .leading)
                     }
+                    KeyValueRow(key: "Server PIN configured",
+                                value: model.meta?.pinConfigured == true
+                                    ? "yes" : "NO — run --set-pin",
+                                valueColor: model.meta?.pinConfigured == true ? nil : DS.down)
+                    KeyValueRow(key: "Market",
+                                value: model.meta?.marketOpen == true ? "open" : "closed")
+                    KeyValueRow(key: "Poll interval",
+                                value: "\(Int(model.meta?.pollSeconds ?? 30))s")
+                    KeyValueRow(key: "Last refresh",
+                                value: model.lastRefreshed?
+                                    .formatted(date: .omitted, time: .standard) ?? "—")
                     Button("Retry direct broker connection") {
                         Task { await model.retryDirectBroker() }
                     }
-                    KeyValueRow(key: "Server PIN configured",
-                                value: model.meta?.pinConfigured == true ? "yes" : "NO — run --set-pin")
-                    KeyValueRow(key: "Last refresh",
-                                value: model.lastRefreshed?.formatted(date: .omitted, time: .standard) ?? "—")
+                    .buttonStyle(.organicSoft)
+                    .padding(.top, DS.s1)
                 }
             }
-            .formStyle(.grouped)
-            .navigationTitle("Settings")
-            .toolbar {
-                ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } }
-            }
         }
-        #if os(macOS)
-        .frame(width: 500, height: 520)
-        #endif
     }
 }

@@ -16,20 +16,21 @@ struct ReturnsPills: View {
     private static let order = ["1w", "1m", "6m", "1y"]
 
     var body: some View {
-        HStack(spacing: 4) {
+        HStack(spacing: 5) {
             ForEach(Self.order, id: \.self) { tf in
                 let v = returns?[tf]?.numberValue
                 VStack(spacing: 0) {
-                    Text(tf).font(.system(size: 8, weight: .bold))
-                        .foregroundStyle(.secondary)
+                    Text(tf)
+                        .font(DSFont.label(9))
+                        .foregroundStyle(DS.textFaint)
                     Text(v == nil ? "—" : Fmt.pct(v, dp: 0))
-                        .font(.caption2.weight(.semibold).monospacedDigit())
-                        .foregroundStyle(v == nil ? Color.secondary : v!.pnlColor)
+                        .font(DSFont.num(12, .semibold))
+                        .foregroundStyle(v == nil ? DS.textFaint : v.pnlColor)
                 }
-                .frame(minWidth: 34)
-                .padding(.vertical, 2)
-                .background((v ?? 0).pnlColor.opacity(v == nil ? 0.04 : 0.09),
-                            in: RoundedRectangle(cornerRadius: 5))
+                .frame(minWidth: 38)
+                .padding(.vertical, 4)
+                .background(v.pnlColor.opacity(v == nil ? 0.05 : 0.12),
+                            in: RoundedRectangle(cornerRadius: DS.rSm, style: .continuous))
             }
         }
     }
@@ -44,60 +45,48 @@ struct AnalyzerView: View {
     private var p: SymbolPayload? { model.symbolPayload }
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 14) {
-                if let err = model.tabErrors[.analyzer] { ErrorBox(text: err) }
-                controls
-                quoteHeader
+        Screen(title: "Analyzer", subtitle: AppTab.analyzer.blurb,
+               refresh: { await model.load(.analyzer) }) {
+            if let err = model.tabErrors[.analyzer] { ErrorBox(text: err) }
+            controls
+            AdaptivePair(compactBelow: 900, ratio: 1.7) {
                 chartCard
-                AdaptivePair(compactBelow: 700) {
-                    statsCard
-                } second: {
-                    ribbonCard
-                }
-                pastTradesCard
-                newsCard
+            } second: {
+                signalReadCard
             }
-            .padding()
+            AdaptivePair(compactBelow: 760) {
+                statsCard
+            } second: {
+                ribbonCard
+            }
+            pastTradesCard
+            newsCard
         }
-        .refreshable { await model.load(.analyzer) }
         .task {
             symbolField = model.analyzerSymbol
             if p == nil { await model.load(.analyzer) }
         }
     }
 
+    // MARK: controls
+
     private var controls: some View {
         @Bindable var model = model
-        return GroupBox {
-            VStack(alignment: .leading, spacing: 8) {
-                HStack(spacing: 8) {
-                    TextField("Symbol", text: $symbolField)
-                        .font(.body.monospaced())
-                        .textFieldStyle(.roundedBorder)
-                        .frame(maxWidth: 120)
-                        .onSubmit { go() }
-                        #if !os(macOS)
-                        .textInputAutocapitalization(.characters)
-                        .autocorrectionDisabled()
-                        #endif
-                    Picker("", selection: $model.analyzerInterval) {
-                        Text("Daily").tag("1d")
-                        Text("1h (bot)").tag("1h")
-                        Text("30m").tag("30m")
-                    }
-                    .pickerStyle(.segmented)
-                    .frame(maxWidth: 260)
+        return VStack(alignment: .leading, spacing: DS.s3) {
+            HStack(spacing: DS.s2) {
+                OrganicField(prompt: "Symbol", text: $symbolField, mono: true,
+                             width: 140, onSubmit: go)
+                Button { go() } label: { Label("Load", systemImage: "magnifyingglass") }
+                    .buttonStyle(.organicPrimary)
+                Spacer(minLength: DS.s2)
+                FilterPills(options: [("1d", "Daily"), ("1h", "1h (bot)"), ("30m", "30m")],
+                            selection: $model.analyzerInterval)
                     .onChange(of: model.analyzerInterval) { _, _ in
                         Task { await model.load(.analyzer) }
                     }
-                    Button { go() } label: { Label("Load", systemImage: "magnifyingglass") }
-                        .buttonStyle(.borderedProminent)
-                        .controlSize(.small)
-                    Spacer()
-                }
-                quickChips
+                    .frame(maxWidth: 280)
             }
+            quickChips
         }
     }
 
@@ -106,23 +95,23 @@ struct AnalyzerView: View {
         let extras = ["SPY", "QQQ", "IWM", "NVDA", "MU", "LABU"]
         let all = Array(NSOrderedSet(array: held + extras)) as? [String] ?? extras
         return ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 6) {
+            HStack(spacing: DS.s2) {
                 ForEach(all, id: \.self) { s in
                     Button {
                         symbolField = s
                         go()
                     } label: {
                         Text(s)
-                            .font(.caption.weight(.semibold).monospaced())
-                            .padding(.horizontal, 8).padding(.vertical, 3)
-                            .background(s == model.analyzerSymbol
-                                        ? Color.accentColor.opacity(0.25)
-                                        : Color.secondary.opacity(0.12),
+                            .font(DSFont.semibold(13))
+                            .padding(.horizontal, 16).padding(.vertical, 7)
+                            .background(s == model.analyzerSymbol ? DS.accent : DS.neutral(2),
                                         in: Capsule())
+                            .foregroundStyle(s == model.analyzerSymbol ? .white : DS.text)
                     }
                     .buttonStyle(.plain)
                 }
             }
+            .padding(.vertical, 1)
         }
     }
 
@@ -134,34 +123,7 @@ struct AnalyzerView: View {
         Task { await model.load(.analyzer) }
     }
 
-    @ViewBuilder
-    private var quoteHeader: some View {
-        if let p {
-            HStack(spacing: 12) {
-                Text(p.symbol ?? "—").font(.title2.bold().monospaced())
-                Text(Fmt.usd(p.quote?.price)).font(.title3.monospacedDigit())
-                Text(Fmt.pct(p.quote?.changePct))
-                    .font(.headline.monospacedDigit())
-                    .foregroundStyle((p.quote?.changePct ?? 0).pnlColor)
-                RibbonBadge(state: p.ribbon?.state)
-                if p.held == true { StatusDot(color: .up, label: "HELD") }
-                if p.dnt == true { StatusDot(color: .down, label: "DNT") }
-                Spacer()
-                HStack(spacing: 8) {
-                    Button {
-                        model.orderPrefill = .init(symbol: p.symbol ?? "", side: "buy")
-                        model.showOrderSheet = true
-                    } label: { Label("Buy", systemImage: "plus.circle") }
-                    Button {
-                        model.orderPrefill = .init(symbol: p.symbol ?? "", side: "sell")
-                        model.showOrderSheet = true
-                    } label: { Label("Sell", systemImage: "minus.circle") }
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-            }
-        }
-    }
+    // MARK: chart
 
     private struct SeriesPoint: Identifiable {
         let id = UUID()
@@ -174,7 +136,7 @@ struct AnalyzerView: View {
         guard let p, let bars = p.bars else { return [] }
         var out: [SeriesPoint] = []
         for (i, b) in bars.enumerated() {
-            if let c = b.close { out.append(SeriesPoint(idx: i, series: "close", value: c)) }
+            if let c = b.close { out.append(SeriesPoint(idx: i, series: "Close", value: c)) }
         }
         // ribbon overlay: EMA(8/13/21/55) — same math the bot trades on
         let nameMap = [("blue", "EMA 8"), ("green", "EMA 13"),
@@ -189,99 +151,204 @@ struct AnalyzerView: View {
     }
 
     private var chartCard: some View {
-        GroupBox {
-            let data = chartData
-            if data.isEmpty {
-                ContentUnavailableView("No chart data",
-                                       systemImage: "chart.line.downtrend.xyaxis",
-                                       description: Text("Load a symbol — intraday intervals need 60+ bars."))
-                    .frame(height: 220)
-            } else {
-                Chart {
-                    ForEach(data) { pt in
-                        LineMark(x: .value("Bar", pt.idx),
-                                 y: .value("Price", pt.value))
-                            .foregroundStyle(by: .value("Series", pt.series))
-                            .lineStyle(StrokeStyle(lineWidth: pt.series == "close" ? 2 : 1.2))
+        Card("Price & ribbon",
+             subtitle: "plain EMA 8 / 13 / 21 / 55 — the exact lines the bot trades") {
+            VStack(alignment: .leading, spacing: DS.s3) {
+                quoteHeader
+                let data = chartData
+                if data.isEmpty {
+                    EmptyNote(text: "No chart data — intraday intervals need 60+ bars.",
+                              icon: "chart.line.downtrend.xyaxis")
+                        .frame(height: 200)
+                } else {
+                    Chart {
+                        ForEach(data) { pt in
+                            LineMark(x: .value("Bar", pt.idx), y: .value("Price", pt.value))
+                                .foregroundStyle(by: .value("Series", pt.series))
+                                .lineStyle(StrokeStyle(lineWidth: pt.series == "Close" ? 2.4 : 1.2,
+                                                       lineCap: .round, lineJoin: .round))
+                        }
+                        if let stop = p?.stops?.stopPrice {
+                            RuleMark(y: .value("Stop", stop))
+                                .foregroundStyle(DS.down.opacity(0.75))
+                                .lineStyle(StrokeStyle(lineWidth: 1, dash: [4, 3]))
+                                .annotation(position: .trailing, alignment: .leading) {
+                                    Text("stop").font(DSFont.label(9)).foregroundStyle(DS.down)
+                                }
+                        }
+                        if let trail = p?.stops?.trailPrice {
+                            RuleMark(y: .value("Trail", trail))
+                                .foregroundStyle(DS.caution.opacity(0.75))
+                                .lineStyle(StrokeStyle(lineWidth: 1, dash: [4, 3]))
+                                .annotation(position: .trailing, alignment: .leading) {
+                                    Text("trail").font(DSFont.label(9)).foregroundStyle(DS.caution)
+                                }
+                        }
+                        if let entry = p?.position?["entry_price"]?.numberValue {
+                            RuleMark(y: .value("Entry", entry))
+                                .foregroundStyle(DS.textMuted.opacity(0.8))
+                                .lineStyle(StrokeStyle(lineWidth: 1, dash: [2, 3]))
+                                .annotation(position: .trailing, alignment: .leading) {
+                                    Text("entry").font(DSFont.label(9))
+                                        .foregroundStyle(DS.textMuted)
+                                }
+                        }
                     }
-                    if let stop = p?.stops?.stopPrice {
-                        RuleMark(y: .value("Stop", stop))
-                            .foregroundStyle(Color.down.opacity(0.7))
-                            .lineStyle(StrokeStyle(lineWidth: 1, dash: [4, 3]))
-                            .annotation(position: .trailing, alignment: .leading) {
-                                Text("stop").font(.caption2).foregroundStyle(Color.down)
+                    .chartForegroundStyleScale([
+                        "Close": DS.text,
+                        "EMA 8": DS.accent(4),
+                        "EMA 13": DS.accent2,
+                        "EMA 21": DS.caution,
+                        "EMA 55": DS.down,
+                    ])
+                    .chartXAxis(.hidden)
+                    .chartYScale(domain: .automatic(includesZero: false))
+                    .chartYAxis {
+                        AxisMarks(position: .leading) { v in
+                            AxisGridLine().foregroundStyle(DS.divider)
+                            AxisValueLabel {
+                                if let d = v.as(Double.self) {
+                                    Text(Fmt.num(d, dp: 0)).font(DSFont.num(10))
+                                        .foregroundStyle(DS.textMuted)
+                                }
                             }
+                        }
                     }
-                    if let trail = p?.stops?.trailPrice {
-                        RuleMark(y: .value("Trail", trail))
-                            .foregroundStyle(Color.caution.opacity(0.7))
-                            .lineStyle(StrokeStyle(lineWidth: 1, dash: [4, 3]))
-                            .annotation(position: .trailing, alignment: .leading) {
-                                Text("trail").font(.caption2).foregroundStyle(Color.caution)
-                            }
+                    .frame(height: 280)
+                    HStack {
+                        Text(p?.bars?.first?.ts ?? "")
+                        Spacer()
+                        Text("\(p?.bars?.count ?? 0) bars · \(p?.interval ?? "")")
+                        Spacer()
+                        Text(p?.bars?.last?.ts ?? "")
                     }
-                    if let entry = p?.position?["entry_price"]?.numberValue {
-                        RuleMark(y: .value("Entry", entry))
-                            .foregroundStyle(Color.secondary.opacity(0.7))
-                            .lineStyle(StrokeStyle(lineWidth: 1, dash: [2, 3]))
-                            .annotation(position: .trailing, alignment: .leading) {
-                                Text("entry").font(.caption2).foregroundStyle(.secondary)
-                            }
-                    }
+                    .font(DSFont.mono(10))
+                    .foregroundStyle(DS.textFaint)
                 }
-                .chartForegroundStyleScale([
-                    "close": Color.primary,
-                    "EMA 8": Color.blue,
-                    "EMA 13": Color.green,
-                    "EMA 21": Color.yellow,
-                    "EMA 55": Color.red,
-                ])
-                .chartXAxis(.hidden)
-                .chartYScale(domain: .automatic(includesZero: false))
-                .frame(height: 260)
-                HStack {
-                    Text(p?.bars?.first?.ts ?? "")
-                    Spacer()
-                    Text("\(p?.bars?.count ?? 0) bars · \(p?.interval ?? "")")
-                    Spacer()
-                    Text(p?.bars?.last?.ts ?? "")
-                }
-                .font(.caption2.monospaced())
-                .foregroundStyle(.secondary)
             }
-        } label: {
-            Label("Price + bot ribbon (EMA 8/13/21/55)", systemImage: "chart.xyaxis.line")
         }
     }
 
+    @ViewBuilder
+    private var quoteHeader: some View {
+        if let p {
+            WidthReader(compactBelow: 520) { compact in
+                let left = HStack(spacing: DS.s3) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(p.symbol ?? "—")
+                            .font(DSFont.heading(22)).foregroundStyle(DS.text)
+                        HStack(spacing: 8) {
+                            Text(Fmt.usd(p.quote?.price))
+                                .font(DSFont.num(20, .bold)).foregroundStyle(DS.text)
+                            Text(Fmt.pct(p.quote?.changePct))
+                                .font(DSFont.num(15, .semibold))
+                                .foregroundStyle(p.quote?.changePct.pnlColor ?? DS.flat)
+                        }
+                    }
+                    RibbonBadge(state: p.ribbon?.state)
+                    if p.held == true { StatusDot(color: DS.up, label: "HELD") }
+                    if p.dnt == true { StatusDot(color: DS.down, label: "DNT") }
+                }
+                let right = HStack(spacing: DS.s2) {
+                    Button {
+                        model.orderPrefill = .init(symbol: p.symbol ?? "", side: "buy")
+                        model.showOrderSheet = true
+                    } label: { Label("Buy", systemImage: "plus.circle") }
+                        .buttonStyle(SoftButtonStyle(tint: DS.up))
+                    Button {
+                        model.orderPrefill = .init(symbol: p.symbol ?? "", side: "sell")
+                        model.showOrderSheet = true
+                    } label: { Label("Sell", systemImage: "minus.circle") }
+                        .buttonStyle(SoftButtonStyle(tint: DS.down))
+                }
+                if compact {
+                    VStack(alignment: .leading, spacing: DS.s2) { left; right }
+                } else {
+                    HStack { left; Spacer(minLength: DS.s2); right }
+                }
+            }
+        }
+    }
+
+    // MARK: signal read
+
+    private var signalReadCard: some View {
+        Card("Signal Read", subtitle: "what the bot's ribbon says right now") {
+            let state = p?.ribbon?.state
+            let score = p?.stats?.momentumScore
+            VStack(alignment: .leading, spacing: DS.s3) {
+                if state == nil {
+                    EmptyNote(text: "No active signal for this symbol yet.", icon: "wifi.slash")
+                } else {
+                    RibbonBadge(state: state)
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text("Momentum score")
+                            .font(DSFont.body(13)).foregroundStyle(DS.textMuted)
+                        MeterBar(value: (score ?? 0) / 100,
+                                 tint: (score ?? 0) >= 60 ? DS.accent : DS.neutral(5))
+                        Text("\(Fmt.num(score, dp: 0)) / 100")
+                            .font(DSFont.num(12, .semibold))
+                            .foregroundStyle(DS.textMuted)
+                            .frame(maxWidth: .infinity, alignment: .trailing)
+                    }
+                    Text(reasoning)
+                        .font(DSFont.body(14))
+                        .foregroundStyle(DS.text)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text("Source: plain EMA 8/13/21/55 · \(p?.ribbon?.bars ?? 0) bars · \(p?.ribbon?.source ?? "—")")
+                        .font(DSFont.body(11))
+                        .foregroundStyle(DS.textFaint)
+                    if let note = p?.ribbon?.note, !note.isEmpty {
+                        WarningBox(text: note)
+                    }
+                }
+            }
+        }
+    }
+
+    private var reasoning: String {
+        guard let r = p?.ribbon else { return "" }
+        let t = r.transition ?? "NO_ACTION"
+        switch r.state {
+        case "BUY":
+            return "Red EMA(55) sits below the fast pack — the bot's long gate is open"
+                + (t == "ENTER_LONG" ? " and it just crossed this bar." : ".")
+        case "SELL":
+            return "Red EMA(55) is above the fast pack. Under let-winners-run this is advisory — the trailing stop owns the exit."
+        default:
+            return "Ribbon is tangled (neutral). No entry edge; existing positions ride their stops."
+        }
+    }
+
+    // MARK: stats / ribbon
+
     private var statsCard: some View {
-        GroupBox {
-            VStack(spacing: 4) {
+        Card("Momentum profile", subtitle: "the numbers the screener ranks on") {
+            VStack(spacing: DS.s2) {
                 KeyValueRow(key: "52w high", value: Fmt.usd(p?.stats?.high52w))
                 KeyValueRow(key: "52w low", value: Fmt.usd(p?.stats?.low52w))
                 KeyValueRow(key: "Off high", value: Fmt.pct(p?.stats?.offHighPct),
-                            valueColor: (p?.stats?.offHighPct ?? 0).pnlColor)
+                            valueColor: p?.stats?.offHighPct.pnlColor)
                 KeyValueRow(key: "Momentum score",
                             value: p?.stats?.momentumScore.map { Fmt.num($0, dp: 0) + "/100" } ?? "—")
-                Divider().padding(.vertical, 2)
+                Rectangle().fill(DS.divider).frame(height: 1).padding(.vertical, 2)
                 HStack {
-                    Text("Returns").foregroundStyle(.secondary)
+                    Text("Returns").font(DSFont.body(13)).foregroundStyle(DS.textMuted)
                     Spacer()
                     ReturnsPills(returns: p?.stats?.returns)
                 }
             }
-        } label: { Label("Momentum profile", systemImage: "speedometer") }
+        }
     }
 
     private var ribbonCard: some View {
-        GroupBox {
-            VStack(spacing: 4) {
+        Card("Live ribbon", subtitle: "the bot's signal layer, line by line") {
+            VStack(spacing: DS.s2) {
                 HStack {
-                    Text("State").foregroundStyle(.secondary)
+                    Text("State").font(DSFont.body(13)).foregroundStyle(DS.textMuted)
                     Spacer()
                     RibbonBadge(state: p?.ribbon?.state)
-                    Text(p?.ribbon?.transition ?? "—")
-                        .font(.caption.monospaced()).foregroundStyle(.secondary)
+                    Tag(p?.ribbon?.transition ?? "—", tone: .neutral, size: 10)
                 }
                 KeyValueRow(key: "EMA 8 (blue)", value: Fmt.usd(p?.ribbon?.lines?.blue))
                 KeyValueRow(key: "EMA 13 (green)", value: Fmt.usd(p?.ribbon?.lines?.green))
@@ -289,57 +356,53 @@ struct AnalyzerView: View {
                 KeyValueRow(key: "EMA 55 (red)", value: Fmt.usd(p?.ribbon?.lines?.red))
                 KeyValueRow(key: "Bars / source",
                             value: "\(p?.ribbon?.bars ?? 0) · \(p?.ribbon?.source ?? "—")")
-                if let note = p?.ribbon?.note, !note.isEmpty {
-                    Text(note).font(.caption2).foregroundStyle(Color.caution)
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                if p?.ribbon?.warmupOk == false {
+                    WarningBox(text: "Not fully seeded — fewer than 165 bars of warmup.")
                 }
             }
-        } label: { Label("Live ribbon (bot signal layer)", systemImage: "dot.radiowaves.left.and.right") }
+        }
     }
 
     @ViewBuilder
     private var pastTradesCard: some View {
         if let trades = p?.pastTrades, !trades.isEmpty {
-            GroupBox {
-                VStack(spacing: 6) {
+            Card("The bot's past trades here", subtitle: "closed positions in this name") {
+                VStack(spacing: 0) {
                     ForEach(trades, id: \.stableId) { t in
-                        HStack {
-                            Text(t.id ?? "—").font(.caption.monospaced())
-                            Text(t.outcome ?? "").font(.caption.bold())
-                                .foregroundStyle(t.outcome == "WIN" ? Color.up : Color.down)
-                            Text(t.exitReason ?? "").font(.caption).foregroundStyle(.secondary)
-                            Spacer()
-                            Text(Fmt.pct(t.pnlPct))
-                                .font(.caption.monospacedDigit())
-                                .foregroundStyle((t.pnlPct ?? 0).pnlColor)
-                            Text(Fmt.when(t.exitDate)).font(.caption2).foregroundStyle(.secondary)
+                        TRow(showsDivider: t.stableId != trades.last?.stableId) {
+                            TCell {
+                                Text(t.id ?? "—").font(DSFont.mono(11))
+                                    .foregroundStyle(DS.textFaint)
+                            }
+                            TCell {
+                                Tag(t.outcome ?? "—", tone: t.outcome == "WIN" ? .up : .down,
+                                    size: 10)
+                            }
+                            TCell(weight: 2) {
+                                Text(t.exitReason ?? "").font(DSFont.body(12))
+                                    .foregroundStyle(DS.textMuted).lineLimit(1)
+                            }
+                            TCell(align: .trailing) {
+                                Text(Fmt.pct(t.pnlPct))
+                                    .font(DSFont.num(13, .semibold))
+                                    .foregroundStyle(t.pnlPct.pnlColor)
+                            }
+                            TCell(align: .trailing) {
+                                Text(Fmt.when(t.exitDate)).font(DSFont.num(11))
+                                    .foregroundStyle(DS.textFaint)
+                            }
                         }
                     }
                 }
-            } label: { Label("Bot's past trades here", systemImage: "clock.arrow.circlepath") }
+            }
         }
     }
 
     @ViewBuilder
     private var newsCard: some View {
         if let news = p?.news, !news.isEmpty {
-            GroupBox {
-                VStack(alignment: .leading, spacing: 8) {
-                    ForEach(Array(news.enumerated()), id: \.offset) { _, h in
-                        VStack(alignment: .leading, spacing: 1) {
-                            if let link = h.link, let url = URL(string: link) {
-                                Link(h.title ?? "—", destination: url)
-                                    .font(.callout)
-                            } else {
-                                Text(h.title ?? "—").font(.callout)
-                            }
-                            Text("\(h.source ?? "") · \(h.published ?? "")")
-                                .font(.caption2).foregroundStyle(.secondary)
-                        }
-                    }
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-            } label: { Label("Symbol news", systemImage: "newspaper") }
+            headlinesCard(news, title: "Symbol news",
+                          subtitle: "live headlines for \(model.analyzerSymbol)")
         }
     }
 }
@@ -348,52 +411,75 @@ struct AnalyzerView: View {
 
 struct SignalsView: View {
     @Environment(AppModel.self) private var model
+    @State private var filter: SignalFilter = .all
+
+    enum SignalFilter: String, Hashable, CaseIterable {
+        case all = "All", buy = "Buy", sell = "Sell", neutral = "Neutral", held = "Held"
+    }
 
     private var payload: SignalsPayload? { model.signalsPayload }
-    private var rows: [SignalRow] { payload?.rows ?? [] }
+    private var allRows: [SignalRow] { payload?.rows ?? [] }
 
-    var body: some View {
-        List {
-            if let err = model.tabErrors[.signals] { ErrorBox(text: err) }
-            Section {
-                summary
-            }
-            Section("Every symbol the bot watches — tap to analyze") {
-                ForEach(rows) { row in
-                    Button { model.analyze(row.symbol) } label: {
-                        SignalRowView(row: row)
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
-        }
-        .refreshable { await model.load(.signals) }
-        .task { if payload == nil { await model.load(.signals) } }
-        .overlay {
-            if payload == nil {
-                ContentUnavailableView("Computing ribbons…", systemImage: "dot.radiowaves.left.and.right")
-            }
+    private var rows: [SignalRow] {
+        switch filter {
+        case .all: allRows
+        case .buy: allRows.filter { $0.state == "BUY" }
+        case .sell: allRows.filter { $0.state == "SELL" }
+        case .neutral: allRows.filter { $0.state != "BUY" && $0.state != "SELL" }
+        case .held: allRows.filter { $0.held == true }
         }
     }
 
-    private var summary: some View {
-        let buys = rows.filter { $0.state == "BUY" }.count
-        let sells = rows.filter { $0.state == "SELL" }.count
-        let neutral = rows.filter { $0.state == "NEUTRAL" }.count
-        return GroupBox {
-            VStack(alignment: .leading, spacing: 8) {
-                HStack(spacing: 10) {
-                    StatusDot(color: .up, label: "BUY \(buys)")
-                    StatusDot(color: .down, label: "SELL \(sells)")
-                    StatusDot(color: .secondary, label: "NEUTRAL \(neutral)")
-                    Spacer()
-                    Text("interval \(payload?.interval ?? "—")")
-                        .font(.caption.monospaced())
-                        .foregroundStyle(.secondary)
+    var body: some View {
+        Group {
+            if payload == nil {
+                LoadingScreen(title: "Computing ribbons…",
+                              detail: "plain EMA 8/13/21/55 over every watched symbol")
+                    .background(DS.bg)
+            } else {
+                Screen(title: "Signals", subtitle: AppTab.signals.blurb,
+                       refresh: { await model.load(.signals) }) {
+                    if let err = model.tabErrors[.signals] { ErrorBox(text: err) }
+                    summary
+                    FilterPills(options: SignalFilter.allCases.map { ($0, $0.rawValue) },
+                                selection: $filter)
+                    grid
                 }
-                Text("Plain EMA 8/13/21/55 — the exact lines the bot trades. Margin = how far red(55) sits below the fast pack (+ = BUY room, − = SELL).")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
+            }
+        }
+        .task { if payload == nil { await model.load(.signals) } }
+    }
+
+    private var summary: some View {
+        let buys = allRows.filter { $0.state == "BUY" }.count
+        let sells = allRows.filter { $0.state == "SELL" }.count
+        let neutral = allRows.count - buys - sells
+        return StatRow(minWidth: 175) {
+            StatCard(label: "BUY zone", value: "\(buys)",
+                     delta: "red(55) under the fast pack", deltaTone: .up)
+            StatCard(label: "SELL zone", value: "\(sells)",
+                     delta: "advisory — trail owns the exit", deltaTone: .down)
+            StatCard(label: "Neutral", value: "\(neutral)", sublabel: "ribbon tangled")
+            StatCard(label: "Interval", value: payload?.interval ?? "—",
+                     sublabel: "generated \(Fmt.when(payload?.generatedAt))")
+        }
+    }
+
+    private var grid: some View {
+        Card(padding: DS.s4) {
+            if rows.isEmpty {
+                EmptyNote(text: "No symbols match this filter.", icon: "wifi.slash")
+            } else {
+                VStack(spacing: 0) {
+                    ForEach(rows) { row in
+                        SignalRowView(row: row, isLast: row.id == rows.last?.id)
+                            .contentShape(Rectangle())
+                            .onTapGesture { model.analyze(row.symbol) }
+                    }
+                }
+                Text("Margin = how far red(55) sits below the fast pack (+ = BUY room, − = SELL).")
+                    .font(DSFont.body(12)).foregroundStyle(DS.textMuted)
+                    .padding(.top, DS.s2)
             }
         }
     }
@@ -401,51 +487,78 @@ struct SignalsView: View {
 
 struct SignalRowView: View {
     let row: SignalRow
+    let isLast: Bool
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            HStack(spacing: 8) {
-                if row.held == true {
-                    Circle().fill(Color.up).frame(width: 6, height: 6)
-                }
-                Text(row.symbol).font(.headline.monospaced())
-                RibbonBadge(state: row.state)
-                if let t = row.transition, t != "NO_ACTION", t != "HOLD" {
-                    Text(t).font(.caption2.bold().monospaced())
-                        .foregroundStyle(t == "ENTER_LONG" ? Color.up : Color.caution)
-                }
-                if row.dnt == true {
-                    Text("DNT").font(.caption2.bold()).foregroundStyle(Color.down)
-                }
-                Spacer()
-                Sparkline(points: row.spark ?? [])
-                VStack(alignment: .trailing, spacing: 1) {
-                    Text(Fmt.usd(row.price)).font(.callout.monospacedDigit())
-                    Text(Fmt.pct(row.changePct))
-                        .font(.caption2.monospacedDigit())
-                        .foregroundStyle((row.changePct ?? 0).pnlColor)
-                }
+        VStack(spacing: 0) {
+            WidthReader(compactBelow: 640) { compact in
+                if compact { compactBody } else { wideBody }
             }
-            HStack(spacing: 10) {
-                if let m = row.redMarginPct {
-                    Text("margin \(Fmt.pct(m, dp: 2))")
-                        .font(.caption2.monospacedDigit())
-                        .foregroundStyle(m > 0 ? Color.up : Color.down)
-                }
-                if let l = row.lines {
-                    Text("8:\(Fmt.num(l.blue, dp: 2)) 13:\(Fmt.num(l.green, dp: 2)) 21:\(Fmt.num(l.yellow, dp: 2)) 55:\(Fmt.num(l.red, dp: 2))")
-                        .font(.caption2.monospaced())
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                }
-                if let note = row.note, !note.isEmpty {
-                    Text(note).font(.caption2).foregroundStyle(Color.caution).lineLimit(1)
-                }
-                Spacer()
-            }
+            .padding(.vertical, 12)
+            if !isLast { Rectangle().fill(DS.divider).frame(height: 1) }
         }
-        .padding(.vertical, 2)
-        .contentShape(Rectangle())
+    }
+
+    private var wideBody: some View {
+        HStack(spacing: DS.s3) {
+            identity.frame(minWidth: 160, alignment: .leading)
+            Spacer(minLength: DS.s2)
+            lines
+            Spacer(minLength: DS.s2)
+            margin
+            Sparkline(points: row.spark ?? [])
+            price
+        }
+    }
+
+    private var compactBody: some View {
+        VStack(alignment: .leading, spacing: DS.s2) {
+            HStack { identity; Spacer(); price }
+            HStack(spacing: DS.s2) { margin; Sparkline(points: row.spark ?? [], width: 64); Spacer() }
+            lines
+        }
+    }
+
+    private var identity: some View {
+        HStack(spacing: 8) {
+            if row.held == true { Circle().fill(DS.up).frame(width: 7, height: 7) }
+            Text(row.symbol).font(DSFont.bold(15)).foregroundStyle(DS.text)
+            RibbonBadge(state: row.state)
+            if let t = row.transition, t != "NO_ACTION", t != "HOLD" {
+                Tag(t, tone: t == "ENTER_LONG" ? .up : .caution, size: 9)
+            }
+            if row.dnt == true { Tag("DNT", tone: .down, size: 9) }
+        }
+    }
+
+    @ViewBuilder
+    private var lines: some View {
+        if let l = row.lines {
+            Text("8: \(Fmt.num(l.blue, dp: 2))   13: \(Fmt.num(l.green, dp: 2))   21: \(Fmt.num(l.yellow, dp: 2))   55: \(Fmt.num(l.red, dp: 2))")
+                .font(DSFont.num(11))
+                .foregroundStyle(DS.textFaint)
+                .lineLimit(1)
+        }
+    }
+
+    @ViewBuilder
+    private var margin: some View {
+        if let m = row.redMarginPct {
+            Tag("margin \(Fmt.pct(m, dp: 2))", tone: m > 0 ? .up : .down, size: 10)
+        }
+        if let note = row.note, !note.isEmpty {
+            Tag(note, tone: .caution, size: 10)
+        }
+    }
+
+    private var price: some View {
+        VStack(alignment: .trailing, spacing: 2) {
+            Text(Fmt.usd(row.price)).font(DSFont.num(14, .semibold)).foregroundStyle(DS.text)
+            Text(Fmt.pct(row.changePct))
+                .font(DSFont.num(11, .semibold))
+                .foregroundStyle(row.changePct.pnlColor)
+        }
+        .frame(minWidth: 78, alignment: .trailing)
     }
 }
 
@@ -453,46 +566,47 @@ struct SignalRowView: View {
 
 struct ScreenerView: View {
     @Environment(AppModel.self) private var model
+    @State private var query = ""
 
     private var payload: ScreenPayload? { model.screenPayload }
 
+    private var rows: [ScreenRow] {
+        let all = payload?.rows ?? []
+        guard !query.isEmpty else { return all }
+        let q = query.lowercased()
+        return all.filter { $0.symbol.lowercased().contains(q)
+            || ($0.reason ?? "").lowercased().contains(q) }
+    }
+
     var body: some View {
-        List {
-            if let err = model.tabErrors[.screener] { ErrorBox(text: err) }
-            Section {
-                header
-            }
-            Section("Ranked by momentum score — tap to analyze") {
-                ForEach(Array((payload?.rows ?? []).enumerated()), id: \.element.id) { i, row in
-                    Button { model.analyze(row.symbol) } label: {
-                        ScreenRowView(rank: i + 1, row: row)
-                    }
-                    .buttonStyle(.plain)
+        Group {
+            if payload == nil, model.loadingTabs.contains(.screener) {
+                LoadingScreen(title: "Screening…",
+                              detail: "multi-timeframe momentum over held + picks + universe")
+                    .background(DS.bg)
+            } else {
+                Screen(title: "Screener", subtitle: AppTab.screener.blurb,
+                       refresh: { await model.load(.screener) }) {
+                    if let err = model.tabErrors[.screener] { ErrorBox(text: err) }
+                    header
+                    tableCard
                 }
             }
         }
-        .refreshable { await model.load(.screener) }
         .task { if payload == nil { await model.load(.screener) } }
-        .overlay {
-            if payload == nil, model.loadingTabs.contains(.screener) {
-                ContentUnavailableView("Screening…", systemImage: "line.3.horizontal.decrease.circle")
-            }
-        }
     }
 
     private var header: some View {
-        GroupBox {
-            VStack(alignment: .leading, spacing: 8) {
-                HStack {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("The bot's own multi-timeframe momentum screen (momentum_screen.py) over held + picks + watchlist + universe.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                        Text("anchor \(payload?.anchor ?? "1m") · min score \(Fmt.num(payload?.minScore, dp: 0)) · \(Fmt.when(payload?.generatedAt))")
-                            .font(.caption2.monospaced())
-                            .foregroundStyle(.secondary)
-                    }
-                    Spacer()
+        Card {
+            WidthReader(compactBelow: 620) { compact in
+                let left = VStack(alignment: .leading, spacing: 4) {
+                    Text("momentum_screen.py over held + picks + watchlist + universe")
+                        .font(DSFont.body(13)).foregroundStyle(DS.textMuted)
+                    Text("anchor \(payload?.anchor ?? "1m") · min score \(Fmt.num(payload?.minScore, dp: 0)) · \(Fmt.when(payload?.generatedAt))")
+                        .font(DSFont.mono(11)).foregroundStyle(DS.textFaint)
+                }
+                let right = HStack(spacing: DS.s2) {
+                    OrganicField(prompt: "Filter ticker / reason", text: $query, width: 220)
                     Button {
                         Task { await model.rerunScreen() }
                     } label: {
@@ -502,8 +616,33 @@ struct ScreenerView: View {
                             Label("Re-screen", systemImage: "arrow.triangle.2.circlepath")
                         }
                     }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.small)
+                    .buttonStyle(.organicPrimary)
+                }
+                if compact {
+                    VStack(alignment: .leading, spacing: DS.s3) { left; right }
+                } else {
+                    HStack(spacing: DS.s3) { left; Spacer(minLength: DS.s2); right }
+                }
+            }
+        }
+    }
+
+    private var tableCard: some View {
+        Card(padding: DS.s4) {
+            if rows.isEmpty {
+                EmptyNote(text: "No names match.", icon: "line.3.horizontal.decrease")
+            } else {
+                VStack(spacing: 0) {
+                    THeader(columns: ["#", "Ticker", "Score", "Returns", "Matched on", "Price"],
+                            weights: [0.35, 1.4, 1.4, 1.6, 1.6, 1],
+                            alignments: [.leading, .leading, .leading, .trailing,
+                                         .leading, .trailing])
+                    Rectangle().fill(DS.divider).frame(height: 1)
+                    ForEach(Array(rows.enumerated()), id: \.element.id) { i, row in
+                        ScreenRowView(rank: i + 1, row: row, isLast: i == rows.count - 1)
+                            .contentShape(Rectangle())
+                            .onTapGesture { model.analyze(row.symbol) }
+                    }
                 }
             }
         }
@@ -513,57 +652,54 @@ struct ScreenerView: View {
 struct ScreenRowView: View {
     let rank: Int
     let row: ScreenRow
+    let isLast: Bool
 
     var body: some View {
-        HStack(spacing: 10) {
-            Text("#\(rank)")
-                .font(.caption.bold().monospacedDigit())
-                .foregroundStyle(.secondary)
-                .frame(width: 28, alignment: .trailing)
-            VStack(alignment: .leading, spacing: 3) {
+        TRow(showsDivider: !isLast) {
+            TCell(weight: 0.35) {
+                Text("\(rank)")
+                    .font(DSFont.num(12, .bold))
+                    .foregroundStyle(DS.textFaint)
+            }
+            TCell(weight: 1.4) {
                 HStack(spacing: 6) {
-                    Text(row.symbol).font(.headline.monospaced())
+                    Text(row.symbol).font(DSFont.bold(14)).foregroundStyle(DS.text)
                     if row.qualified == true {
-                        Label("QUALIFIED", systemImage: "checkmark.seal.fill")
-                            .font(.caption2.bold())
-                            .foregroundStyle(Color.up)
-                            .labelStyle(.titleAndIcon)
+                        Tag("QUALIFIED", tone: .up, size: 9, icon: "checkmark.seal.fill")
                     }
-                    if row.held == true { chip("HELD", .up) }
-                    if row.pick == true { chip("PICK", .accentColor) }
+                    if row.held == true { Tag("HELD", tone: .sage, size: 9) }
+                    if row.pick == true { Tag("PICK", tone: .accent, size: 9) }
                 }
+            }
+            TCell(weight: 1.4) {
                 HStack(spacing: 8) {
-                    Gauge(value: min(max(row.score ?? 0, 0), 100), in: 0...100) { EmptyView() }
-                        .gaugeStyle(.accessoryLinearCapacity)
-                        .tint(row.qualified == true ? Color.up : Color.secondary)
+                    MeterBar(value: min(max(row.score ?? 0, 0), 100) / 100,
+                             tint: row.qualified == true ? DS.accent2 : DS.neutral(5))
                         .frame(width: 90)
                     Text(Fmt.num(row.score, dp: 0))
-                        .font(.caption.bold().monospacedDigit())
-                    if row.qualified != true {
-                        Text(row.reason ?? "")
-                            .font(.caption2.monospaced())
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                    }
+                        .font(DSFont.num(13, .bold)).foregroundStyle(DS.text)
                 }
             }
-            Spacer()
-            ReturnsPills(returns: row.returns)
-            VStack(alignment: .trailing, spacing: 1) {
-                Text(Fmt.usd(row.lastPrice)).font(.callout.monospacedDigit())
-                Text(Fmt.pct(row.changePct))
-                    .font(.caption2.monospacedDigit())
-                    .foregroundStyle((row.changePct ?? 0).pnlColor)
+            TCell(align: .trailing, weight: 1.6) {
+                ReturnsPills(returns: row.returns)
+            }
+            TCell(weight: 1.6) {
+                Text(row.qualified == true
+                     ? "clears anchor + score gates"
+                     : (row.reason ?? row.affordableReason ?? "—"))
+                    .font(DSFont.body(12))
+                    .foregroundStyle(DS.textMuted)
+                    .lineLimit(2)
+            }
+            TCell(align: .trailing) {
+                VStack(alignment: .trailing, spacing: 2) {
+                    Text(Fmt.usd(row.lastPrice)).font(DSFont.num(13, .semibold))
+                        .foregroundStyle(DS.text)
+                    Text(Fmt.pct(row.changePct))
+                        .font(DSFont.num(11))
+                        .foregroundStyle(row.changePct.pnlColor)
+                }
             }
         }
-        .padding(.vertical, 2)
-        .contentShape(Rectangle())
-    }
-
-    private func chip(_ text: String, _ color: Color) -> some View {
-        Text(text).font(.caption2.bold())
-            .padding(.horizontal, 5).padding(.vertical, 1)
-            .background(color.opacity(0.15), in: Capsule())
-            .foregroundStyle(color)
     }
 }

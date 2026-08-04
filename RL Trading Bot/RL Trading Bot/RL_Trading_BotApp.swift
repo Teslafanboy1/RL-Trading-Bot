@@ -13,12 +13,16 @@ struct RL_Trading_BotApp: App {
         WindowGroup {
             ContentView()
                 .environment(model)
+                .tint(DS.accent)
                 #if os(macOS)
-                .frame(minWidth: 720, minHeight: 520)
+                .frame(minWidth: 900, minHeight: 560)
                 #endif
         }
         #if os(macOS)
-        .defaultSize(width: 1240, height: 800)
+        // no header bar above the sidebar — the design's shell starts at the
+        // very top of the window, with the traffic lights overlaid
+        .windowStyle(.hiddenTitleBar)
+        .defaultSize(width: 1320, height: 860)
         .commands {
             CommandGroup(after: .toolbar) {
                 Button("Refresh") { Task { await model.refreshTick() } }

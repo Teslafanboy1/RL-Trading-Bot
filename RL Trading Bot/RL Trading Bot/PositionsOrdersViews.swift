@@ -1,11 +1,10 @@
 //
-//  PositionsOrdersViews.swift — deep position manager (stops, giveback,
+//  PositionsOrdersViews.swift — the deep position manager (stops, giveback,
 //  per-position actions) and the order center (working orders, history,
 //  cancel, journal).
 //
 
 import SwiftUI
-import Charts
 
 // MARK: - Positions
 
@@ -18,37 +17,67 @@ struct PositionsView: View {
     private var positions: [Position] { model.overview?.positions ?? [] }
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 14) {
-                if let err = model.tabErrors[.positions] { ErrorBox(text: err) }
-                if let err = actionError { ErrorBox(text: err) }
-                statStrip
-                if positions.isEmpty {
-                    ContentUnavailableView("No open positions",
-                                           systemImage: "tray",
-                                           description: Text("The bot is flat — nothing held right now."))
-                        .frame(maxWidth: .infinity)
-                } else {
+        Screen(title: "Positions",
+               subtitle: positions.isEmpty
+                    ? "The bot is flat — nothing held right now."
+                    : "\(positions.count) open positions · click a row for the agent's thesis",
+               refresh: { await model.load(.positions) }) {
+            if let err = model.tabErrors[.positions] { ErrorBox(text: err) }
+            if let err = actionError { ErrorBox(text: err) }
+            statTiles
+            tableCard
+        }
+        .task { if model.overview == nil { await model.load(.positions) } }
+        .sheet(item: $overrideRow) { row in StopOverrideSheet(row: row) }
+    }
+
+    private var statTiles: some View {
+        let value = positions.reduce(0.0) { $0 + (($1.price ?? 0) * ($1.shares ?? 0)) }
+        let unreal = positions.compactMap(\.unrealizedPnl).reduce(0, +)
+        let day = model.overview?.dayPnlPositions
+        let cash = model.overview?.account?.cash
+        return StatRow {
+            StatCard(label: "Positions", value: "\(positions.count)",
+                     sublabel: "held at the broker")
+            StatCard(label: "Market value", value: Fmt.usd(value),
+                     sublabel: "at last quote")
+            StatCard(label: "Day P&L", value: Fmt.usdSigned(day),
+                     deltaTone: .forValue(day), sublabel: "open positions only")
+            StatCard(label: "Unrealized", value: Fmt.usdSigned(unreal),
+                     deltaTone: .forValue(unreal),
+                     sublabel: "settled cash \(Fmt.usd(cash))")
+        }
+    }
+
+    private var tableCard: some View {
+        Card(padding: DS.s4) {
+            if positions.isEmpty {
+                EmptyNote(text: "No open positions — the bot is flat.", icon: "tray")
+            } else {
+                VStack(spacing: 0) {
+                    THeader(columns: ["Ticker", "Qty", "Avg price", "Current",
+                                      "Market value", "P&L", "Signal"],
+                            weights: [1.4, 1, 1, 1, 1, 1, 1.2],
+                            alignments: [.leading, .trailing, .trailing, .trailing,
+                                         .trailing, .trailing, .trailing])
+                    Rectangle().fill(DS.divider).frame(height: 1)
                     ForEach(positions, id: \.stableId) { pos in
-                        PositionManagerCard(
+                        PositionTableRow(
                             position: pos,
                             riskRow: riskRow(for: pos.symbol),
                             isExpanded: expanded.contains(pos.stableId),
+                            isLast: pos.stableId == positions.last?.stableId,
                             toggle: {
                                 if expanded.contains(pos.stableId) { expanded.remove(pos.stableId) }
                                 else { expanded.insert(pos.stableId) }
                             },
-                            editStops: { overrideRow = riskRow(for: pos.symbol) ?? syntheticRiskRow(pos) },
+                            editStops: {
+                                overrideRow = riskRow(for: pos.symbol) ?? syntheticRiskRow(pos)
+                            },
                             onError: { actionError = $0 })
                     }
                 }
             }
-            .padding()
-        }
-        .refreshable { await model.load(.positions) }
-        .task { if model.overview == nil { await model.load(.positions) } }
-        .sheet(item: $overrideRow) { row in
-            StopOverrideSheet(row: row)
         }
     }
 
@@ -65,139 +94,132 @@ struct PositionsView: View {
                 distStopPct: nil, distTrailPct: nil,
                 override_: p.stop?.override_, watchdogStop: nil)
     }
-
-    private var statStrip: some View {
-        let value = positions.reduce(0.0) { $0 + (($1.price ?? 0) * ($1.shares ?? 0)) }
-        let unreal = positions.compactMap(\.unrealizedPnl).reduce(0, +)
-        let day = model.overview?.dayPnlPositions
-        let cash = model.overview?.account?.cash
-        return GroupBox {
-            WidthReader(compactBelow: 620) { compact in
-                let cols = [GridItem(.adaptive(minimum: compact ? 130 : 150), spacing: 12)]
-                LazyVGrid(columns: cols, alignment: .leading, spacing: 10) {
-                    stat("Positions", "\(positions.count)")
-                    stat("Market value", Fmt.usd(value))
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Day P&L").font(.caption).foregroundStyle(.secondary)
-                        PnLText(value: day, font: .headline)
-                    }
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Unrealized").font(.caption).foregroundStyle(.secondary)
-                        PnLText(value: unreal, font: .headline)
-                    }
-                    stat("Settled cash", Fmt.usd(cash))
-                }
-            }
-        }
-    }
-
-    private func stat(_ key: String, _ value: String) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(key).font(.caption).foregroundStyle(.secondary)
-            Text(value).font(.headline.monospacedDigit())
-        }
-    }
 }
 
-struct PositionManagerCard: View {
+struct PositionTableRow: View {
     @Environment(AppModel.self) private var model
     let position: Position
     let riskRow: RiskRow?
     let isExpanded: Bool
+    let isLast: Bool
     let toggle: () -> Void
     let editStops: () -> Void
     let onError: (String?) -> Void
 
     var body: some View {
-        let p = position
-        GroupBox {
-            VStack(alignment: .leading, spacing: 10) {
-                headerRow
-                if isExpanded {
-                    Divider()
-                    detailGrid
-                    if let thesis = p.thesis, !thesis.isEmpty {
-                        Text(thesis)
-                            .font(.callout)
-                            .foregroundStyle(.secondary)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                    actionRow
-                }
+        VStack(spacing: 0) {
+            summaryRow
+            if isExpanded { detail }
+            if !isLast || isExpanded {
+                Rectangle().fill(DS.divider).frame(height: 1)
             }
         }
     }
 
-    private var headerRow: some View {
+    private var summaryRow: some View {
         let p = position
-        return HStack(spacing: 10) {
-            Button(action: toggle) {
-                Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
-                    .font(.caption.bold())
-                    .foregroundStyle(.secondary)
-                    .frame(width: 16)
+        return WeightedRow {
+            TCell(weight: 1.4) {
+                HStack(spacing: 8) {
+                    Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundStyle(DS.textFaint)
+                        .frame(width: 12)
+                    Text(p.symbol).font(DSFont.bold(14)).foregroundStyle(DS.text)
+                    if p.dnt == true { Tag("DNT", tone: .caution, size: 9) }
+                    if p.locked == true { Tag("LOCKED", tone: .caution, size: 9) }
+                    if p.adopted == true { Tag("ADOPTED", tone: .neutral, size: 9) }
+                }
             }
-            .buttonStyle(.plain)
-            VStack(alignment: .leading, spacing: 2) {
+            TCell(align: .trailing) {
+                Text(Fmt.num(p.shares, dp: 4)).font(DSFont.num(13)).foregroundStyle(DS.text)
+            }
+            TCell(align: .trailing) {
+                Text(Fmt.usd(p.entryPrice)).font(DSFont.num(13)).foregroundStyle(DS.text)
+            }
+            TCell(align: .trailing) {
+                Text(Fmt.usd(p.price)).font(DSFont.num(13)).foregroundStyle(DS.text)
+            }
+            TCell(align: .trailing) {
+                Text(Fmt.usd((p.price ?? 0) * (p.shares ?? 0)))
+                    .font(DSFont.num(13, .semibold)).foregroundStyle(DS.text)
+            }
+            TCell(align: .trailing) {
+                PnLPair(dollars: p.unrealizedPnl, pct: p.unrealizedPct)
+            }
+            TCell(align: .trailing, weight: 1.2) {
                 HStack(spacing: 6) {
-                    Text(p.symbol).font(.headline.monospaced())
+                    Sparkline(points: p.spark ?? [], width: 56, height: 20)
                     RibbonBadge(state: p.emaState)
-                    if p.dnt == true { tag("DNT", .down) }
-                    if p.locked == true { tag("LOCKED", .caution) }
-                    if p.adopted == true { tag("ADOPTED", .secondary) }
                 }
-                Text("\(Fmt.num(p.shares, dp: 4)) sh @ \(Fmt.usd(p.entryPrice)) · \(Fmt.when(p.entryDate))")
-                    .font(.caption2.monospaced())
-                    .foregroundStyle(.secondary)
-            }
-            Spacer()
-            Sparkline(points: p.spark ?? [])
-            VStack(alignment: .trailing, spacing: 2) {
-                Text(Fmt.usd(p.price)).font(.headline.monospacedDigit())
-                PnLText(value: p.unrealizedPnl, pct: p.unrealizedPct, font: .caption)
             }
         }
+        .padding(.vertical, 12)
+        .contentShape(Rectangle())
+        .onTapGesture(perform: toggle)
     }
 
-    private var detailGrid: some View {
+    private var detail: some View {
         let p = position
         let peak = p.peakPrice ?? p.entryPrice ?? 0
         let giveback = (peak > 0 && p.price != nil)
             ? max(0, (peak - p.price!) / peak * 100) : nil
-        return WidthReader(compactBelow: 560) { compact in
-            let cols = [GridItem(.adaptive(minimum: compact ? 140 : 165), spacing: 10)]
-            LazyVGrid(columns: cols, alignment: .leading, spacing: 8) {
-                kv("Day P&L", Fmt.usdSigned(p.dayPnl), (p.dayPnl ?? 0).pnlColor)
-                kv("Peak", Fmt.usd(p.peakPrice))
-                kv("Giveback off peak", giveback.map { Fmt.pct($0, dp: 1, signed: false) } ?? "—",
-                   (giveback ?? 0) > 15 ? .caution : .primary)
-                kv("Hard stop", Fmt.usd(p.stop?.stopPrice), .down)
-                kv("Trailing stop", Fmt.usd(p.stop?.trailPrice), .caution)
-                kv("Dist. to stop",
-                   riskRow?.distStopPct.map { Fmt.pct($0, dp: 1, signed: false) } ?? "—")
-                kv("Dist. to trail",
-                   riskRow?.distTrailPct.map { Fmt.pct($0, dp: 1, signed: false) } ?? "—")
-                kv("Confidence", p.confidence.map { "\($0)/100" } ?? "—")
-                kv("Signal", "\(p.emaState ?? "—") / \(p.emaTransition ?? "—")")
+        return VStack(alignment: .leading, spacing: DS.s3) {
+            WidthReader(compactBelow: 620) { compact in
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: compact ? 130 : 155),
+                                             spacing: DS.s3)],
+                          alignment: .leading, spacing: DS.s3) {
+                    MicroStat(key: "Opened", value: Fmt.when(p.entryDate))
+                    MicroStat(key: "Day P&L", value: Fmt.usdSigned(p.dayPnl),
+                              color: p.dayPnl.pnlColor)
+                    MicroStat(key: "Peak", value: Fmt.usd(p.peakPrice))
+                    MicroStat(key: "Giveback off peak",
+                              value: giveback.map { Fmt.pct($0, dp: 1, signed: false) } ?? "—",
+                              color: (giveback ?? 0) > 15 ? DS.caution : nil)
+                    MicroStat(key: "Hard stop", value: Fmt.usd(p.stop?.stopPrice), color: DS.down)
+                    MicroStat(key: "Trailing stop", value: Fmt.usd(p.stop?.trailPrice),
+                              color: DS.caution)
+                    MicroStat(key: "Dist. to stop",
+                              value: riskRow?.distStopPct.map { Fmt.pct($0, dp: 1, signed: false) } ?? "—")
+                    MicroStat(key: "Dist. to trail",
+                              value: riskRow?.distTrailPct.map { Fmt.pct($0, dp: 1, signed: false) } ?? "—")
+                    MicroStat(key: "Confidence", value: p.confidence.map { "\($0)/100" } ?? "—")
+                    MicroStat(key: "Signal",
+                              value: "\(p.emaState ?? "—") / \(p.emaTransition ?? "—")")
+                }
             }
+            if let thesis = p.thesis, !thesis.isEmpty {
+                Text(thesis)
+                    .font(DSFont.body(13))
+                    .foregroundStyle(DS.textMuted)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            actionRow
         }
+        .padding(DS.s4)
+        .background(DS.neutral(1),
+                    in: RoundedRectangle(cornerRadius: DS.rMd, style: .continuous))
+        .padding(.bottom, DS.s3)
     }
 
     private var actionRow: some View {
         let p = position
-        return HStack(spacing: 8) {
+        return LazyVGrid(columns: [GridItem(.adaptive(minimum: 118), spacing: DS.s2)],
+                         spacing: DS.s2) {
             Button {
                 model.orderPrefill = .init(symbol: p.symbol, side: "buy")
                 model.showOrderSheet = true
-            } label: { Label("Buy", systemImage: "plus.circle") }
+            } label: { Label("Buy", systemImage: "plus.circle").frame(maxWidth: .infinity) }
+                .buttonStyle(SoftButtonStyle(tint: DS.up, size: 12))
             Button {
-                model.orderPrefill = .init(symbol: p.symbol, side: "sell",
-                                           quantity: p.shares)
+                model.orderPrefill = .init(symbol: p.symbol, side: "sell", quantity: p.shares)
                 model.showOrderSheet = true
-            } label: { Label("Sell", systemImage: "minus.circle") }
-            Button {
-                editStops()
-            } label: { Label("Stops", systemImage: "shield.lefthalf.filled") }
+            } label: { Label("Sell", systemImage: "minus.circle").frame(maxWidth: .infinity) }
+                .buttonStyle(SoftButtonStyle(tint: DS.down, size: 12))
+            Button(action: editStops) {
+                Label("Stops", systemImage: "shield.lefthalf.filled").frame(maxWidth: .infinity)
+            }
+            .buttonStyle(SoftButtonStyle(tint: DS.caution, size: 12))
             Button {
                 let blocking = p.dnt != true
                 model.requireArm {
@@ -206,28 +228,15 @@ struct PositionManagerCard: View {
             } label: {
                 Label(p.dnt == true ? "Allow buys" : "Block buys",
                       systemImage: p.dnt == true ? "checkmark.circle" : "nosign")
+                    .frame(maxWidth: .infinity)
             }
-            Spacer()
-            Button {
-                model.analyze(p.symbol)
-            } label: { Label("Analyze", systemImage: "waveform.and.magnifyingglass") }
+            .buttonStyle(SoftButtonStyle(tint: DS.text, size: 12))
+            Button { model.analyze(p.symbol) } label: {
+                Label("Analyze", systemImage: "waveform.and.magnifyingglass")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(SoftButtonStyle(tint: DS.accent, size: 12))
         }
-        .buttonStyle(.bordered)
-        .controlSize(.small)
-    }
-
-    private func kv(_ key: String, _ value: String, _ color: Color = .primary) -> some View {
-        VStack(alignment: .leading, spacing: 1) {
-            Text(key).font(.caption2).foregroundStyle(.secondary)
-            Text(value).font(.callout.monospacedDigit()).foregroundStyle(color)
-        }
-    }
-
-    private func tag(_ text: String, _ color: Color) -> some View {
-        Text(text).font(.caption2.bold())
-            .padding(.horizontal, 5).padding(.vertical, 1)
-            .background(color.opacity(0.15), in: Capsule())
-            .foregroundStyle(color)
     }
 }
 
@@ -237,69 +246,50 @@ struct OrdersView: View {
     @Environment(AppModel.self) private var model
     @State private var cancelTarget: BrokerOrder?
     @State private var actionError: String?
+    @State private var filter: OrderFilter = .all
+
+    enum OrderFilter: String, Hashable, CaseIterable {
+        case all = "All", working = "Working", filled = "Filled", cancelled = "Cancelled"
+    }
 
     private var payload: OrdersPayload? { model.ordersPayload }
 
     private static let terminal: Set<String> = ["filled", "cancelled", "canceled",
                                                 "rejected", "failed", "expired"]
 
-    private var working: [BrokerOrder] {
-        (payload?.today ?? []).filter {
-            !Self.terminal.contains(($0.state ?? "").lowercased())
-        }
+    private var allOrders: [BrokerOrder] {
+        (payload?.today ?? []) + (model.orderHistoryDays > 1 ? (payload?.history ?? []) : [])
     }
-    private var doneToday: [BrokerOrder] {
-        (payload?.today ?? []).filter {
-            Self.terminal.contains(($0.state ?? "").lowercased())
+
+    private var visible: [BrokerOrder] {
+        allOrders.filter { o in
+            let s = (o.state ?? "").lowercased()
+            switch filter {
+            case .all: return true
+            case .working: return !Self.terminal.contains(s)
+            case .filled: return s == "filled"
+            case .cancelled: return ["cancelled", "canceled", "rejected", "failed",
+                                     "expired"].contains(s)
+            }
         }
     }
 
+    private var workingCount: Int {
+        allOrders.filter { !Self.terminal.contains(($0.state ?? "").lowercased()) }.count
+    }
+
     var body: some View {
-        @Bindable var model = model
-        List {
+        Screen(title: "Orders",
+               subtitle: "\(workingCount) working · \(allOrders.count) in view · cancel needs an armed session",
+               refresh: { await model.load(.orders) }) {
             if let err = model.tabErrors[.orders] { ErrorBox(text: err) }
             if let err = actionError { ErrorBox(text: err) }
-            Section {
-                headerCard
-            }
-            Section("Working orders (\(working.count))") {
-                if working.isEmpty {
-                    Text("No working orders.").foregroundStyle(.secondary).font(.callout)
-                }
-                ForEach(working, id: \.stableId) { o in
-                    OrderRow(order: o) { cancelTarget = o }
-                }
-            }
-            Section("Executed / terminal today (\(doneToday.count))") {
-                if doneToday.isEmpty {
-                    Text("Nothing filled today.").foregroundStyle(.secondary).font(.callout)
-                }
-                ForEach(doneToday, id: \.stableId) { o in
-                    OrderRow(order: o, cancel: nil)
-                }
-            }
-            if model.orderHistoryDays > 1 {
-                Section("History — last \(model.orderHistoryDays) days") {
-                    if let err = payload?.historyError {
-                        WarningBox(text: err)
-                    } else if let hist = payload?.history {
-                        ForEach(hist, id: \.stableId) { o in
-                            OrderRow(order: o, cancel: nil)
-                        }
-                    } else {
-                        Text("Loading…").foregroundStyle(.secondary)
-                    }
-                }
-            }
-            if let journal = payload?.journal, !journal.isEmpty {
-                Section("Dashboard order journal") {
-                    ForEach(Array(journal.enumerated()), id: \.offset) { _, a in
-                        JournalRow(action: a)
-                    }
-                }
-            }
+            headerCard
+            FilterPills(options: OrderFilter.allCases.map { ($0, $0.rawValue) },
+                        selection: $filter)
+            tableCard
+            journalCard
         }
-        .refreshable { await model.load(.orders) }
         .task { if payload == nil { await model.load(.orders) } }
         .confirmationDialog("Cancel this order?", isPresented: .init(
             get: { cancelTarget != nil },
@@ -320,114 +310,160 @@ struct OrdersView: View {
 
     private var headerCard: some View {
         @Bindable var model = model
-        return GroupBox {
-            VStack(alignment: .leading, spacing: 10) {
-                HStack(spacing: 10) {
-                    StatusDot(color: payload?.broker?.mode == "direct-mcp" ? .up : .caution,
-                              label: payload?.broker?.mode ?? "broker?")
-                    Text("updated \(Fmt.when(payload?.updated))")
-                        .font(.caption).foregroundStyle(.secondary)
-                    Spacer()
-                    Button {
-                        Task { actionError = await model.brokerRefresh(); await model.load(.orders) }
-                    } label: { Label("Refresh", systemImage: "arrow.clockwise") }
-                        .controlSize(.small)
-                    Button {
-                        model.orderPrefill = .init()
-                        model.showOrderSheet = true
-                    } label: { Label("New order", systemImage: "plus.circle.fill") }
-                        .buttonStyle(.borderedProminent)
-                        .controlSize(.small)
+        return Card {
+            VStack(alignment: .leading, spacing: DS.s3) {
+                WidthReader(compactBelow: 620) { compact in
+                    let status = HStack(spacing: DS.s2) {
+                        StatusDot(color: payload?.broker?.mode == "direct-mcp" ? DS.up : DS.caution,
+                                  label: payload?.broker?.mode ?? "broker?")
+                        Text("updated \(Fmt.when(payload?.updated))")
+                            .font(DSFont.body(12)).foregroundStyle(DS.textMuted)
+                            .lineLimit(1)
+                    }
+                    let actions = HStack(spacing: DS.s2) {
+                        Button {
+                            Task {
+                                actionError = await model.brokerRefresh()
+                                await model.load(.orders)
+                            }
+                        } label: { Label("Refresh", systemImage: "arrow.clockwise") }
+                            .buttonStyle(.organicSoft)
+                        Button {
+                            model.orderPrefill = .init()
+                            model.showOrderSheet = true
+                        } label: { Label("New order", systemImage: "plus.circle.fill") }
+                            .buttonStyle(.organicPrimary)
+                    }
+                    if compact {
+                        VStack(alignment: .leading, spacing: DS.s2) { status; actions }
+                    } else {
+                        HStack(spacing: DS.s2) { status; Spacer(minLength: DS.s2); actions }
+                    }
                 }
-                Picker("Lookback", selection: $model.orderHistoryDays) {
-                    Text("Today").tag(1)
-                    Text("7 days").tag(7)
-                    Text("30 days").tag(30)
+                HStack(spacing: DS.s2) {
+                    Text("Lookback").font(DSFont.body(13)).foregroundStyle(DS.textMuted)
+                    FilterPills(options: [(1, "Today"), (7, "7 days"), (30, "30 days")],
+                                selection: $model.orderHistoryDays)
+                        .onChange(of: model.orderHistoryDays) { _, _ in
+                            Task { await model.load(.orders) }
+                        }
                 }
-                .pickerStyle(.segmented)
-                .onChange(of: model.orderHistoryDays) { _, _ in
-                    Task { await model.load(.orders) }
-                }
-                if model.orderHistoryDays > 1 && payload?.broker?.mode != "direct-mcp" {
+                if model.orderHistoryDays > 1, payload?.broker?.mode != "direct-mcp" {
                     Text("Deeper history needs the direct broker connection (rh_login) — the claude-cli path only snapshots today.")
-                        .font(.caption2).foregroundStyle(.secondary)
+                        .font(DSFont.body(12)).foregroundStyle(DS.textMuted)
+                }
+                if let err = payload?.historyError { WarningBox(text: err) }
+            }
+        }
+    }
+
+    private var tableCard: some View {
+        Card(padding: DS.s4) {
+            if visible.isEmpty {
+                EmptyNote(text: "No orders match this filter.", icon: "tray")
+            } else {
+                VStack(spacing: 0) {
+                    THeader(columns: ["Order", "Ticker", "Side", "Type", "Qty",
+                                      "Price", "Status", "Time"],
+                            weights: [1.2, 1, 1, 1, 1, 1, 1, 1.4],
+                            alignments: [.leading, .leading, .leading, .leading,
+                                         .trailing, .trailing, .trailing, .trailing])
+                    Rectangle().fill(DS.divider).frame(height: 1)
+                    ForEach(visible, id: \.stableId) { o in
+                        orderRow(o, isLast: o.stableId == visible.last?.stableId)
+                    }
                 }
             }
         }
     }
-}
 
-struct OrderRow: View {
-    let order: BrokerOrder
-    var cancel: (() -> Void)?
-
-    var body: some View {
-        let o = order
+    private func orderRow(_ o: BrokerOrder, isLast: Bool) -> some View {
         let side = (o.side ?? "").lowercased()
-        HStack(spacing: 10) {
-            Image(systemName: side == "buy" ? "arrow.down.circle.fill" : "arrow.up.circle.fill")
-                .foregroundStyle(side == "buy" ? Color.up : Color.down)
-            VStack(alignment: .leading, spacing: 2) {
+        let cancellable = !Self.terminal.contains((o.state ?? "").lowercased())
+        return TRow(showsDivider: !isLast) {
+            TCell(weight: 1.2) {
+                Text(String((o.id ?? "—").prefix(10)))
+                    .font(DSFont.mono(11)).foregroundStyle(DS.textFaint).lineLimit(1)
+            }
+            TCell {
+                Text(o.symbol ?? "—").font(DSFont.bold(14)).foregroundStyle(DS.text)
+            }
+            TCell {
+                Text(side.uppercased())
+                    .font(DSFont.semibold(12))
+                    .foregroundStyle(side == "buy" ? DS.up : DS.down)
+            }
+            TCell {
+                Text(o.type ?? "—").font(DSFont.body(12)).foregroundStyle(DS.textMuted)
+                    .lineLimit(1)
+            }
+            TCell(align: .trailing) {
+                Text(o.quantity != nil ? Fmt.num(o.quantity, dp: 5) : Fmt.usd(o.notional))
+                    .font(DSFont.num(13)).foregroundStyle(DS.text)
+            }
+            TCell(align: .trailing) {
+                Text(o.price != nil ? Fmt.usd(o.price) : "—")
+                    .font(DSFont.num(13)).foregroundStyle(DS.text)
+            }
+            TCell(align: .trailing) {
+                Tag(o.state ?? "—", tone: stateTone(o.state))
+            }
+            TCell(align: .trailing, weight: 1.4) {
                 HStack(spacing: 6) {
-                    Text(o.symbol ?? "—").font(.headline.monospaced())
-                    Text(side.uppercased())
-                        .font(.caption2.bold())
-                        .foregroundStyle(side == "buy" ? Color.up : Color.down)
-                    Text(o.type ?? "").font(.caption2).foregroundStyle(.secondary)
+                    Text(Fmt.when(o.createdAt))
+                        .font(DSFont.num(11)).foregroundStyle(DS.textMuted).lineLimit(1)
+                    if cancellable {
+                        Button { cancelTarget = o } label: {
+                            Image(systemName: "xmark")
+                                .font(.system(size: 10, weight: .bold))
+                        }
+                        .buttonStyle(SoftButtonStyle(tint: DS.down, size: 11))
+                        .help("Cancel this order")
+                    }
                 }
-                Text("\(Fmt.when(o.createdAt)) · id \(String((o.id ?? "—").prefix(12)))")
-                    .font(.caption2.monospaced()).foregroundStyle(.secondary)
-            }
-            Spacer()
-            VStack(alignment: .trailing, spacing: 2) {
-                Text(o.quantity != nil ? "\(Fmt.num(o.quantity, dp: 5)) sh"
-                     : Fmt.usd(o.notional))
-                    .font(.callout.monospacedDigit())
-                Text("\(o.state ?? "—")\(o.price != nil ? " @ \(Fmt.usd(o.price))" : "")")
-                    .font(.caption2.monospaced())
-                    .foregroundStyle(stateColor(o.state))
-            }
-            if let cancel {
-                Button(role: .destructive, action: cancel) {
-                    Image(systemName: "xmark.circle")
-                }
-                .buttonStyle(.bordered).controlSize(.small)
-                .help("Cancel this order")
             }
         }
-        .padding(.vertical, 2)
     }
 
-    private func stateColor(_ s: String?) -> Color {
+    private func stateTone(_ s: String?) -> TagTone {
         switch (s ?? "").lowercased() {
         case "filled": .up
-        case "cancelled", "canceled", "rejected", "failed": .secondary
+        case "cancelled", "canceled", "rejected", "failed", "expired": .neutral
         default: .caution
         }
     }
-}
 
-struct JournalRow: View {
-    let action: ManualAction
-
-    var body: some View {
-        let ok = action.result?["ok"]?.boolValue != false
-        VStack(alignment: .leading, spacing: 2) {
-            HStack(spacing: 6) {
-                Image(systemName: ok ? "checkmark.circle" : "xmark.octagon.fill")
-                    .foregroundStyle(ok ? Color.secondary : Color.down)
-                    .font(.caption)
-                Text(action.action ?? "—").font(.callout.monospaced())
-                Spacer()
-                Text(Fmt.when(action.ts)).font(.caption2).foregroundStyle(.secondary)
-            }
-            if let params = action.params?.objectValue, !params.isEmpty {
-                Text(JSONValue.object(params).compact)
-                    .font(.caption2.monospaced())
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2)
+    @ViewBuilder
+    private var journalCard: some View {
+        let journal = payload?.journal ?? []
+        if !journal.isEmpty {
+            Card("Dashboard order journal",
+                 subtitle: "every action this app took — \u{201C}did I do that, or the bot?\u{201D}") {
+                VStack(spacing: 0) {
+                    ForEach(Array(journal.enumerated()), id: \.offset) { i, a in
+                        let ok = a.result?["ok"]?.boolValue != false
+                        TRow(showsDivider: i < journal.count - 1) {
+                            Image(systemName: ok ? "checkmark.circle" : "xmark.octagon.fill")
+                                .font(.system(size: 12))
+                                .foregroundStyle(ok ? DS.up : DS.down)
+                                .frame(width: 16)
+                            TCell {
+                                Text(a.action ?? "—")
+                                    .font(DSFont.semibold(13)).foregroundStyle(DS.text)
+                            }
+                            TCell(weight: 3) {
+                                Text(a.params?.compact ?? "")
+                                    .font(DSFont.mono(11)).foregroundStyle(DS.textMuted)
+                                    .lineLimit(2)
+                            }
+                            TCell(align: .trailing) {
+                                Text(Fmt.when(a.ts))
+                                    .font(DSFont.num(11)).foregroundStyle(DS.textFaint)
+                            }
+                        }
+                    }
+                }
             }
         }
-        .padding(.vertical, 1)
     }
 }

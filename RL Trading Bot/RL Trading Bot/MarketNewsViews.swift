@@ -1,6 +1,6 @@
 //
 //  MarketNewsViews.swift — market context (indices, watchlist, earnings,
-//  headlines) and the news/sources feed with the accuracy leaderboard.
+//  headlines) and the news feed with the source-accuracy leaderboard.
 //
 
 import SwiftUI
@@ -15,163 +15,168 @@ struct MarketView: View {
     private var m: MarketPayload? { model.marketPayload }
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 14) {
-                if let err = model.tabErrors[.market] { ErrorBox(text: err) }
-                indicesCard
-                watchlistCard
-                earningsCard
-                headlinesCard(m?.generalNews ?? [], title: "Headlines")
+        Group {
+            if m == nil {
+                LoadingScreen(title: "Loading market…", detail: "indices, watchlist, earnings")
+                    .background(DS.bg)
+            } else {
+                Screen(title: "Market", subtitle: AppTab.market.blurb,
+                       refresh: { await model.load(.market) }) {
+                    if let err = model.tabErrors[.market] { ErrorBox(text: err) }
+                    indexTiles
+                    watchlistCard
+                    AdaptivePair(compactBelow: 820) {
+                        earningsCard
+                    } second: {
+                        headlinesCard(m?.generalNews ?? [], title: "Headlines",
+                                      subtitle: "general market tape")
+                    }
+                }
             }
-            .padding()
         }
-        .opacity(m == nil ? 0 : 1)
-        .refreshable { await model.load(.market) }
         .task {
             if m == nil { await model.load(.market) }
-            watchlistText = (m?.watchlistSymbols ?? []).joined(separator: ", ")
+            if watchlistText.isEmpty {
+                watchlistText = (m?.watchlistSymbols ?? []).joined(separator: ", ")
+            }
         }
         .onChange(of: m?.watchlistSymbols) { _, syms in
             if watchlistText.isEmpty { watchlistText = (syms ?? []).joined(separator: ", ") }
         }
-        .overlay {
-            if m == nil { ContentUnavailableView("Loading market…", systemImage: "globe") }
-        }
     }
 
-    private var indicesCard: some View {
-        GroupBox {
-            let cols = [GridItem(.adaptive(minimum: 210), spacing: 12)]
-            LazyVGrid(columns: cols, spacing: 10) {
-                ForEach(m?.indices ?? []) { ix in
-                    VStack(alignment: .leading, spacing: 4) {
-                        HStack {
-                            Text(ix.label ?? ix.symbol).font(.callout.weight(.medium))
-                            Spacer()
-                            VStack(alignment: .trailing, spacing: 0) {
-                                Text(Fmt.num(ix.price)).font(.callout.monospacedDigit())
-                                Text(Fmt.pct(ix.changePct))
-                                    .font(.caption2.monospacedDigit())
-                                    .foregroundStyle((ix.changePct ?? 0).pnlColor)
-                            }
-                        }
-                        Sparkline(points: ix.spark ?? [])
-                            .frame(maxWidth: .infinity, alignment: .leading)
+    private var indexTiles: some View {
+        StatRow(minWidth: 200) {
+            ForEach(m?.indices ?? []) { ix in
+                VStack(alignment: .leading, spacing: 6) {
+                    Text((ix.label ?? ix.symbol).uppercased())
+                        .font(DSFont.semibold(13)).kerning(0.5)
+                        .foregroundStyle(DS.textMuted).lineLimit(1)
+                    Text(ix.price == nil ? "—" : Fmt.num(ix.price))
+                        .font(DSFont.heading(24)).foregroundStyle(DS.text)
+                        .lineLimit(1).minimumScaleFactor(0.6)
+                    HStack {
+                        Text(Fmt.pct(ix.changePct))
+                            .font(DSFont.num(14, .semibold))
+                            .foregroundStyle(ix.changePct.pnlColor)
+                        Spacer()
+                        Sparkline(points: ix.spark ?? [], width: 70, height: 22)
                     }
-                    .padding(8)
-                    .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 8))
                 }
+                .frame(maxWidth: .infinity, minHeight: 118, alignment: .topLeading)
+                .padding(DS.s4)
+                .background(DS.surface,
+                            in: RoundedRectangle(cornerRadius: DS.rCard, style: .continuous))
+                .shadow(color: DS.shadowColor, radius: DS.shadowRadius, y: DS.shadowY)
             }
-        } label: { Label("Indices", systemImage: "chart.xyaxis.line") }
+        }
     }
 
     private var watchlistCard: some View {
-        GroupBox {
-            HStack {
-                TextField("SPY, QQQ, NVDA…", text: $watchlistText)
-                    .font(.callout.monospaced())
-                    #if !os(macOS)
-                    .textInputAutocapitalization(.characters)
-                    .autocorrectionDisabled()
-                    #endif
-                Button("Save") {
-                    let syms = watchlistText.split(separator: ",")
-                        .map { $0.trimmingCharacters(in: .whitespaces).uppercased() }
-                        .filter { !$0.isEmpty }
-                    Task { saveError = await model.saveWatchlist(syms) }
+        Card("My watchlist", subtitle: "the symbols the bot polls every cycle") {
+            VStack(alignment: .leading, spacing: DS.s3) {
+                HStack(spacing: DS.s2) {
+                    OrganicField(prompt: "SPY, QQQ, NVDA…", text: $watchlistText, mono: true)
+                    Button("Save") {
+                        let syms = watchlistText.split(separator: ",")
+                            .map { $0.trimmingCharacters(in: .whitespaces).uppercased() }
+                            .filter { !$0.isEmpty }
+                        Task { saveError = await model.saveWatchlist(syms) }
+                    }
+                    .buttonStyle(.organicPrimary)
                 }
-                .buttonStyle(.bordered)
-            }
-            if let saveError { ErrorBox(text: saveError) }
-            VStack(spacing: 0) {
-                ForEach(m?.watchlist ?? []) { row in
-                    watchRow(row)
-                        .padding(.vertical, 6)
-                    if row.id != m?.watchlist?.last?.id { Divider() }
-                }
-            }
-        } label: { Label("My watchlist", systemImage: "star.fill") }
-    }
-
-    @ViewBuilder
-    private func watchRow(_ row: WatchRow) -> some View {
-        let symbolBlock = HStack(spacing: 6) {
-            Text(row.symbol).font(.subheadline.bold().monospaced())
-            if row.held == true {
-                Text("held").font(.caption2)
-                    .padding(.horizontal, 5).padding(.vertical, 1)
-                    .background(Color.up.opacity(0.15), in: Capsule())
-                    .foregroundStyle(Color.up)
-            }
-        }
-        let priceBlock = HStack(spacing: 10) {
-            Text(Fmt.usd(row.price)).font(.callout.monospacedDigit())
-            Text(Fmt.pct(row.changePct))
-                .font(.caption.monospacedDigit())
-                .foregroundStyle((row.changePct ?? 0).pnlColor)
-        }
-        let extras = HStack(spacing: 10) {
-            RibbonBadge(state: row.emaState)
-            Sparkline(points: row.spark ?? [])
-            Button("Trade") {
-                model.orderPrefill = .init(symbol: row.symbol, side: "buy")
-                model.showOrderSheet = true
-            }
-            .buttonStyle(.bordered).controlSize(.small)
-        }
-        WidthReader(compactBelow: 560) { compact in
-            if compact {
-                VStack(alignment: .leading, spacing: 6) {
-                    HStack { symbolBlock; Spacer(); priceBlock }
-                    extras
-                }
-            } else {
-                HStack(spacing: 10) {
-                    symbolBlock.frame(minWidth: 90, alignment: .leading)
-                    Spacer(minLength: 8)
-                    priceBlock
-                    extras
+                if let saveError { ErrorBox(text: saveError) }
+                let rows = m?.watchlist ?? []
+                if rows.isEmpty {
+                    EmptyNote(text: "Watchlist is empty.", icon: "star")
+                } else {
+                    VStack(spacing: 0) {
+                        THeader(columns: ["Ticker", "Price", "Change", "Signal", "Trend", ""],
+                                weights: [1.3, 1, 1, 1, 1, 1],
+                                alignments: [.leading, .trailing, .trailing, .trailing,
+                                             .trailing, .trailing])
+                        Rectangle().fill(DS.divider).frame(height: 1)
+                        ForEach(rows) { row in
+                            TRow(showsDivider: row.id != rows.last?.id,
+                                 onTap: { model.analyze(row.symbol) }) {
+                                TCell(weight: 1.3) {
+                                    HStack(spacing: 7) {
+                                        Text(row.symbol).font(DSFont.bold(14))
+                                            .foregroundStyle(DS.text)
+                                        if row.held == true { Tag("held", tone: .up, size: 9) }
+                                    }
+                                }
+                                TCell(align: .trailing) {
+                                    Text(Fmt.usd(row.price)).font(DSFont.num(13))
+                                        .foregroundStyle(DS.text)
+                                }
+                                TCell(align: .trailing) {
+                                    Text(Fmt.pct(row.changePct))
+                                        .font(DSFont.num(13, .semibold))
+                                        .foregroundStyle(row.changePct.pnlColor)
+                                }
+                                TCell(align: .trailing) { RibbonBadge(state: row.emaState) }
+                                TCell(align: .trailing) {
+                                    Sparkline(points: row.spark ?? [], width: 70, height: 22)
+                                }
+                                TCell(align: .trailing) {
+                                    Button("Trade") {
+                                        model.orderPrefill = .init(symbol: row.symbol, side: "buy")
+                                        model.showOrderSheet = true
+                                    }
+                                    .buttonStyle(SoftButtonStyle(tint: DS.accent, size: 12))
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
     }
 
     private var earningsCard: some View {
-        GroupBox {
+        Card("Earnings — next 14 days",
+             subtitle: "held names inside the window are blackout candidates") {
             earningsBody
-        } label: { Label("Earnings — next 14 days", systemImage: "calendar") }
+        }
     }
 
     @ViewBuilder
     private var earningsBody: some View {
         let e = m?.earnings
         if let note = e?["unavailable"]?.stringValue {
-            Text(note).font(.caption).foregroundStyle(.secondary)
-                .frame(maxWidth: .infinity, alignment: .leading)
+            EmptyNote(text: note, icon: "calendar")
         } else if let err = e?["error"]?.stringValue {
             WarningBox(text: err)
         } else {
             let items = e?["earnings"]?.arrayValue ?? e?["results"]?.arrayValue
                 ?? e?["calendar"]?.arrayValue ?? e?.arrayValue ?? []
             if items.isEmpty {
-                Text("nothing in the window").font(.caption).foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                EmptyNote(text: "Nothing in the window.", icon: "calendar")
             } else {
                 let held = Set(m?.held ?? [])
-                VStack(spacing: 4) {
-                    ForEach(Array(items.prefix(30).enumerated()), id: \.offset) { _, item in
-                        let sym = (item["symbol"]?.stringValue ?? item["ticker"]?.stringValue ?? "").uppercased()
-                        HStack {
-                            Text(sym).font(.callout.bold().monospaced())
-                            if held.contains(sym) {
-                                Text("HELD — blackout?").font(.caption2.bold())
-                                    .foregroundStyle(Color.caution)
+                VStack(spacing: 0) {
+                    ForEach(Array(items.prefix(30).enumerated()), id: \.offset) { i, item in
+                        let sym = (item["symbol"]?.stringValue
+                                   ?? item["ticker"]?.stringValue ?? "").uppercased()
+                        TRow(showsDivider: i < min(items.count, 30) - 1) {
+                            TCell {
+                                HStack(spacing: 7) {
+                                    Text(sym).font(DSFont.bold(13)).foregroundStyle(DS.text)
+                                    if held.contains(sym) {
+                                        Tag("HELD — blackout?", tone: .caution, size: 9)
+                                    }
+                                }
                             }
-                            Spacer()
-                            Text(item["report_date"]?.stringValue ?? item["date"]?.stringValue ?? "—")
-                                .font(.caption.monospaced())
-                            Text(item["timing"]?.stringValue ?? item["time"]?.stringValue ?? "")
-                                .font(.caption2).foregroundStyle(.secondary)
+                            TCell(align: .trailing) {
+                                Text(item["report_date"]?.stringValue
+                                     ?? item["date"]?.stringValue ?? "—")
+                                    .font(DSFont.num(12)).foregroundStyle(DS.text)
+                            }
+                            TCell(align: .trailing) {
+                                Text(item["timing"]?.stringValue ?? item["time"]?.stringValue ?? "")
+                                    .font(DSFont.body(11)).foregroundStyle(DS.textMuted)
+                            }
                         }
                     }
                 }
@@ -187,117 +192,143 @@ struct NewsView: View {
     private var n: NewsPayload? { model.newsPayload }
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 14) {
-                if let err = model.tabErrors[.news] { ErrorBox(text: err) }
-                leaderboardCard
-                verdictsCard
-                citationsCard
-                symbolNewsCards
-                headlinesCard(n?.general ?? [], title: "General market news")
+        Group {
+            if n == nil {
+                LoadingScreen(title: "Loading news…", detail: "headlines, citations, verdicts")
+                    .background(DS.bg)
+            } else {
+                Screen(title: "News", subtitle: AppTab.news.blurb,
+                       refresh: { await model.load(.news) }) {
+                    if let err = model.tabErrors[.news] { ErrorBox(text: err) }
+                    leaderboardCard
+                    AdaptivePair(compactBelow: 860, ratio: 1.3) {
+                        citationsCard
+                    } second: {
+                        verdictsCard
+                    }
+                    ForEach((n?.symbolNews ?? [:]).keys.sorted(), id: \.self) { sym in
+                        headlinesCard(n?.symbolNews?[sym] ?? [],
+                                      title: "Live headlines — \(sym)",
+                                      subtitle: "pulled for a held or watched name")
+                    }
+                    headlinesCard(n?.general ?? [], title: "General market news",
+                                  subtitle: "broad tape the research run reads")
+                }
             }
-            .padding()
         }
-        .opacity(n == nil ? 0 : 1)
-        .refreshable { await model.load(.news) }
         .task { if n == nil { await model.load(.news) } }
-        .overlay {
-            if n == nil { ContentUnavailableView("Loading news…", systemImage: "newspaper") }
-        }
     }
 
     private var leaderboardCard: some View {
-        GroupBox {
-            VStack(spacing: 8) {
-                ForEach(n?.leaderboard ?? []) { row in
-                    HStack(spacing: 10) {
-                        Text(row.source).font(.subheadline.bold().monospaced())
-                            .frame(width: 110, alignment: .leading)
-                        Text(row.weight != nil ? "w \(Fmt.pct((row.weight ?? 0) * 100, dp: 1, signed: false))" : "—")
-                            .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
-                        Gauge(value: row.accuracy ?? 0, in: 0...1) { EmptyView() }
-                            .gaugeStyle(.accessoryLinearCapacity)
-                            .tint((row.accuracy ?? 0) >= 0.5 ? Color.up : Color.down)
-                        Text("\(row.wins ?? 0)W/\(row.losses ?? 0)L")
-                            .font(.caption.monospacedDigit())
-                            .frame(width: 64, alignment: .trailing)
+        Card("Source accuracy leaderboard",
+             subtitle: "these numbers drive the weights the bot actually scores with") {
+            let rows = n?.leaderboard ?? []
+            if rows.isEmpty {
+                EmptyNote(text: "No source data yet — it accrues from postmortems.",
+                          icon: "chart.bar")
+            } else {
+                VStack(spacing: DS.s3) {
+                    ForEach(rows) { row in
+                        VStack(alignment: .leading, spacing: 5) {
+                            HStack {
+                                Text(row.source).font(DSFont.semibold(14))
+                                    .foregroundStyle(DS.text)
+                                Spacer()
+                                Text("\(row.wins ?? 0)W / \(row.losses ?? 0)L")
+                                    .font(DSFont.num(12)).foregroundStyle(DS.textMuted)
+                                Text(row.accuracy.map {
+                                    Fmt.pct($0 * 100, dp: 0, signed: false) } ?? "—")
+                                    .font(DSFont.num(13, .bold))
+                                    .foregroundStyle((row.accuracy ?? 0) >= 0.5 ? DS.up : DS.down)
+                                Tag("w \(Fmt.pct((row.weight ?? 0) * 100, dp: 1, signed: false))",
+                                    tone: .neutral, size: 10)
+                            }
+                            MeterBar(value: row.accuracy ?? 0,
+                                     tint: (row.accuracy ?? 0) >= 0.5 ? DS.accent2 : DS.down)
+                        }
                     }
                 }
             }
-        } label: {
-            Label("Source accuracy leaderboard (drives the bot's weights)",
-                  systemImage: "chart.bar.fill")
         }
     }
 
     @ViewBuilder
     private var verdictsCard: some View {
-        if let verdicts = n?.verdicts, !verdicts.isEmpty {
-            GroupBox {
-                VStack(alignment: .leading, spacing: 8) {
+        let verdicts = n?.verdicts ?? []
+        if !verdicts.isEmpty {
+            Card("Per-trade source verdicts", subtitle: "extracted from each postmortem") {
+                VStack(alignment: .leading, spacing: DS.s3) {
                     ForEach(Array(verdicts.prefix(10).enumerated()), id: \.offset) { _, v in
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text("\(v.file ?? "") \(v.tradeIds?.joined(separator: ",") ?? "")")
-                                .font(.caption.monospaced()).foregroundStyle(.secondary)
-                            HStack(spacing: 5) {
-                                ForEach((v.sources ?? [:]).keys.sorted(), id: \.self) { src in
-                                    let ok = v.sources?[src] == true
-                                    Label(src, systemImage: ok ? "checkmark" : "xmark")
-                                        .font(.caption2.bold())
-                                        .padding(.horizontal, 6).padding(.vertical, 2)
-                                        .background((ok ? Color.up : Color.down).opacity(0.14),
-                                                    in: Capsule())
-                                        .foregroundStyle(ok ? Color.up : Color.down)
-                                }
-                            }
+                        VStack(alignment: .leading, spacing: 5) {
+                            Text("\(v.file ?? "") \(v.tradeIds?.joined(separator: ", ") ?? "")")
+                                .font(DSFont.mono(11)).foregroundStyle(DS.textFaint)
+                            SourceChips(sources: v.sources ?? [:])
                         }
                     }
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
-            } label: {
-                Label("Per-trade source verdicts (from postmortems)", systemImage: "checklist")
             }
         }
     }
 
     private var citationsCard: some View {
-        GroupBox {
-            VStack(alignment: .leading, spacing: 10) {
-                ForEach(Array((n?.citations ?? []).prefix(25).enumerated()), id: \.offset) { _, c in
-                    VStack(alignment: .leading, spacing: 2) {
-                        HStack {
-                            Text(c.symbol ?? "—").font(.subheadline.bold().monospaced())
-                            if let conf = c.confidence {
-                                Text("conf \(conf)").font(.caption.monospaced())
-                                    .foregroundStyle(.secondary)
+        Card("What the bot cited", subtitle: "research + review claims, with their kill-switch") {
+            let cites = Array((n?.citations ?? []).prefix(25))
+            if cites.isEmpty {
+                EmptyNote(text: "No citations parsed yet.", icon: "quote.opening")
+            } else {
+                VStack(spacing: 0) {
+                    ForEach(Array(cites.enumerated()), id: \.offset) { i, c in
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack(spacing: 7) {
+                                Text(c.symbol ?? "—").font(DSFont.bold(14))
+                                    .foregroundStyle(DS.text)
+                                if let conf = c.confidence {
+                                    Tag("conf \(conf)",
+                                        tone: conf >= 75 ? .up : conf >= 60 ? .caution : .neutral,
+                                        size: 10)
+                                }
+                                Spacer()
+                                Text(c.when ?? c.file ?? "")
+                                    .font(DSFont.body(11)).foregroundStyle(DS.textFaint)
+                                    .lineLimit(1)
                             }
-                            Spacer()
-                            Text(c.when ?? c.file ?? "").font(.caption2).foregroundStyle(.tertiary)
+                            if let s = c.sources, !s.isEmpty {
+                                Text("sources: \(s)")
+                                    .font(DSFont.body(12)).foregroundStyle(DS.textMuted)
+                            }
+                            if let note = c.note, !note.isEmpty {
+                                Text(note).font(DSFont.body(13)).foregroundStyle(DS.text)
+                                    .lineLimit(3)
+                            }
+                            if let inv = c.invalidates, !inv.isEmpty {
+                                Label(inv, systemImage: "exclamationmark.triangle.fill")
+                                    .font(DSFont.body(12))
+                                    .foregroundStyle(DS.caution)
+                                    .lineLimit(2)
+                            }
                         }
-                        if let s = c.sources, !s.isEmpty {
-                            Text("sources: \(s)").font(.caption).foregroundStyle(.secondary)
-                        }
-                        if let note = c.note, !note.isEmpty {
-                            Text(note).font(.caption).lineLimit(3)
-                        }
-                        if let inv = c.invalidates, !inv.isEmpty {
-                            Text("invalidates if: \(inv)")
-                                .font(.caption).foregroundStyle(Color.caution).lineLimit(2)
+                        .padding(.vertical, 9)
+                        if i < cites.count - 1 {
+                            Rectangle().fill(DS.divider).frame(height: 1)
                         }
                     }
-                    .padding(.vertical, 2)
                 }
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-        } label: {
-            Label("What the bot cited (research + reviews)", systemImage: "quote.opening")
         }
     }
+}
 
-    @ViewBuilder
-    private var symbolNewsCards: some View {
-        ForEach((n?.symbolNews ?? [:]).keys.sorted(), id: \.self) { sym in
-            headlinesCard(n?.symbolNews?[sym] ?? [], title: "Live headlines — \(sym)")
+/// Wrapping right/wrong chips for a postmortem's source verdicts.
+struct SourceChips: View {
+    let sources: [String: Bool]
+    var body: some View {
+        let items = sources.sorted { $0.key < $1.key }
+        LazyVGrid(columns: [GridItem(.adaptive(minimum: 108), spacing: 6)],
+                  alignment: .leading, spacing: 6) {
+            ForEach(items, id: \.key) { name, ok in
+                Tag(name, tone: ok ? .up : .down, size: 10,
+                    icon: ok ? "checkmark" : "xmark")
+            }
         }
     }
 }
@@ -305,24 +336,42 @@ struct NewsView: View {
 // MARK: - shared headline list
 
 @ViewBuilder
-func headlinesCard(_ items: [Headline], title: String) -> some View {
+func headlinesCard(_ items: [Headline], title: String, subtitle: String) -> some View {
     if !items.isEmpty {
-        GroupBox {
-            VStack(alignment: .leading, spacing: 6) {
-                ForEach(Array(items.prefix(15).enumerated()), id: \.offset) { _, h in
-                    HStack(alignment: .firstTextBaseline) {
+        Card(title, subtitle: subtitle) {
+            VStack(spacing: 0) {
+                ForEach(Array(items.prefix(15).enumerated()), id: \.offset) { i, h in
+                    VStack(alignment: .leading, spacing: 4) {
                         if let link = h.link, let url = URL(string: link) {
-                            Link(h.title ?? link, destination: url)
-                                .font(.callout)
+                            Link(destination: url) {
+                                Text(h.title ?? link)
+                                    .font(DSFont.semibold(14))
+                                    .foregroundStyle(DS.text)
+                                    .multilineTextAlignment(.leading)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                            .buttonStyle(.plain)
                         } else {
-                            Text(h.title ?? "").font(.callout)
+                            Text(h.title ?? "")
+                                .font(DSFont.semibold(14))
+                                .foregroundStyle(DS.text)
+                                .frame(maxWidth: .infinity, alignment: .leading)
                         }
-                        Spacer()
-                        Text(h.source ?? "").font(.caption2).foregroundStyle(.tertiary)
+                        HStack(spacing: 8) {
+                            if let src = h.source, !src.isEmpty {
+                                Tag(src, tone: .neutral, size: 10)
+                            }
+                            if let pub = h.published, !pub.isEmpty {
+                                Text(pub).font(DSFont.body(11)).foregroundStyle(DS.textFaint)
+                            }
+                        }
+                    }
+                    .padding(.vertical, 9)
+                    if i < min(items.count, 15) - 1 {
+                        Rectangle().fill(DS.divider).frame(height: 1)
                     }
                 }
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-        } label: { Label(title, systemImage: "newspaper") }
+        }
     }
 }

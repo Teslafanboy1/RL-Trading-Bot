@@ -10,6 +10,16 @@
 		<key>NSAllowsLocalNetworking</key>
 		<true/>
 	</dict>
+	<!-- bundled "Organic" type stack: Caprasimo (headings) + Figtree (body).
+	     Theme.swift also registers them programmatically, so the app still
+	     draws correctly if the copy phase ever flattens the folder. -->
+	<key>ATSApplicationFontsPath</key>
+	<string>.</string>
+	<key>UIAppFonts</key>
+	<array>
+		<string>Caprasimo.ttf</string>
+		<string>Figtree.ttf</string>
+	</array>
 	<key>NSFaceIDUsageDescription</key>
 	<string>Face ID unlocks your saved trading PIN to quickly arm control actions.</string>
 </dict>

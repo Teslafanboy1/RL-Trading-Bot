@@ -1,9 +1,9 @@
 //
-//  Support.swift — JSONValue, formatters, theme, shared UI components.
+//  Support.swift — JSONValue, formatters, and the small markdown renderer.
+//  Visual components live in DesignKit.swift; tokens live in Theme.swift.
 //
 
 import SwiftUI
-import Charts
 
 // MARK: - JSONValue (free-form API payloads: config, earnings, broker review…)
 
@@ -117,6 +117,15 @@ enum Fmt {
         guard let d = date(ts) else { return ts.map { String($0.prefix(16)) } ?? "—" }
         return d.formatted(.dateTime.month(.abbreviated).day().hour().minute())
     }
+    /// Clock-only rendering for log/thinking timestamps (`10:02:14`).
+    static func clock(_ ts: String?) -> String {
+        guard let d = date(ts) else {
+            guard let ts, ts.count >= 19 else { return ts ?? "—" }
+            return String(ts.dropFirst(11).prefix(8))
+        }
+        return d.formatted(.dateTime.hour(.twoDigits(amPM: .omitted)).minute(.twoDigits)
+            .second(.twoDigits))
+    }
     private static let iso: ISO8601DateFormatter = { ISO8601DateFormatter() }()
     private static let isoFrac: ISO8601DateFormatter = {
         let f = ISO8601DateFormatter()
@@ -135,231 +144,36 @@ enum Fmt {
     }()
 }
 
-// MARK: - Theme
+// MARK: - Legacy color aliases (map onto the Organic tokens)
 
 extension Color {
-    static let up = Color.green
-    static let down = Color.red
-    static let caution = Color.orange
+    static let up = DS.up
+    static let down = DS.down
+    static let caution = DS.caution
 }
 
-extension Double {
-    var pnlColor: Color { self > 0 ? .up : self < 0 ? .down : .secondary }
-}
+// MARK: - Markdown-ish renderer for research / postmortem text
 
-// MARK: - Shared components
-
-/// Colored EMA ribbon state badge (BUY / SELL / NEUTRAL / …).
-struct RibbonBadge: View {
-    let state: String?
-    var body: some View {
-        // long diagnostic states (INSUFFICIENT_DATA, ERROR) must not blow up
-        // row layouts — shorten them and keep the full text as a tooltip
-        let raw = state ?? "—"
-        let s: String = switch raw {
-        case "INSUFFICIENT_DATA": "NO DATA"
-        case "ERROR": "ERR"
-        default: raw
-        }
-        let color: Color = raw == "BUY" ? .up : raw == "SELL" ? .down : .secondary
-        Text(s)
-            .font(.caption2.weight(.bold).monospaced())
-            .lineLimit(1)
-            .fixedSize()
-            .padding(.horizontal, 6).padding(.vertical, 2)
-            .background(color.opacity(0.15), in: Capsule())
-            .foregroundStyle(color)
-            .help(raw)
-    }
-}
-
-/// Measures the width actually offered to it and hands `isCompact` to the
-/// content builder. The reliable way to adapt card pairs / dense rows to
-/// window resizing — ViewThatFits can't help here because GroupBoxes and
-/// charts are infinitely compressible, so the wide variant always "fits".
-struct WidthReader<Content: View>: View {
-    var compactBelow: CGFloat
-    @ViewBuilder let content: (_ isCompact: Bool) -> Content
-    @State private var width: CGFloat = .infinity
-
-    var body: some View {
-        content(width < compactBelow)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { width = $0 }
-    }
-}
-
-/// Two cards side by side when there's room, stacked when there isn't.
-struct AdaptivePair<A: View, B: View>: View {
-    var compactBelow: CGFloat = 680
-    @ViewBuilder let first: () -> A
-    @ViewBuilder let second: () -> B
-
-    var body: some View {
-        WidthReader(compactBelow: compactBelow) { compact in
-            if compact {
-                VStack(alignment: .leading, spacing: 14) { first(); second() }
-            } else {
-                HStack(alignment: .top, spacing: 14) {
-                    first().frame(maxWidth: .infinity, alignment: .topLeading)
-                    second().frame(maxWidth: .infinity, alignment: .topLeading)
-                }
-            }
-        }
-    }
-}
-
-struct ConfidenceMeter: View {
-    let confidence: Int?
-    var body: some View {
-        let c = confidence ?? 0
-        let color: Color = c >= 75 ? .up : c >= 60 ? .caution : .down
-        Gauge(value: Double(c), in: 0...100) { EmptyView() }
-            .gaugeStyle(.accessoryLinearCapacity)
-            .tint(color)
-            .scaleEffect(y: 0.7)
-    }
-}
-
-/// P&L text with sign coloring and monospaced digits.
-struct PnLText: View {
-    let value: Double?
-    var pct: Double? = nil
-    var font: Font = .body
-    var body: some View {
-        let str = Fmt.usdSigned(value) + (pct != nil ? " (\(Fmt.pct(pct)))" : "")
-        Text(value == nil ? "—" : str)
-            .font(font.monospacedDigit())
-            .foregroundStyle((value ?? 0).pnlColor)
-    }
-}
-
-struct KeyValueRow: View {
-    let key: String
-    let value: String
-    var valueColor: Color? = nil
-    var body: some View {
-        HStack(alignment: .firstTextBaseline) {
-            Text(key).foregroundStyle(.secondary)
-            Spacer(minLength: 12)
-            Text(value)
-                .font(.body.monospacedDigit())
-                .foregroundStyle(valueColor ?? .primary)
-                .multilineTextAlignment(.trailing)
-        }
-    }
-}
-
-struct WarningBox: View {
-    let text: String
-    var body: some View {
-        Label(text, systemImage: "exclamationmark.triangle.fill")
-            .font(.callout)
-            .foregroundStyle(Color.caution)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(10)
-            .background(Color.caution.opacity(0.1), in: RoundedRectangle(cornerRadius: 8))
-    }
-}
-
-struct ErrorBox: View {
-    let text: String
-    var body: some View {
-        Label(text, systemImage: "xmark.octagon.fill")
-            .font(.callout)
-            .foregroundStyle(Color.down)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(10)
-            .background(Color.down.opacity(0.1), in: RoundedRectangle(cornerRadius: 8))
-    }
-}
-
-/// Press-and-hold confirm button for real-money / bot-control actions.
-struct HoldToConfirmButton: View {
-    let title: String
-    var tint: Color = .down
-    var duration: Double = 1.2
-    let action: () -> Void
-
-    @State private var progress: Double = 0
-    @State private var timer: Timer?
-    @State private var fired = false
-
-    var body: some View {
-        ZStack {
-            RoundedRectangle(cornerRadius: 10)
-                .fill(tint.opacity(0.12))
-            GeometryReader { geo in
-                Rectangle()
-                    .fill(tint.opacity(0.4))
-                    .frame(width: geo.size.width * progress)
-                    .animation(.linear(duration: 0.05), value: progress)
-            }
-            .clipShape(RoundedRectangle(cornerRadius: 10))
-            RoundedRectangle(cornerRadius: 10)
-                .strokeBorder(tint, lineWidth: 1.5)
-            Label(title, systemImage: "hand.tap.fill")
-                .font(.headline)
-                .foregroundStyle(tint)
-                .padding(.vertical, 12)
-        }
-        .frame(height: 48)
-        .contentShape(RoundedRectangle(cornerRadius: 10))
-        .onLongPressGesture(minimumDuration: duration, maximumDistance: 60) {
-            if !fired { fired = true; stop(); progress = 1; action() }
-        } onPressingChanged: { pressing in
-            if pressing {
-                fired = false
-                progress = 0
-                timer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { _ in
-                    MainActor.assumeIsolated {
-                        progress = min(1, progress + 0.05 / duration)
-                    }
-                }
-            } else if !fired {
-                stop(); progress = 0
-            }
-        }
-        .accessibilityHint("Press and hold to confirm")
-    }
-
-    private func stop() { timer?.invalidate(); timer = nil }
-}
-
-/// Tiny inline sparkline via Swift Charts.
-struct Sparkline: View {
-    let points: [Double]
-    var body: some View {
-        if points.count > 1 {
-            let up = (points.last ?? 0) >= (points.first ?? 0)
-            Chart(Array(points.enumerated()), id: \.offset) { item in
-                LineMark(x: .value("i", item.offset), y: .value("v", item.element))
-                    .lineStyle(StrokeStyle(lineWidth: 1.5))
-                    .foregroundStyle(up ? Color.up : Color.down)
-            }
-            .chartXAxis(.hidden)
-            .chartYAxis(.hidden)
-            .chartYScale(domain: (points.min() ?? 0)...(points.max() ?? 1))
-            .frame(width: 84, height: 24)
-        } else {
-            Color.clear.frame(width: 84, height: 24)
-        }
-    }
-}
-
-/// Very small markdown-ish renderer for research/postmortem text.
 struct MarkdownLite: View {
     let text: String
+    var scrolls: Bool = true
+
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 6) {
-                ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
-                    blockView(block)
-                }
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding()
+        if scrolls {
+            ScrollView { stack.padding(DS.s4) }
+        } else {
+            stack
         }
+    }
+
+    private var stack: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
+                blockView(block)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .textSelection(.enabled)
     }
 
     private enum Block { case h(Int, String), li(String), code(String), p(String) }
@@ -390,22 +204,24 @@ struct MarkdownLite: View {
         switch b {
         case .h(let level, let s):
             styled(s)
-                .font(level == 1 ? .title3.bold() : level == 2 ? .headline : .subheadline.bold())
-                .foregroundStyle(level == 2 ? Color.accentColor : Color.primary)
-                .padding(.top, 6)
+                .font(DSFont.heading(level == 1 ? 22 : level == 2 ? 18 : 15))
+                .foregroundStyle(level == 2 ? DS.accent : DS.text)
+                .padding(.top, 8)
         case .li(let s):
-            HStack(alignment: .firstTextBaseline, spacing: 6) {
-                Text("•").foregroundStyle(.secondary)
-                styled(s)
+            HStack(alignment: .firstTextBaseline, spacing: 7) {
+                Text("•").foregroundStyle(DS.accent)
+                styled(s).font(DSFont.body(14)).foregroundStyle(DS.text)
             }
         case .code(let s):
             Text(s)
-                .font(.caption.monospaced())
+                .font(DSFont.mono(11))
+                .foregroundStyle(DS.text)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(8)
-                .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 6))
+                .padding(10)
+                .background(DS.neutral(2),
+                            in: RoundedRectangle(cornerRadius: DS.rSm, style: .continuous))
         case .p(let s):
-            styled(s)
+            styled(s).font(DSFont.body(14)).foregroundStyle(DS.text)
         }
     }
 
@@ -415,20 +231,5 @@ struct MarkdownLite: View {
             return Text(attr)
         }
         return Text(s)
-    }
-}
-
-/// Age-tinted dot + text for heartbeat-style freshness.
-struct StatusDot: View {
-    let color: Color
-    let label: String
-    var body: some View {
-        HStack(spacing: 5) {
-            Circle().fill(color).frame(width: 8, height: 8)
-            Text(label).font(.caption.weight(.semibold).monospaced())
-        }
-        .padding(.horizontal, 8).padding(.vertical, 4)
-        .background(color.opacity(0.12), in: Capsule())
-        .foregroundStyle(color)
     }
 }

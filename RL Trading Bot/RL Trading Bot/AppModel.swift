@@ -101,6 +101,32 @@ final class AppModel {
     var connectionError: String?
     var lastRefreshed: Date?
 
+    /// Which Organic palette to draw in. Defaults to `light` — that cream
+    /// ground *is* the design; the warm dark variant is opt-in, and `system`
+    /// follows the Mac's appearance for anyone who wants it to.
+    var appearance: Appearance {
+        didSet { UserDefaults.standard.set(appearance.rawValue, forKey: "appearance") }
+    }
+
+    enum Appearance: String, CaseIterable, Identifiable, Hashable {
+        case light, dark, system
+        var id: String { rawValue }
+        var label: String {
+            switch self {
+            case .light: "Light"
+            case .dark: "Dark"
+            case .system: "System"
+            }
+        }
+        var colorScheme: ColorScheme? {
+            switch self {
+            case .light: .light
+            case .dark: .dark
+            case .system: nil
+            }
+        }
+    }
+
     // MARK: payloads
     var meta: Meta?
     var overview: Overview?
@@ -162,6 +188,8 @@ final class AppModel {
         #endif
         let saved = UserDefaults.standard.string(forKey: "serverURL")
         serverURLString = (saved?.isEmpty == false) ? saved! : fallback
+        appearance = UserDefaults.standard.string(forKey: "appearance")
+            .flatMap(Appearance.init(rawValue:)) ?? .light
         api.baseURL = URL(string: serverURLString)
     }
 
@@ -210,6 +238,13 @@ final class AppModel {
             switch tab {
             case .overview:
                 overview = try await api.get("/api/overview", as: Overview.self)
+                // the home screen's "Agent Thinking" and "Recent Activity"
+                // cards read these; both are best-effort so a failure here
+                // can never blank the portfolio numbers
+                async let think: Thinking? = try? api.get("/api/thinking", as: Thinking.self)
+                async let logs: LogsPayload? = try? api.get("/api/logs", as: LogsPayload.self)
+                if let t = await think { thinking = t }
+                if let l = await logs { logsPayload = l }
             case .positions:
                 overview = try await api.get("/api/overview", as: Overview.self)
                 riskPayload = try? await api.get("/api/risk", as: RiskPayload.self)

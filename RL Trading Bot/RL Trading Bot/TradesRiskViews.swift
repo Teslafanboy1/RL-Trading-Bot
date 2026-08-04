@@ -12,12 +12,24 @@ struct TradesView: View {
     @State private var search = ""
     @State private var sortNewestFirst = true
     @State private var sortKey: SortKey = .date
+    @State private var outcomeFilter: OutcomeFilter = .all
     @State private var postmortem: PostmortemMeta?
 
-    enum SortKey: String, CaseIterable { case date = "Closed", pnl = "P&L", symbol = "Symbol" }
+    enum SortKey: String, CaseIterable, Hashable {
+        case date = "Closed", pnl = "P&L", symbol = "Symbol"
+    }
+    enum OutcomeFilter: String, CaseIterable, Hashable {
+        case all = "All", wins = "Wins", losses = "Losses", stops = "Stopped out"
+    }
 
     private var trades: [ClosedTrade] {
         var rows = model.tradesPayload?.trades ?? []
+        switch outcomeFilter {
+        case .all: break
+        case .wins: rows = rows.filter { $0.outcome == "WIN" }
+        case .losses: rows = rows.filter { $0.outcome != "WIN" }
+        case .stops: rows = rows.filter { $0.stopLoss == true }
+        }
         if !search.isEmpty {
             let q = search.lowercased()
             rows = rows.filter {
@@ -37,55 +49,104 @@ struct TradesView: View {
     }
 
     var body: some View {
-        List {
-            if let err = model.tabErrors[.trades] { ErrorBox(text: err) }
-            Section {
-                ForEach(trades, id: \.stableId) { t in
-                    TradeRow(trade: t) {
-                        if let file = t.analysisFile {
-                            postmortem = PostmortemMeta(file: file, kind: nil, title: nil,
-                                                        tradeIds: nil)
-                        }
-                    }
-                }
-            } header: {
-                HStack {
-                    Text("\(trades.count) closed trades")
-                    Spacer()
-                    Picker("Sort", selection: $sortKey) {
-                        ForEach(SortKey.allCases, id: \.self) { Text($0.rawValue) }
-                    }
-                    .pickerStyle(.menu)
-                    Button {
-                        sortNewestFirst.toggle()
-                    } label: {
-                        Image(systemName: sortNewestFirst ? "arrow.down" : "arrow.up")
-                    }
-                    .buttonStyle(.borderless)
-                }
-            }
-            if let pms = model.tradesPayload?.postmortems, !pms.isEmpty {
-                Section("All analyses") {
-                    ForEach(pms) { pm in
-                        Button {
-                            postmortem = pm
-                        } label: {
-                            Label(pm.file, systemImage: pm.kind == "victory" ? "trophy.fill" : "stethoscope")
-                                .font(.callout.monospaced())
-                        }
-                    }
+        Group {
+            if model.tradesPayload == nil {
+                LoadingScreen(title: "Loading trades…", detail: "closed positions and analyses")
+                    .background(DS.bg)
+            } else {
+                Screen(title: "Trades",
+                       subtitle: "\(trades.count) closed trades · every loss and win has an analysis",
+                       refresh: { await model.load(.trades) }) {
+                    if let err = model.tabErrors[.trades] { ErrorBox(text: err) }
+                    controls
+                    tableCard
+                    analysesCard
                 }
             }
         }
-        .searchable(text: $search, prompt: "symbol / reason / outcome")
-        .refreshable { await model.load(.trades) }
         .task { if model.tradesPayload == nil { await model.load(.trades) } }
         .sheet(item: $postmortem) { pm in
             DocumentSheet(title: pm.file, loader: { await model.postmortemText(pm.file) })
         }
-        .overlay {
-            if model.tradesPayload == nil {
-                ContentUnavailableView("Loading trades…", systemImage: "list.bullet")
+    }
+
+    private var controls: some View {
+        Card {
+            WidthReader(compactBelow: 700) { compact in
+                let filters = FilterPills(
+                    options: OutcomeFilter.allCases.map { ($0, $0.rawValue) },
+                    selection: $outcomeFilter)
+                let tools = HStack(spacing: DS.s2) {
+                    OrganicField(prompt: "symbol / reason / outcome", text: $search, width: 230)
+                    FilterPills(options: SortKey.allCases.map { ($0, $0.rawValue) },
+                                selection: $sortKey)
+                        .frame(maxWidth: 240)
+                    Button {
+                        sortNewestFirst.toggle()
+                    } label: {
+                        Image(systemName: sortNewestFirst ? "arrow.down" : "arrow.up")
+                            .font(.system(size: 12, weight: .bold))
+                    }
+                    .buttonStyle(.organicSoft)
+                    .help(sortNewestFirst ? "Descending" : "Ascending")
+                }
+                if compact {
+                    VStack(alignment: .leading, spacing: DS.s3) { filters; tools }
+                } else {
+                    HStack(spacing: DS.s3) { filters; Spacer(minLength: DS.s2); tools }
+                }
+            }
+        }
+    }
+
+    private var tableCard: some View {
+        Card(padding: DS.s4) {
+            if trades.isEmpty {
+                EmptyNote(text: "No trades match.", icon: "list.bullet.rectangle")
+            } else {
+                VStack(spacing: 0) {
+                    THeader(columns: ["Closed", "Ticker", "Trade", "Entry → exit",
+                                      "P&L", "Exit reason", ""],
+                            weights: [1.2, 1, 1.2, 1.2, 1, 1.4, 0.7],
+                            alignments: [.leading, .leading, .leading, .trailing,
+                                         .trailing, .leading, .trailing])
+                    Rectangle().fill(DS.divider).frame(height: 1)
+                    ForEach(trades, id: \.stableId) { t in
+                        TradeRow(trade: t, isLast: t.stableId == trades.last?.stableId) {
+                            if let file = t.analysisFile {
+                                postmortem = PostmortemMeta(file: file, kind: nil,
+                                                            title: nil, tradeIds: nil)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var analysesCard: some View {
+        let pms = model.tradesPayload?.postmortems ?? []
+        if !pms.isEmpty {
+            Card("All analyses", subtitle: "\(pms.count) postmortems and victories on disk") {
+                VStack(spacing: 0) {
+                    ForEach(pms) { pm in
+                        TRow(showsDivider: pm.id != pms.last?.id, onTap: { postmortem = pm }) {
+                            Image(systemName: pm.kind == "victory" ? "trophy.fill" : "stethoscope")
+                                .font(.system(size: 12))
+                                .foregroundStyle(pm.kind == "victory" ? DS.up : DS.down)
+                                .frame(width: 18)
+                            TCell(weight: 4) {
+                                Text(pm.title ?? pm.file)
+                                    .font(DSFont.body(13)).foregroundStyle(DS.text).lineLimit(1)
+                            }
+                            TCell(align: .trailing, weight: 2) {
+                                Text(pm.file).font(DSFont.mono(11))
+                                    .foregroundStyle(DS.textFaint).lineLimit(1)
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -93,43 +154,52 @@ struct TradesView: View {
 
 struct TradeRow: View {
     let trade: ClosedTrade
+    let isLast: Bool
     let openAnalysis: () -> Void
 
     var body: some View {
         let t = trade
-        HStack(spacing: 10) {
-            VStack(alignment: .leading, spacing: 2) {
+        TRow(showsDivider: !isLast) {
+            TCell(weight: 1.2) {
+                Text(Fmt.when(t.exitDate)).font(DSFont.num(12))
+                    .foregroundStyle(DS.textMuted).lineLimit(1)
+            }
+            TCell {
                 HStack(spacing: 6) {
-                    Text(t.symbol ?? "—").font(.headline.monospaced())
-                    if t.stopLoss == true {
-                        Text("STOP").font(.caption2.bold())
-                            .padding(.horizontal, 5).padding(.vertical, 1)
-                            .background(Color.down.opacity(0.18), in: Capsule())
-                            .foregroundStyle(Color.down)
-                    }
+                    Text(t.symbol ?? "—").font(DSFont.bold(14)).foregroundStyle(DS.text)
+                    if t.stopLoss == true { Tag("STOP", tone: .down, size: 9) }
                 }
-                Text("\(t.id ?? "") · \(t.exitReason ?? (t.stopLoss == true ? "stop_loss" : "—")) · \(Fmt.when(t.exitDate))")
-                    .font(.caption2.monospaced())
-                    .foregroundStyle(.secondary)
             }
-            Spacer()
-            VStack(alignment: .trailing, spacing: 2) {
-                PnLText(value: t.pnlDollar, pct: t.pnlPct, font: .callout)
+            TCell(weight: 1.2) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Tag(t.outcome ?? "—", tone: t.outcome == "WIN" ? .up : .down, size: 10)
+                    Text("\(Fmt.num(t.shares, dp: 4)) sh · \(t.id ?? "")")
+                        .font(DSFont.num(10)).foregroundStyle(DS.textFaint).lineLimit(1)
+                }
+            }
+            TCell(align: .trailing, weight: 1.2) {
                 Text("\(Fmt.usd(t.entryPrice)) → \(Fmt.usd(t.exitPrice))")
-                    .font(.caption2.monospacedDigit())
-                    .foregroundStyle(.secondary)
+                    .font(DSFont.num(12)).foregroundStyle(DS.text).lineLimit(1)
             }
-            if t.analysisFile != nil {
-                Button {
-                    openAnalysis()
-                } label: {
-                    Image(systemName: t.outcome == "WIN" ? "trophy.fill" : "stethoscope")
+            TCell(align: .trailing) {
+                PnLPair(dollars: t.pnlDollar, pct: t.pnlPct)
+            }
+            TCell(weight: 1.4) {
+                Text(t.exitReason ?? (t.stopLoss == true ? "stop_loss" : "—"))
+                    .font(DSFont.body(12)).foregroundStyle(DS.textMuted).lineLimit(1)
+            }
+            TCell(align: .trailing, weight: 0.7) {
+                if t.analysisFile != nil {
+                    Button(action: openAnalysis) {
+                        Image(systemName: t.outcome == "WIN" ? "trophy.fill" : "stethoscope")
+                            .font(.system(size: 11, weight: .semibold))
+                    }
+                    .buttonStyle(SoftButtonStyle(tint: t.outcome == "WIN" ? DS.up : DS.down,
+                                                 size: 11))
+                    .help("Open \(t.outcome == "WIN" ? "victory" : "postmortem") analysis")
                 }
-                .buttonStyle(.bordered).controlSize(.small)
-                .help("Open \(t.outcome == "WIN" ? "victory" : "postmortem") analysis")
             }
         }
-        .padding(.vertical, 2)
     }
 }
 
@@ -147,256 +217,288 @@ struct RiskView: View {
     private var r: RiskPayload? { model.riskPayload }
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 14) {
-                if let err = model.tabErrors[.risk] { ErrorBox(text: err) }
-                if let err = actionError { ErrorBox(text: err) }
-                killswitchCard
-                cashFlowCard
-                stopsCard
-                dntCard
-                watchdogCard
+        Group {
+            if r == nil {
+                LoadingScreen(title: "Loading risk…", detail: "stops, kill-switch, watchdog")
+                    .background(DS.bg)
+            } else {
+                Screen(title: "Risk", subtitle: AppTab.risk.blurb,
+                       refresh: { await model.load(.risk) }) {
+                    if let err = model.tabErrors[.risk] { ErrorBox(text: err) }
+                    if let err = actionError { ErrorBox(text: err) }
+                    statTiles
+                    killswitchCard
+                    stopsCard
+                    AdaptivePair(compactBelow: 820) {
+                        dntCard
+                    } second: {
+                        cashFlowCard
+                    }
+                    watchdogCard
+                }
             }
-            .padding()
         }
-        .opacity(r == nil ? 0 : 1)
-        .refreshable { await model.load(.risk) }
         .task { if r == nil { await model.load(.risk) } }
         .sheet(item: $overrideRow) { row in StopOverrideSheet(row: row) }
         .sheet(isPresented: $showHalt) { HaltSheet() }
         .sheet(isPresented: $showClearHalt) { ClearHaltSheet() }
         .sheet(isPresented: $showCashFlow) {
-            CashFlowSheet()
-                .onDisappear { Task { await model.load(.risk) } }
-        }
-        .overlay {
-            if r == nil { ContentUnavailableView("Loading risk…", systemImage: "shield") }
+            CashFlowSheet().onDisappear { Task { await model.load(.risk) } }
         }
     }
 
+    // MARK: tiles
+
+    private var statTiles: some View {
+        let ks = r?.killswitch
+        let dd = (ks?.drawdown ?? 0) * 100
+        let rows = r?.positions ?? []
+        let atRisk = rows.filter { ($0.distStopPct ?? 99) < 5 || ($0.distTrailPct ?? 99) < 5 }
+        let deployed = rows.reduce(0.0) { $0 + (($1.price ?? 0) * ($1.shares ?? 0)) }
+        let total = ks?.current ?? model.overview?.account?.total
+        let rm = r?.riskManagement
+        return StatRow {
+            StatCard(label: "Portfolio exposure",
+                     value: total.map { $0 > 0 ? Fmt.pct(deployed / $0 * 100, dp: 1, signed: false) : "—" } ?? "—",
+                     delta: Fmt.usd(deployed) + " deployed",
+                     deltaTone: .neutral,
+                     sublabel: "\(rows.count) positions")
+            StatCard(label: "Kill-switch room",
+                     value: Fmt.pct(max(0, 25 - dd), dp: 1, signed: false),
+                     delta: "drawdown \(Fmt.pct(dd, dp: 1, signed: false))",
+                     deltaTone: dd > 15 ? .down : dd > 8 ? .caution : .up,
+                     sublabel: "halts at \(Fmt.usd(ks?.haltAtValue))")
+            StatCard(label: "Near a stop",
+                     value: "\(atRisk.count)",
+                     delta: atRisk.isEmpty ? "nothing within 5%" : atRisk.map(\.symbol).joined(separator: ", "),
+                     deltaTone: atRisk.isEmpty ? .up : .caution,
+                     sublabel: "hard \(Fmt.pct((rm?["stop_loss_pct"]?.numberValue ?? 0.1) * 100, dp: 0, signed: false)) · trail \(Fmt.pct((rm?["trailing_stop_pct"]?.numberValue ?? 0) * 100, dp: 0, signed: false))")
+            StatCard(label: "Blocked names",
+                     value: "\((r?.dnt ?? []).count)",
+                     delta: (r?.dnt ?? []).isEmpty ? "no do-not-trade entries" : (r?.dnt ?? []).joined(separator: ", "),
+                     deltaTone: .neutral,
+                     sublabel: "blocks BUYs; sells still allowed")
+        }
+    }
+
+    // MARK: kill-switch
+
     private var killswitchCard: some View {
-        GroupBox {
-            let ks = r?.killswitch
-            let dd = (ks?.drawdown ?? 0) * 100
-            let halted = r?.bot?.halt?.halted == true
-            VStack(alignment: .leading, spacing: 8) {
-                LazyVGrid(columns: [GridItem(.adaptive(minimum: 220), spacing: 20)],
-                          alignment: .leading, spacing: 4) {
-                    KeyValueRow(key: "month peak", value: Fmt.usd(ks?.peak))
-                    KeyValueRow(key: "current", value: Fmt.usd(ks?.current))
-                    KeyValueRow(key: "halts at", value: Fmt.usd(ks?.haltAtValue))
-                    KeyValueRow(key: "drawdown", value: Fmt.pct(dd, dp: 1, signed: false),
-                                valueColor: dd > 15 ? .down : .caution)
-                    KeyValueRow(key: "headroom", value: Fmt.pct(25 - dd, dp: 1, signed: false))
+        let ks = r?.killswitch
+        let dd = (ks?.drawdown ?? 0) * 100
+        let halted = r?.bot?.halt?.halted == true
+        return Card("Kill-switch — monthly −25% drawdown",
+                    subtitle: "account-level dead-man, checked every cycle") {
+            VStack(alignment: .leading, spacing: DS.s3) {
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 160), spacing: DS.s4)],
+                          alignment: .leading, spacing: DS.s2) {
+                    MicroStat(key: "Month peak", value: Fmt.usd(ks?.peak))
+                    MicroStat(key: "Current", value: Fmt.usd(ks?.current))
+                    MicroStat(key: "Halts at", value: Fmt.usd(ks?.haltAtValue), color: DS.down)
+                    MicroStat(key: "Drawdown", value: Fmt.pct(dd, dp: 1, signed: false),
+                              color: dd > 15 ? DS.down : DS.caution)
+                    MicroStat(key: "Headroom", value: Fmt.pct(max(0, 25 - dd), dp: 1, signed: false),
+                              color: DS.up)
                 }
-                Gauge(value: min(dd, 25), in: 0...25) { EmptyView() }
-                    .gaugeStyle(.accessoryLinearCapacity)
-                    .tint(dd > 15 ? .down : .caution)
+                MeterBar(value: min(dd, 25) / 25, tint: dd > 15 ? DS.down : DS.caution, height: 10)
                 if halted {
-                    ErrorBox(text: "HALTED — the bot will not trade; its stop enforcement is OFF (watchdog alerts only). Detail: \(r?.bot?.halt?.detail?.prefix(200) ?? "")")
+                    ErrorBox(text: "HALTED — the bot will not trade; its stop enforcement is OFF (watchdog alerts only). \(r?.bot?.halt?.detail?.prefix(200) ?? "")")
                     Button { showClearHalt = true } label: {
                         Label("Clear HALT", systemImage: "checkmark.shield.fill")
                     }
-                    .buttonStyle(.borderedProminent).tint(.up)
+                    .buttonStyle(.organicPrimary(DS.up))
                 } else {
-                    Button(role: .destructive) { showHalt = true } label: {
+                    Button { showHalt = true } label: {
                         Label("Force HALT now", systemImage: "octagon.fill")
                     }
-                    .buttonStyle(.bordered).tint(.down)
+                    .buttonStyle(.organicSoft(DS.down))
                 }
             }
-        } label: { Label("Kill-switch — monthly −25% drawdown", systemImage: "bolt.shield.fill") }
+        }
     }
 
+    // MARK: stops
+
+    private var stopsCard: some View {
+        let rm = r?.riskManagement
+        let stop = (rm?["stop_loss_pct"]?.numberValue ?? 0.1) * 100
+        let trail = (rm?["trailing_stop_pct"]?.numberValue ?? 0) * 100
+        let ribbon = rm?["exit_on_ribbon_sell"]?.boolValue == true
+        let rows = r?.positions ?? []
+        return Card("Per-position stops",
+                    subtitle: "hard \(Int(stop))% · trail \(Int(trail))% · ribbon-exit \(ribbon ? "ON" : "off (advisory)")") {
+            if rows.isEmpty {
+                EmptyNote(text: "No open positions.", icon: "shield")
+            } else {
+                VStack(spacing: 0) {
+                    THeader(columns: ["Ticker", "Entry", "Peak", "Now",
+                                      "Hard stop", "Trailing stop", ""],
+                            weights: [1.2, 1, 1, 1, 1, 1, 0.8],
+                            alignments: [.leading, .trailing, .trailing, .trailing,
+                                         .trailing, .trailing, .trailing])
+                    Rectangle().fill(DS.divider).frame(height: 1)
+                    ForEach(rows) { row in
+                        TRow(showsDivider: row.id != rows.last?.id) {
+                            TCell(weight: 1.2) {
+                                HStack(spacing: 6) {
+                                    Text(row.symbol).font(DSFont.bold(14))
+                                        .foregroundStyle(DS.text)
+                                    if row.override_ != nil, row.override_ != JSONValue.null {
+                                        Tag("OVERRIDE", tone: .caution, size: 9)
+                                    }
+                                }
+                            }
+                            TCell(align: .trailing) {
+                                Text(Fmt.usd(row.entry)).font(DSFont.num(12))
+                                    .foregroundStyle(DS.textMuted)
+                            }
+                            TCell(align: .trailing) {
+                                Text(Fmt.usd(row.peak)).font(DSFont.num(12))
+                                    .foregroundStyle(DS.textMuted)
+                            }
+                            TCell(align: .trailing) {
+                                Text(Fmt.usd(row.price)).font(DSFont.num(13, .semibold))
+                                    .foregroundStyle(DS.text)
+                            }
+                            TCell(align: .trailing) {
+                                stopCell(row.stopPrice, row.distStopPct)
+                            }
+                            TCell(align: .trailing) {
+                                stopCell(row.trailPrice, row.distTrailPct)
+                            }
+                            TCell(align: .trailing, weight: 0.8) {
+                                Button("Edit") { overrideRow = row }
+                                    .buttonStyle(SoftButtonStyle(tint: DS.accent, size: 12))
+                            }
+                        }
+                    }
+                }
+                Text("Overrides are honored by the bot next cycle and mirrored into the watchdog's stops.json. Leveraged ETFs already get a tighter effective stop.")
+                    .font(DSFont.body(12)).foregroundStyle(DS.textMuted)
+                    .padding(.top, DS.s2)
+            }
+        }
+    }
+
+    private func stopCell(_ price: Double?, _ dist: Double?) -> some View {
+        VStack(alignment: .trailing, spacing: 2) {
+            Text(Fmt.usd(price)).font(DSFont.num(13)).foregroundStyle(DS.text)
+            Text(dist != nil ? Fmt.pct(dist, dp: 1, signed: false) + " away" : "—")
+                .font(DSFont.num(10))
+                .foregroundStyle((dist ?? 99) < 3 ? DS.down : DS.textFaint)
+        }
+    }
+
+    // MARK: do-not-trade
+
+    private var dntCard: some View {
+        Card("Do-not-trade list", subtitle: "blocks bot BUYs · sells are never blocked") {
+            VStack(alignment: .leading, spacing: DS.s3) {
+                HStack(spacing: DS.s2) {
+                    OrganicField(prompt: "SYMBOL", text: $dntSymbol, mono: true, width: 150)
+                    Button("Block") {
+                        let sym = dntSymbol.trimmingCharacters(in: .whitespaces).uppercased()
+                        guard !sym.isEmpty else { return }
+                        model.requireArm {
+                            Task {
+                                actionError = await model.setDNT(symbol: sym, blocked: true)
+                                dntSymbol = ""
+                                await model.load(.risk)
+                            }
+                        }
+                    }
+                    .buttonStyle(.organicPrimary(DS.down))
+                    Spacer()
+                }
+                if (r?.dnt ?? []).isEmpty {
+                    EmptyNote(text: "Empty — the bot may buy anything its strategy allows.",
+                              icon: "nosign")
+                } else {
+                    ChipCloud(items: r?.dnt ?? [], minWidth: 96) { sym in
+                        Button {
+                            model.requireArm {
+                                Task {
+                                    actionError = await model.setDNT(symbol: sym, blocked: false)
+                                    await model.load(.risk)
+                                }
+                            }
+                        } label: {
+                            Tag(sym, tone: .down, size: 11, icon: "xmark.circle.fill")
+                        }
+                        .buttonStyle(.plain)
+                        .help("Unblock \(sym)")
+                    }
+                }
+            }
+        }
+    }
+
+    // MARK: cash flow
+
     private var cashFlowCard: some View {
-        GroupBox {
-            VStack(alignment: .leading, spacing: 8) {
+        Card("Deposits & withdrawals", subtitle: "keeps the performance % honest") {
+            VStack(alignment: .leading, spacing: DS.s3) {
                 Button { showCashFlow = true } label: {
                     Label("Log deposit / withdrawal", systemImage: "plus.forwardslash.minus")
                 }
-                .buttonStyle(.bordered)
+                .buttonStyle(.organicSoft)
                 let flows = r?.cashFlows ?? []
                 if flows.isEmpty {
-                    Text("no declared deposits/withdrawals yet")
-                        .font(.caption).foregroundStyle(.secondary)
+                    EmptyNote(text: "No declared deposits or withdrawals yet.", icon: "banknote")
                 } else {
                     VStack(spacing: 0) {
-                        ForEach(flows.prefix(6)) { f in
-                            HStack {
-                                Text((f.ts ?? "").prefix(16))
-                                    .font(.caption2.monospaced()).foregroundStyle(.secondary)
-                                if let note = f.note, !note.isEmpty {
-                                    Text(note).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+                        let shown = Array(flows.prefix(6))
+                        ForEach(shown) { f in
+                            TRow(showsDivider: f.id != shown.last?.id) {
+                                TCell(weight: 1.4) {
+                                    Text((f.ts ?? "").prefix(16))
+                                        .font(DSFont.num(11)).foregroundStyle(DS.textFaint)
                                 }
-                                Spacer()
-                                Text(Fmt.usdSigned(f.amount))
-                                    .font(.caption.monospacedDigit().bold())
-                                    .foregroundStyle((f.amount ?? 0) >= 0 ? Color.up : Color.down)
-                                Text(f.applied == true ? "applied" : "pending")
-                                    .font(.caption2)
-                                    .foregroundStyle(f.applied == true ? .secondary : Color.caution)
-                            }
-                            .padding(.vertical, 4)
-                            if f.id != flows.prefix(6).last?.id { Divider() }
-                        }
-                    }
-                }
-            }
-        } label: {
-            Label("Deposits & withdrawals — keeps performance % honest", systemImage: "banknote.fill")
-        }
-    }
-
-    private var stopsCard: some View {
-        GroupBox {
-            VStack(spacing: 0) {
-                ForEach(r?.positions ?? []) { row in
-                    riskRow(row)
-                        .padding(.vertical, 6)
-                    if row.id != r?.positions?.last?.id { Divider() }
-                }
-                if (r?.positions ?? []).isEmpty {
-                    Text("no open positions").foregroundStyle(.secondary).padding(.vertical, 10)
-                }
-            }
-            Text("Overrides are honored by the bot next cycle and mirrored into the watchdog's stops.json. Leveraged ETFs already get a tighter effective stop.")
-                .font(.caption2).foregroundStyle(.secondary)
-                .frame(maxWidth: .infinity, alignment: .leading)
-        } label: {
-            let rm = r?.riskManagement
-            let stop = (rm?["stop_loss_pct"]?.numberValue ?? 0.1) * 100
-            let trail = (rm?["trailing_stop_pct"]?.numberValue ?? 0) * 100
-            let ribbon = rm?["exit_on_ribbon_sell"]?.boolValue == true
-            Label("Per-position stops — hard \(Int(stop))% · trail \(Int(trail))% · ribbon-exit \(ribbon ? "ON" : "off (advisory)")",
-                  systemImage: "target")
-                .lineLimit(1)
-                .truncationMode(.tail)
-        }
-    }
-
-    @ViewBuilder
-    private func riskRow(_ row: RiskRow) -> some View {
-        let symbolBlock = VStack(alignment: .leading, spacing: 2) {
-            HStack(spacing: 6) {
-                Text(row.symbol).font(.subheadline.bold().monospaced())
-                if row.override_ != nil && row.override_ != JSONValue.null {
-                    Text("OVERRIDE").font(.caption2.bold())
-                        .padding(.horizontal, 5).padding(.vertical, 2)
-                        .background(Color.caution.opacity(0.18), in: Capsule())
-                        .foregroundStyle(Color.caution)
-                }
-            }
-            Text("entry \(Fmt.usd(row.entry)) · peak \(Fmt.usd(row.peak)) · now \(Fmt.usd(row.price))")
-                .font(.caption2.monospaced()).foregroundStyle(.secondary)
-                .lineLimit(1)
-        }
-        let cells = HStack(spacing: 12) {
-            stopCell("stop", row.stopPrice, row.distStopPct, dangerBelow: 3)
-            stopCell("trail", row.trailPrice, row.distTrailPct, dangerBelow: 3)
-            Button("Edit") { overrideRow = row }
-                .buttonStyle(.bordered).controlSize(.small)
-        }
-        WidthReader(compactBelow: 540) { compact in
-            if compact {
-                VStack(alignment: .leading, spacing: 6) {
-                    symbolBlock
-                    cells
-                }
-            } else {
-                HStack(spacing: 12) {
-                    symbolBlock
-                    Spacer(minLength: 8)
-                    cells
-                }
-            }
-        }
-    }
-
-    private func stopCell(_ label: String, _ price: Double?, _ dist: Double?,
-                          dangerBelow: Double) -> some View {
-        VStack(alignment: .trailing, spacing: 2) {
-            Text(Fmt.usd(price)).font(.caption.monospacedDigit())
-            Text(dist != nil ? "\(label) \(Fmt.pct(dist, dp: 1, signed: false))" : label)
-                .font(.caption2.monospacedDigit())
-                .foregroundStyle((dist ?? 99) < dangerBelow ? Color.down : Color.secondary)
-        }
-        .frame(minWidth: 76, alignment: .trailing)
-    }
-
-    private var dntCard: some View {
-        GroupBox {
-            HStack {
-                TextField("SYMBOL", text: $dntSymbol)
-                    .font(.body.monospaced())
-                    .textCase(.uppercase)
-                    .frame(maxWidth: 140)
-                    #if !os(macOS)
-                    .textInputAutocapitalization(.characters)
-                    .autocorrectionDisabled()
-                    #endif
-                Button("Block") {
-                    let sym = dntSymbol.trimmingCharacters(in: .whitespaces).uppercased()
-                    guard !sym.isEmpty else { return }
-                    model.requireArm {
-                        Task {
-                            actionError = await model.setDNT(symbol: sym, blocked: true)
-                            dntSymbol = ""
-                            await model.load(.risk)
-                        }
-                    }
-                }
-                .buttonStyle(.bordered)
-                Spacer()
-            }
-            if (r?.dnt ?? []).isEmpty {
-                Text("empty — the bot may buy anything its strategy allows")
-                    .font(.caption).foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            } else {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack {
-                        ForEach(r?.dnt ?? [], id: \.self) { sym in
-                            Button {
-                                model.requireArm {
-                                    Task {
-                                        actionError = await model.setDNT(symbol: sym, blocked: false)
-                                        await model.load(.risk)
-                                    }
+                                TCell(weight: 2) {
+                                    Text(f.note ?? "").font(DSFont.body(12))
+                                        .foregroundStyle(DS.textMuted).lineLimit(1)
                                 }
-                            } label: {
-                                Label(sym, systemImage: "xmark.circle.fill")
-                                    .font(.caption.bold().monospaced())
+                                TCell(align: .trailing) {
+                                    Text(Fmt.usdSigned(f.amount))
+                                        .font(DSFont.num(13, .bold))
+                                        .foregroundStyle((f.amount ?? 0) >= 0 ? DS.up : DS.down)
+                                }
+                                TCell(align: .trailing) {
+                                    Tag(f.applied == true ? "applied" : "pending",
+                                        tone: f.applied == true ? .neutral : .caution, size: 10)
+                                }
                             }
-                            .buttonStyle(.bordered).controlSize(.small)
-                            .help("Unblock \(sym)")
                         }
                     }
                 }
             }
-        } label: {
-            Label("Do-not-trade list — blocks bot BUYs; sells still allowed",
-                  systemImage: "nosign")
         }
     }
+
+    // MARK: watchdog
 
     private var watchdogCard: some View {
-        GroupBox {
-            let lines = r?.watchdogLog ?? []
+        let lines = r?.watchdogLog ?? []
+        return Card("Watchdog",
+                    subtitle: "independent launchd dead-man · stops.json updated \((r?.stopsFile?["updated"]?.stringValue ?? "—").prefix(16))") {
             if lines.isEmpty {
-                Text("(no watchdog log lines yet)").font(.caption).foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                EmptyNote(text: "No watchdog log lines yet.", icon: "dog")
             } else {
                 ScrollView {
-                    Text(lines.joined(separator: "\n"))
-                        .font(.caption2.monospaced())
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .textSelection(.enabled)
+                    VStack(alignment: .leading, spacing: 3) {
+                        ForEach(Array(lines.enumerated()), id: \.offset) { _, line in
+                            Text(line)
+                                .font(DSFont.mono(11))
+                                .foregroundStyle(line.contains("ALERT") ? DS.down : DS.consoleText)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    }
+                    .padding(DS.s3)
                 }
-                .frame(maxHeight: 180)
+                .frame(maxHeight: 200)
+                .background(DS.consoleBG,
+                            in: RoundedRectangle(cornerRadius: DS.rMd, style: .continuous))
             }
-        } label: {
-            Label("Watchdog (independent, launchd) — stops.json updated \((r?.stopsFile?["updated"]?.stringValue ?? "—").prefix(16))",
-                  systemImage: "dog.fill")
         }
     }
 }

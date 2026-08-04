@@ -16,95 +16,167 @@ struct LearningView: View {
     private var p: LearningPayload? { model.learningPayload }
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 14) {
-                if let err = model.tabErrors[.learning] { ErrorBox(text: err) }
-                AdaptivePair(compactBelow: 700) {
-                    leaderboardCard
-                } second: {
-                    skillVersionsCard
+        Group {
+            if p == nil {
+                LoadingScreen(title: "Loading learning loop…",
+                              detail: "source accuracy, rules, rewrite queue")
+                    .background(DS.bg)
+            } else {
+                Screen(title: "Learning", subtitle: AppTab.learning.blurb,
+                       refresh: { await model.load(.learning) }) {
+                    if let err = model.tabErrors[.learning] { ErrorBox(text: err) }
+                    statTiles
+                    AdaptivePair(compactBelow: 860, ratio: 1.4) {
+                        leaderboardCard
+                    } second: {
+                        skillVersionsCard
+                    }
+                    accuracyChartCard
+                    learnedRulesCard
+                    observationsCard
+                    queueCard
+                    verdictsCard
+                    analysesCard
                 }
-                learnedRulesCard
-                observationsCard
-                queueCard
-                verdictsCard
-                analysesCard
             }
-            .padding()
         }
-        .refreshable { await model.load(.learning) }
         .task { if p == nil { await model.load(.learning) } }
         .sheet(item: $document) { pm in
             DocumentSheet(title: pm.file, loader: { await model.postmortemText(pm.file) })
         }
-        .overlay {
-            if p == nil { ContentUnavailableView("Loading learning loop…",
-                                                 systemImage: "graduationcap") }
+    }
+
+    private var statTiles: some View {
+        let board = p?.leaderboard ?? []
+        let totalN = board.reduce(0) { $0 + ($1.n ?? (($1.wins ?? 0) + ($1.losses ?? 0))) }
+        let avgAcc = board.isEmpty ? nil
+            : board.compactMap(\.accuracy).reduce(0, +) / Double(max(1, board.compactMap(\.accuracy).count))
+        let pending = (p?.rewriteQueue ?? []).filter { $0.done != true }.count
+        let rules = (p?.learnedRules?.arrayValue ?? []).count
+        let latestSkill = (p?.skillVersions ?? []).map { $0.latest ?? 0 }.max() ?? 0
+        return StatRow {
+            StatCard(label: "Learning events",
+                     value: "\(totalN)",
+                     delta: "\(p?.postmortems?.count ?? 0) analyses on disk",
+                     deltaTone: .neutral,
+                     sublabel: "source verdicts credited")
+            StatCard(label: "Avg source accuracy",
+                     value: avgAcc.map { Fmt.pct($0 * 100, dp: 0, signed: false) } ?? "—",
+                     delta: "\(board.count) tracked sources",
+                     deltaTone: (avgAcc ?? 0) >= 0.5 ? .up : .down,
+                     sublabel: "drives the weight rebalance")
+            StatCard(label: "Rewrite queue",
+                     value: "\(pending)",
+                     delta: pending == 0 ? "nothing waiting" : "waiting for skill_5",
+                     deltaTone: pending == 0 ? .up : .caution,
+                     sublabel: "one entry consumed per cycle")
+            StatCard(label: "Learned rules",
+                     value: "\(rules)",
+                     delta: "latest skill v\(String(format: "%03d", latestSkill))",
+                     deltaTone: .neutral,
+                     sublabel: "needs 3+ similar outcomes to promote")
         }
     }
 
     private var leaderboardCard: some View {
-        GroupBox {
-            VStack(spacing: 8) {
-                if (p?.leaderboard ?? []).isEmpty {
-                    Text("No source data yet.").font(.callout).foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                ForEach(p?.leaderboard ?? []) { row in
-                    VStack(spacing: 2) {
-                        HStack {
-                            Text(row.source).font(.callout)
-                            Spacer()
-                            Text("\(row.wins ?? 0)W/\(row.losses ?? 0)L")
-                                .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
-                            Text(row.accuracy.map { Fmt.pct($0 * 100, dp: 0, signed: false) } ?? "—")
-                                .font(.caption.bold().monospacedDigit())
-                            Text("w \(Fmt.num(row.weight, dp: 2))")
-                                .font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
+        Card("Source accuracy leaderboard", subtitle: "wins and losses credited by postmortems") {
+            let rows = p?.leaderboard ?? []
+            if rows.isEmpty {
+                EmptyNote(text: "No source data yet.", icon: "scalemass")
+            } else {
+                VStack(spacing: DS.s3) {
+                    ForEach(rows) { row in
+                        VStack(alignment: .leading, spacing: 5) {
+                            HStack {
+                                Text(row.source).font(DSFont.semibold(14))
+                                    .foregroundStyle(DS.text)
+                                Spacer()
+                                Text("\(row.wins ?? 0)W / \(row.losses ?? 0)L")
+                                    .font(DSFont.num(12)).foregroundStyle(DS.textMuted)
+                                Text(row.accuracy.map {
+                                    Fmt.pct($0 * 100, dp: 0, signed: false) } ?? "—")
+                                    .font(DSFont.num(13, .bold))
+                                    .foregroundStyle((row.accuracy ?? 0) >= 0.5 ? DS.up : DS.down)
+                                Tag("w \(Fmt.num(row.weight, dp: 2))", tone: .neutral, size: 10)
+                            }
+                            MeterBar(value: row.accuracy ?? 0,
+                                     tint: (row.accuracy ?? 0) >= 0.5 ? DS.accent2 : DS.down)
                         }
-                        Gauge(value: row.accuracy ?? 0, in: 0...1) { EmptyView() }
-                            .gaugeStyle(.accessoryLinearCapacity)
-                            .tint((row.accuracy ?? 0) >= 0.5 ? Color.up : Color.down)
-                            .scaleEffect(y: 0.7)
                     }
                 }
             }
-        } label: { Label("Source accuracy leaderboard", systemImage: "scalemass") }
+        }
     }
 
     private var skillVersionsCard: some View {
-        GroupBox {
-            VStack(spacing: 4) {
-                if (p?.skillVersions ?? []).isEmpty {
-                    Text("No skill rewrites yet.").font(.callout).foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                ForEach(p?.skillVersions ?? []) { s in
-                    KeyValueRow(key: s.skill,
-                                value: "v\(String(format: "%03d", s.latest ?? 0)) · \(s.versions ?? 0) snapshots")
+        Card("Skill file versions", subtitle: "every rewrite is snapshotted and reversible") {
+            let rows = p?.skillVersions ?? []
+            if rows.isEmpty {
+                EmptyNote(text: "No skill rewrites yet.", icon: "doc.badge.gearshape")
+            } else {
+                VStack(spacing: DS.s2) {
+                    ForEach(rows) { s in
+                        KeyValueRow(key: s.skill,
+                                    value: "v\(String(format: "%03d", s.latest ?? 0)) · \(s.versions ?? 0) snapshots")
+                    }
                 }
             }
-        } label: { Label("Skill file versions", systemImage: "doc.badge.gearshape") }
+        }
+    }
+
+    @ViewBuilder
+    private var accuracyChartCard: some View {
+        let rows = (p?.leaderboard ?? []).filter { $0.accuracy != nil }
+        if rows.count > 1 {
+            Card("Accuracy vs weight", subtitle: "the bot pays attention in proportion to being right") {
+                Chart(rows) { row in
+                    BarMark(x: .value("Source", row.source),
+                            y: .value("Accuracy", (row.accuracy ?? 0) * 100))
+                        .foregroundStyle((row.accuracy ?? 0) >= 0.5 ? DS.accent2 : DS.down)
+                        .cornerRadius(5)
+                    PointMark(x: .value("Source", row.source),
+                              y: .value("Weight", (row.weight ?? 0) * 100))
+                        .foregroundStyle(DS.accent)
+                        .symbolSize(70)
+                }
+                .chartYAxis {
+                    AxisMarks(position: .leading) { _ in
+                        AxisGridLine().foregroundStyle(DS.divider)
+                        AxisValueLabel().font(DSFont.num(10))
+                    }
+                }
+                .chartXAxis {
+                    AxisMarks { _ in AxisValueLabel().font(DSFont.num(10)) }
+                }
+                .frame(height: 200)
+                HStack(spacing: DS.s3) {
+                    Tag("bar = accuracy %", tone: .sage, size: 10)
+                    Tag("dot = weight %", tone: .accent, size: 10)
+                }
+            }
+        }
     }
 
     @ViewBuilder
     private var learnedRulesCard: some View {
         let rules = p?.learnedRules?.arrayValue ?? []
         if !rules.isEmpty {
-            GroupBox {
-                VStack(alignment: .leading, spacing: 10) {
+            Card("Learned rules", subtitle: "promoted from postmortems after repeat evidence") {
+                VStack(alignment: .leading, spacing: DS.s3) {
                     ForEach(Array(rules.enumerated()), id: \.offset) { _, r in
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("\(r["id"]?.stringValue ?? "LR?") · \(r["added"]?.stringValue ?? "")")
-                                .font(.caption.bold().monospaced())
-                                .foregroundStyle(Color.accentColor)
+                        VStack(alignment: .leading, spacing: 3) {
+                            HStack(spacing: 8) {
+                                Tag(r["id"]?.stringValue ?? "LR?", tone: .accent, size: 10)
+                                Text(r["added"]?.stringValue ?? "")
+                                    .font(DSFont.num(11)).foregroundStyle(DS.textFaint)
+                            }
                             Text(r["rule"]?.stringValue ?? r.compact)
-                                .font(.callout)
+                                .font(DSFont.body(14)).foregroundStyle(DS.text)
+                                .fixedSize(horizontal: false, vertical: true)
                         }
                     }
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
-            } label: { Label("Learned rules (from postmortems)", systemImage: "checkmark.shield") }
+            }
         }
     }
 
@@ -112,26 +184,25 @@ struct LearningView: View {
     private var observationsCard: some View {
         let obs = p?.observations?.arrayValue ?? []
         if !obs.isEmpty {
-            GroupBox {
-                VStack(alignment: .leading, spacing: 8) {
+            Card("Observations pending confirmation",
+                 subtitle: "need 3+ similar outcomes before they become rules") {
+                VStack(alignment: .leading, spacing: DS.s3) {
                     ForEach(Array(obs.enumerated()), id: \.offset) { _, o in
-                        HStack(alignment: .firstTextBaseline, spacing: 6) {
+                        HStack(alignment: .top, spacing: DS.s2) {
                             Image(systemName: "eye")
-                                .font(.caption).foregroundStyle(Color.caution)
-                            VStack(alignment: .leading, spacing: 1) {
+                                .font(.system(size: 12)).foregroundStyle(DS.caution)
+                                .frame(width: 18)
+                            VStack(alignment: .leading, spacing: 2) {
                                 Text(o["id"]?.stringValue ?? "OBS?")
-                                    .font(.caption.bold().monospaced())
-                                    .foregroundStyle(Color.caution)
-                                Text(o["observation"]?.stringValue ?? o["note"]?.stringValue ?? o.compact)
-                                    .font(.callout)
+                                    .font(DSFont.semibold(12)).foregroundStyle(DS.caution)
+                                Text(o["observation"]?.stringValue
+                                     ?? o["note"]?.stringValue ?? o.compact)
+                                    .font(DSFont.body(14)).foregroundStyle(DS.text)
+                                    .fixedSize(horizontal: false, vertical: true)
                             }
                         }
                     }
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
-            } label: {
-                Label("Observations pending confirmation (need 3+ similar outcomes)",
-                      systemImage: "hourglass")
             }
         }
     }
@@ -140,32 +211,41 @@ struct LearningView: View {
     private var queueCard: some View {
         let queue = p?.rewriteQueue ?? []
         if !queue.isEmpty {
-            GroupBox {
-                VStack(alignment: .leading, spacing: 6) {
-                    ForEach(queue) { e in
-                        HStack(spacing: 8) {
+            Card("Strategy-rewrite queue", subtitle: "each close queues one skill_5 review") {
+                VStack(spacing: 0) {
+                    ForEach(Array(queue.enumerated()), id: \.offset) { i, e in
+                        TRow(showsDivider: i < queue.count - 1) {
                             Image(systemName: e.done == true ? "checkmark.circle.fill" : "clock.fill")
-                                .foregroundStyle(e.done == true ? Color.up : Color.caution)
-                                .font(.caption)
-                            VStack(alignment: .leading, spacing: 1) {
-                                HStack(spacing: 6) {
-                                    Text(e.tradeId ?? "—").font(.caption.bold().monospaced())
-                                    Text(e.symbol ?? "").font(.caption.monospaced())
-                                    if let out = e.outcome {
-                                        Text(out).font(.caption2.bold())
-                                            .foregroundStyle(out == "WIN" ? Color.up : Color.down)
-                                    }
-                                    Text(e.pnl ?? "").font(.caption2.monospacedDigit())
-                                        .foregroundStyle(.secondary)
-                                }
-                                Text(e.done == true ? "processed by skill_5" : "queued for skill_5 rewrite")
-                                    .font(.caption2).foregroundStyle(.secondary)
+                                .font(.system(size: 12))
+                                .foregroundStyle(e.done == true ? DS.up : DS.caution)
+                                .frame(width: 18)
+                            TCell {
+                                Text(e.tradeId ?? "—").font(DSFont.mono(12))
+                                    .foregroundStyle(DS.text)
                             }
-                            Spacer()
+                            TCell {
+                                Text(e.symbol ?? "").font(DSFont.semibold(13))
+                                    .foregroundStyle(DS.text)
+                            }
+                            TCell {
+                                if let out = e.outcome {
+                                    Tag(out, tone: out == "WIN" ? .up : .down, size: 10)
+                                }
+                            }
+                            TCell(align: .trailing) {
+                                Text(e.pnl ?? "").font(DSFont.num(12))
+                                    .foregroundStyle(DS.textMuted)
+                            }
+                            TCell(align: .trailing, weight: 2) {
+                                Text(e.done == true ? "processed by skill_5"
+                                     : "queued for skill_5 rewrite")
+                                    .font(DSFont.body(12)).foregroundStyle(DS.textMuted)
+                                    .lineLimit(1)
+                            }
                         }
                     }
                 }
-            } label: { Label("Strategy-rewrite queue", systemImage: "arrow.triangle.branch") }
+            }
         }
     }
 
@@ -173,69 +253,49 @@ struct LearningView: View {
     private var verdictsCard: some View {
         let verdicts = p?.verdicts ?? []
         if !verdicts.isEmpty {
-            GroupBox {
-                VStack(alignment: .leading, spacing: 10) {
+            Card("Per-trade source verdicts", subtitle: "which source was right about which trade") {
+                VStack(alignment: .leading, spacing: DS.s3) {
                     ForEach(Array(verdicts.enumerated()), id: \.offset) { _, v in
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text(v.file ?? "—").font(.caption.monospaced())
-                                .foregroundStyle(.secondary)
-                            let sources = (v.sources ?? [:]).sorted { $0.key < $1.key }
-                            FlowChips(items: sources.map { (name: $0.key, ok: $0.value) })
+                        VStack(alignment: .leading, spacing: 5) {
+                            Text(v.file ?? "—").font(DSFont.mono(11))
+                                .foregroundStyle(DS.textFaint)
+                            SourceChips(sources: v.sources ?? [:])
                         }
                     }
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
-            } label: { Label("Per-trade source verdicts", systemImage: "checklist") }
+            }
         }
     }
 
     private var analysesCard: some View {
-        GroupBox {
-            VStack(alignment: .leading, spacing: 6) {
-                if (p?.postmortems ?? []).isEmpty {
-                    Text("No postmortems or victories yet.")
-                        .font(.callout).foregroundStyle(.secondary)
-                }
-                ForEach(p?.postmortems ?? []) { pm in
-                    Button { document = pm } label: {
-                        HStack(spacing: 8) {
+        Card("All analyses", subtitle: "postmortems and victories, newest first") {
+            let pms = p?.postmortems ?? []
+            if pms.isEmpty {
+                EmptyNote(text: "No postmortems or victories yet.", icon: "books.vertical")
+            } else {
+                VStack(spacing: 0) {
+                    ForEach(pms) { pm in
+                        TRow(showsDivider: pm.id != pms.last?.id, onTap: { document = pm }) {
                             Image(systemName: pm.kind == "victory" ? "trophy.fill" : "stethoscope")
-                                .foregroundStyle(pm.kind == "victory" ? Color.up : Color.down)
+                                .font(.system(size: 12))
+                                .foregroundStyle(pm.kind == "victory" ? DS.up : DS.down)
                                 .frame(width: 18)
-                            VStack(alignment: .leading, spacing: 1) {
-                                Text(pm.title ?? pm.file).font(.callout).lineLimit(1)
-                                Text("\(pm.file) · \((pm.tradeIds ?? []).joined(separator: ", "))")
-                                    .font(.caption2.monospaced()).foregroundStyle(.secondary)
+                            TCell(weight: 4) {
+                                VStack(alignment: .leading, spacing: 1) {
+                                    Text(pm.title ?? pm.file).font(DSFont.body(13))
+                                        .foregroundStyle(DS.text).lineLimit(1)
+                                    Text("\(pm.file) · \((pm.tradeIds ?? []).joined(separator: ", "))")
+                                        .font(DSFont.mono(10)).foregroundStyle(DS.textFaint)
+                                        .lineLimit(1)
+                                }
                             }
-                            Spacer()
-                            Image(systemName: "chevron.right")
-                                .font(.caption2).foregroundStyle(.tertiary)
+                            TCell(align: .trailing) {
+                                Image(systemName: "chevron.right")
+                                    .font(.system(size: 10, weight: .bold))
+                                    .foregroundStyle(DS.textFaint)
+                            }
                         }
-                        .contentShape(Rectangle())
                     }
-                    .buttonStyle(.plain)
-                }
-            }
-        } label: { Label("All analyses", systemImage: "books.vertical") }
-    }
-}
-
-/// Wrapping row of right/wrong source chips.
-struct FlowChips: View {
-    let items: [(name: String, ok: Bool)]
-
-    var body: some View {
-        WidthReader(compactBelow: 0) { _ in
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: 110), spacing: 6)],
-                      alignment: .leading, spacing: 4) {
-                ForEach(items, id: \.name) { item in
-                    Label(item.name, systemImage: item.ok ? "checkmark" : "xmark")
-                        .font(.caption2.weight(.semibold))
-                        .lineLimit(1)
-                        .padding(.horizontal, 6).padding(.vertical, 2)
-                        .background((item.ok ? Color.up : Color.down).opacity(0.12),
-                                    in: Capsule())
-                        .foregroundStyle(item.ok ? Color.up : Color.down)
                 }
             }
         }
@@ -249,68 +309,62 @@ struct LibraryView: View {
     @State private var search = ""
     @State private var research: ResearchFileMeta?
     @State private var analysis: PostmortemMeta?
+    @State private var kind: LibraryKind = .all
+
+    enum LibraryKind: String, CaseIterable, Hashable {
+        case all = "All", picks = "Research", reviews = "Midweek",
+             postmortems = "Postmortems", victories = "Victories"
+    }
 
     private var p: LibraryPayload? { model.libraryPayload }
 
     private var researchFiles: [ResearchFileMeta] {
-        (p?.research ?? []).filter {
-            search.isEmpty || $0.file.lowercased().contains(search.lowercased())
+        (p?.research ?? []).filter { f in
+            (kind == .all || kind == .picks || kind == .reviews)
+            && (kind != .picks || f.kind == "picks")
+            && (kind != .reviews || f.kind != "picks")
+            && (search.isEmpty || f.file.lowercased().contains(search.lowercased()))
         }
     }
     private var analyses: [PostmortemMeta] {
-        (p?.postmortems ?? []).filter {
-            search.isEmpty
-            || $0.file.lowercased().contains(search.lowercased())
-            || ($0.title ?? "").lowercased().contains(search.lowercased())
+        (p?.postmortems ?? []).filter { pm in
+            (kind == .all || kind == .postmortems || kind == .victories)
+            && (kind != .postmortems || pm.kind != "victory")
+            && (kind != .victories || pm.kind == "victory")
+            && (search.isEmpty
+                || pm.file.lowercased().contains(search.lowercased())
+                || (pm.title ?? "").lowercased().contains(search.lowercased()))
         }
     }
 
     var body: some View {
-        List {
-            if let err = model.tabErrors[.library] { ErrorBox(text: err) }
-            Section("Research (\(researchFiles.count)) — weekend picks + midweek reviews") {
-                ForEach(researchFiles) { f in
-                    Button { research = f } label: {
-                        HStack(spacing: 8) {
-                            Image(systemName: f.kind == "picks" ? "lightbulb.fill" : "stethoscope.circle")
-                                .foregroundStyle(f.kind == "picks" ? Color.caution : Color.accentColor)
-                                .frame(width: 18)
-                            VStack(alignment: .leading, spacing: 1) {
-                                Text(f.file).font(.callout.monospaced()).lineLimit(1)
-                                Text(f.kind == "picks" ? "research picks · \(f.date ?? "")"
-                                     : "midweek review · \(f.date ?? "")")
-                                    .font(.caption2).foregroundStyle(.secondary)
+        Group {
+            if p == nil {
+                LoadingScreen(title: "Loading library…", detail: "research files and analyses")
+                    .background(DS.bg)
+            } else {
+                Screen(title: "Library", subtitle: AppTab.library.blurb,
+                       refresh: { await model.load(.library) }) {
+                    if let err = model.tabErrors[.library] { ErrorBox(text: err) }
+                    Card {
+                        WidthReader(compactBelow: 640) { compact in
+                            let pills = FilterPills(
+                                options: LibraryKind.allCases.map { ($0, $0.rawValue) },
+                                selection: $kind)
+                            let field = OrganicField(prompt: "filename / title",
+                                                     text: $search, width: 260)
+                            if compact {
+                                VStack(alignment: .leading, spacing: DS.s3) { pills; field }
+                            } else {
+                                HStack(spacing: DS.s3) { pills; Spacer(minLength: DS.s2); field }
                             }
-                            Spacer()
-                            Image(systemName: "chevron.right").font(.caption2).foregroundStyle(.tertiary)
                         }
-                        .contentShape(Rectangle())
                     }
-                    .buttonStyle(.plain)
-                }
-            }
-            Section("Analyses (\(analyses.count)) — postmortems + victories") {
-                ForEach(analyses) { pm in
-                    Button { analysis = pm } label: {
-                        HStack(spacing: 8) {
-                            Image(systemName: pm.kind == "victory" ? "trophy.fill" : "stethoscope")
-                                .foregroundStyle(pm.kind == "victory" ? Color.up : Color.down)
-                                .frame(width: 18)
-                            VStack(alignment: .leading, spacing: 1) {
-                                Text(pm.title ?? pm.file).font(.callout).lineLimit(1)
-                                Text(pm.file).font(.caption2.monospaced()).foregroundStyle(.secondary)
-                            }
-                            Spacer()
-                            Image(systemName: "chevron.right").font(.caption2).foregroundStyle(.tertiary)
-                        }
-                        .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
+                    researchCard
+                    analysesCard
                 }
             }
         }
-        .searchable(text: $search, prompt: "filename / title")
-        .refreshable { await model.load(.library) }
         .task { if p == nil { await model.load(.library) } }
         .sheet(item: $research) { f in
             DocumentSheet(title: f.file, loader: { await model.researchText(f.file) })
@@ -318,8 +372,74 @@ struct LibraryView: View {
         .sheet(item: $analysis) { pm in
             DocumentSheet(title: pm.file, loader: { await model.postmortemText(pm.file) })
         }
-        .overlay {
-            if p == nil { ContentUnavailableView("Loading library…", systemImage: "books.vertical") }
+    }
+
+    @ViewBuilder
+    private var researchCard: some View {
+        if !researchFiles.isEmpty || kind == .all {
+            Card("Research (\(researchFiles.count))",
+                 subtitle: "weekend picks and midweek reviews") {
+                if researchFiles.isEmpty {
+                    EmptyNote(text: "No research files match.", icon: "lightbulb")
+                } else {
+                    VStack(spacing: 0) {
+                        ForEach(researchFiles) { f in
+                            TRow(showsDivider: f.id != researchFiles.last?.id,
+                                 onTap: { research = f }) {
+                                Image(systemName: f.kind == "picks"
+                                      ? "lightbulb.fill" : "stethoscope.circle")
+                                    .font(.system(size: 12))
+                                    .foregroundStyle(f.kind == "picks" ? DS.caution : DS.accent)
+                                    .frame(width: 18)
+                                TCell(weight: 4) {
+                                    Text(f.file).font(DSFont.mono(12))
+                                        .foregroundStyle(DS.text).lineLimit(1)
+                                }
+                                TCell(align: .trailing, weight: 2) {
+                                    Tag(f.kind == "picks" ? "research picks" : "midweek review",
+                                        tone: f.kind == "picks" ? .caution : .accent, size: 10)
+                                }
+                                TCell(align: .trailing) {
+                                    Text(f.date ?? "").font(DSFont.num(11))
+                                        .foregroundStyle(DS.textFaint)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var analysesCard: some View {
+        if !analyses.isEmpty || kind == .all {
+            Card("Analyses (\(analyses.count))", subtitle: "postmortems and victories") {
+                if analyses.isEmpty {
+                    EmptyNote(text: "No analyses match.", icon: "stethoscope")
+                } else {
+                    VStack(spacing: 0) {
+                        ForEach(analyses) { pm in
+                            TRow(showsDivider: pm.id != analyses.last?.id,
+                                 onTap: { analysis = pm }) {
+                                Image(systemName: pm.kind == "victory"
+                                      ? "trophy.fill" : "stethoscope")
+                                    .font(.system(size: 12))
+                                    .foregroundStyle(pm.kind == "victory" ? DS.up : DS.down)
+                                    .frame(width: 18)
+                                TCell(weight: 4) {
+                                    Text(pm.title ?? pm.file).font(DSFont.body(13))
+                                        .foregroundStyle(DS.text).lineLimit(1)
+                                }
+                                TCell(align: .trailing, weight: 2) {
+                                    Text(pm.file).font(DSFont.mono(11))
+                                        .foregroundStyle(DS.textFaint).lineLimit(1)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -328,85 +448,88 @@ struct LibraryView: View {
 
 struct RX3View: View {
     @Environment(AppModel.self) private var model
+    @State private var showRawConfig = false
 
     private var p: RX3Payload? { model.rx3Payload }
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 14) {
-                if let err = model.tabErrors[.rx3] { ErrorBox(text: err) }
-                hero
-                curveCard
-                AdaptivePair(compactBelow: 700) {
-                    bookCard
-                } second: {
-                    gatesCard
+        Group {
+            if p == nil {
+                LoadingScreen(title: "Loading RX-3 paper track…",
+                              detail: "rotation × vol throttle × RISKX")
+                    .background(DS.bg)
+            } else {
+                Screen(title: "RX-3 Rotation", subtitle: AppTab.rx3.blurb,
+                       refresh: { await model.load(.rx3) }) {
+                    if let err = model.tabErrors[.rx3] { ErrorBox(text: err) }
+                    statTiles
+                    promotionCard
+                    curveCard
+                    AdaptivePair(compactBelow: 860, ratio: 1.4) {
+                        bookCard
+                    } second: {
+                        gatesCard
+                    }
+                    historyCard
+                    rawConfigCard
                 }
-                historyCard
-                configCard
             }
-            .padding()
         }
-        .refreshable { await model.load(.rx3) }
         .task { if p == nil { await model.load(.rx3) } }
-        .overlay {
-            if p == nil { ContentUnavailableView("Loading RX-3 paper track…",
-                                                 systemImage: "arrow.triangle.2.circlepath") }
+    }
+
+    private var statTiles: some View {
+        let m = p?.meta
+        return StatRow {
+            StatCard(label: "Paper equity", value: Fmt.usd(m?.equity),
+                     delta: Fmt.pct(m?.returnPct) + " since start",
+                     deltaTone: .forValue(m?.returnPct),
+                     sublabel: "started \(Fmt.when(m?.startDate))")
+            StatCard(label: "Cash parked", value: Fmt.usd(m?.cash),
+                     delta: p?.latest?.cashW.map {
+                        Fmt.pct($0 * 100, dp: 0, signed: false) + " weight" } ?? nil,
+                     deltaTone: .neutral,
+                     sublabel: "vol throttle + RISKX")
+            StatCard(label: "RISKX gate",
+                     value: Fmt.pct((p?.latest?.riskx ?? 0) * 100, dp: 0, signed: false),
+                     delta: "vol scale \(Fmt.pct((p?.latest?.volScale ?? 0) * 100, dp: 0, signed: false))",
+                     deltaTone: (p?.latest?.riskx ?? 0) >= 0.6 ? .up : .caution,
+                     sublabel: "5-signal cross-asset risk appetite")
+            StatCard(label: "Paper days",
+                     value: "\(p?.paperDays ?? 0)",
+                     delta: "gate at \(p?.promotionGateDays ?? 10)",
+                     deltaTone: (p?.paperDays ?? 0) >= (p?.promotionGateDays ?? 10) ? .up : .caution,
+                     sublabel: "last run \(Fmt.when(m?.lastRun))")
         }
     }
 
-    private var hero: some View {
-        GroupBox {
-            VStack(alignment: .leading, spacing: 10) {
-                HStack(spacing: 14) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Paper equity").font(.caption).foregroundStyle(.secondary)
-                        Text(Fmt.usd(p?.meta?.equity)).font(.title2.bold().monospacedDigit())
-                    }
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Since start").font(.caption).foregroundStyle(.secondary)
-                        Text(Fmt.pct(p?.meta?.returnPct))
-                            .font(.title3.bold().monospacedDigit())
-                            .foregroundStyle((p?.meta?.returnPct ?? 0).pnlColor)
-                    }
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Cash").font(.caption).foregroundStyle(.secondary)
-                        Text(Fmt.usd(p?.meta?.cash)).font(.title3.monospacedDigit())
-                    }
+    private var promotionCard: some View {
+        let days = p?.paperDays ?? 0
+        let gate = p?.promotionGateDays ?? 10
+        return Card("Promotion ladder — paper phase",
+                    subtitle: "≥\(gate) matching paper days → 2 weeks half size → full") {
+            VStack(alignment: .leading, spacing: DS.s2) {
+                HStack {
+                    Text("Auto-rotate")
+                        .font(DSFont.body(13)).foregroundStyle(DS.textMuted)
+                    Tag(p?.config?["paper_enabled"]?.boolValue == true ? "ON (paper)" : "off",
+                        tone: p?.config?["paper_enabled"]?.boolValue == true ? .sage : .neutral)
                     Spacer()
-                    VStack(alignment: .trailing, spacing: 2) {
-                        Text("last run \(Fmt.when(p?.meta?.lastRun))")
-                            .font(.caption2).foregroundStyle(.secondary)
-                        Text("started \(Fmt.when(p?.meta?.startDate))")
-                            .font(.caption2).foregroundStyle(.secondary)
-                    }
+                    Text("\(days)/\(gate) days")
+                        .font(DSFont.num(14, .bold))
+                        .foregroundStyle(days >= gate ? DS.up : DS.caution)
                 }
-                let days = p?.paperDays ?? 0
-                let gate = p?.promotionGateDays ?? 10
-                VStack(alignment: .leading, spacing: 3) {
-                    HStack {
-                        Text("Promotion ladder — paper phase")
-                            .font(.caption.weight(.semibold))
-                        Spacer()
-                        Text("\(days)/\(gate) days")
-                            .font(.caption.bold().monospacedDigit())
-                            .foregroundStyle(days >= gate ? Color.up : Color.caution)
-                    }
-                    ProgressView(value: Double(min(days, gate)), total: Double(gate))
-                        .tint(days >= gate ? Color.up : Color.caution)
-                    Text("≥\(gate) paper days matching the engine → 2 weeks half size → full. Flipping live is an operator action.")
-                        .font(.caption2).foregroundStyle(.secondary)
-                }
+                MeterBar(value: Double(min(days, gate)) / Double(max(1, gate)),
+                         tint: days >= gate ? DS.up : DS.caution, height: 10)
+                Text("Flipping this sleeve to live capital is an operator action — the app never does it for you.")
+                    .font(DSFont.body(12)).foregroundStyle(DS.textMuted)
             }
-        } label: {
-            Label("RX-3 — deterministic rotation × vol throttle × RISKX (paper)",
-                  systemImage: "arrow.triangle.2.circlepath")
         }
     }
 
     private struct CurvePoint: Identifiable {
         let id = UUID()
-        let ts: String
+        let date: Date
         let series: String
         let value: Double
     }
@@ -416,104 +539,138 @@ struct RX3View: View {
         let curve = p?.curve ?? []
         if let base = curve.first?.value, base > 0 {
             for pt in curve {
-                if let v = pt.value, let ts = pt.ts {
-                    out.append(CurvePoint(ts: ts, series: "RX-3", value: v / base * 100))
+                if let v = pt.value, let d = Fmt.date(pt.ts) {
+                    out.append(CurvePoint(date: d, series: "RX-3", value: v / base * 100))
                 }
             }
         }
         let spy = p?.spySinceStart ?? []
         if let base = spy.first?.close, base > 0 {
             for pt in spy {
-                if let c = pt.close, let ts = pt.ts {
-                    out.append(CurvePoint(ts: ts, series: "SPY", value: c / base * 100))
+                if let c = pt.close, let d = Fmt.date(pt.ts) {
+                    out.append(CurvePoint(date: d, series: "SPY", value: c / base * 100))
                 }
             }
         }
-        return out
+        return out.sorted { $0.date < $1.date }
     }
 
-    @ViewBuilder
     private var curveCard: some View {
-        let data = curveData
-        GroupBox {
+        Card("Paper equity vs SPY", subtitle: "indexed to 100 at the paper start") {
+            let data = curveData
             if data.count < 3 {
-                Text("Curve appears after a few paper days.")
-                    .font(.callout).foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, minHeight: 60, alignment: .leading)
+                EmptyNote(text: "Curve appears after a few paper days.",
+                          icon: "chart.xyaxis.line")
+                    .frame(minHeight: 80)
             } else {
                 Chart(data) { pt in
-                    LineMark(x: .value("Day", pt.ts), y: .value("Indexed", pt.value))
+                    LineMark(x: .value("Day", pt.date), y: .value("Indexed", pt.value))
                         .foregroundStyle(by: .value("Series", pt.series))
-                        .lineStyle(StrokeStyle(lineWidth: 1.8))
+                        .interpolationMethod(.monotone)
+                        .lineStyle(StrokeStyle(lineWidth: pt.series == "RX-3" ? 2.4 : 1.4,
+                                               lineCap: .round))
                 }
-                .chartForegroundStyleScale(["RX-3": Color.accentColor, "SPY": Color.secondary])
+                .chartForegroundStyleScale(["RX-3": DS.accent, "SPY": DS.neutral(5)])
                 .chartYScale(domain: .automatic(includesZero: false))
                 .chartXAxis {
-                    AxisMarks(values: .automatic(desiredCount: 5))
+                    AxisMarks(values: .automatic(desiredCount: 5)) { value in
+                        AxisGridLine().foregroundStyle(DS.divider.opacity(0.5))
+                        AxisValueLabel {
+                            if let d = value.as(Date.self) {
+                                Text(d, format: .dateTime.month(.abbreviated).day())
+                                    .font(DSFont.num(10))
+                                    .foregroundStyle(DS.textMuted)
+                            }
+                        }
+                    }
                 }
-                .frame(height: 190)
+                .chartYAxis {
+                    AxisMarks(position: .leading) { _ in
+                        AxisGridLine().foregroundStyle(DS.divider)
+                        AxisValueLabel().font(DSFont.num(10))
+                    }
+                }
+                .frame(height: 220)
             }
-        } label: { Label("Paper equity vs SPY (indexed to 100)", systemImage: "chart.xyaxis.line") }
+        }
     }
 
     private var bookCard: some View {
-        GroupBox {
-            VStack(alignment: .leading, spacing: 8) {
-                HStack(spacing: 6) {
-                    Text("Leaders").font(.caption).foregroundStyle(.secondary)
+        Card("Current paper book", subtitle: "top-2 momentum leaders + defensive sleeve") {
+            VStack(alignment: .leading, spacing: DS.s3) {
+                HStack(spacing: 7) {
+                    Text("Leaders").font(DSFont.body(12)).foregroundStyle(DS.textMuted)
                     ForEach(p?.latest?.leaders ?? p?.leaders ?? [], id: \.self) { s in
-                        chip(s, .up)
+                        Tag(s, tone: .up, size: 11)
                     }
                     if let def = p?.latest?.defensive, !def.isEmpty {
-                        Text("Defensive").font(.caption).foregroundStyle(.secondary)
-                        ForEach(def, id: \.self) { s in chip(s, .caution) }
+                        Text("Defensive").font(DSFont.body(12)).foregroundStyle(DS.textMuted)
+                        ForEach(def, id: \.self) { s in Tag(s, tone: .caution, size: 11) }
                     }
                     Spacer()
                 }
-                Divider()
-                ForEach(p?.positions ?? []) { pos in
-                    HStack {
-                        Text(pos.symbol).font(.callout.monospaced())
-                        Spacer()
-                        Text("\(Fmt.num(pos.shares, dp: 4)) sh")
-                            .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
-                        Text(Fmt.usd(pos.price ?? pos.lastPx))
-                            .font(.callout.monospacedDigit())
-                        Text(Fmt.pct(pos.changePct))
-                            .font(.caption.monospacedDigit())
-                            .foregroundStyle((pos.changePct ?? 0).pnlColor)
-                        Text(Fmt.usd(pos.value))
-                            .font(.callout.monospacedDigit())
-                            .frame(minWidth: 64, alignment: .trailing)
+                let positions = p?.positions ?? []
+                if positions.isEmpty {
+                    EmptyNote(text: "No paper positions — fully in cash.", icon: "banknote")
+                } else {
+                    VStack(spacing: 0) {
+                        THeader(columns: ["Ticker", "Shares", "Price", "Change", "Value"],
+                                alignments: [.leading, .trailing, .trailing, .trailing, .trailing])
+                        Rectangle().fill(DS.divider).frame(height: 1)
+                        ForEach(positions) { pos in
+                            TRow(showsDivider: pos.id != positions.last?.id) {
+                                TCell {
+                                    Text(pos.symbol).font(DSFont.bold(14))
+                                        .foregroundStyle(DS.text)
+                                }
+                                TCell(align: .trailing) {
+                                    Text(Fmt.num(pos.shares, dp: 4)).font(DSFont.num(12))
+                                        .foregroundStyle(DS.textMuted)
+                                }
+                                TCell(align: .trailing) {
+                                    Text(Fmt.usd(pos.price ?? pos.lastPx))
+                                        .font(DSFont.num(13)).foregroundStyle(DS.text)
+                                }
+                                TCell(align: .trailing) {
+                                    Text(Fmt.pct(pos.changePct))
+                                        .font(DSFont.num(12, .semibold))
+                                        .foregroundStyle(pos.changePct.pnlColor)
+                                }
+                                TCell(align: .trailing) {
+                                    Text(Fmt.usd(pos.value)).font(DSFont.num(13, .semibold))
+                                        .foregroundStyle(DS.text)
+                                }
+                            }
+                        }
                     }
                 }
                 if let latest = p?.latest {
-                    Divider()
-                    HStack(spacing: 12) {
+                    Rectangle().fill(DS.divider).frame(height: 1)
+                    HStack(spacing: DS.s4) {
                         gauge("RISKX", latest.riskx, "risk-appetite gate")
                         gauge("Vol scale", latest.volScale, "vol throttle")
                         gauge("Cash", latest.cashW, "weight parked")
                     }
                 }
             }
-        } label: { Label("Current paper book", systemImage: "briefcase") }
+        }
     }
 
     private func gauge(_ label: String, _ value: Double?, _ help: String) -> some View {
-        VStack(spacing: 2) {
-            Text(label).font(.caption2).foregroundStyle(.secondary)
-            Gauge(value: min(max(value ?? 0, 0), 1), in: 0...1) { EmptyView() }
-                .gaugeStyle(.accessoryLinearCapacity)
-                .tint(Color.accentColor)
+        VStack(alignment: .leading, spacing: 4) {
+            Text(label.uppercased()).font(DSFont.label(10)).kerning(0.5)
+                .foregroundStyle(DS.textFaint)
+            MeterBar(value: min(max(value ?? 0, 0), 1), tint: DS.accent)
             Text(Fmt.pct((value ?? 0) * 100, dp: 0, signed: false))
-                .font(.caption.bold().monospacedDigit())
+                .font(DSFont.num(12, .bold)).foregroundStyle(DS.text)
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
         .help(help)
     }
 
     private var gatesCard: some View {
-        GroupBox {
-            VStack(spacing: 4) {
+        Card("Rotation config", subtitle: "what the deterministic engine is running with") {
+            VStack(spacing: DS.s2) {
                 KeyValueRow(key: "Mode", value: p?.config?["mode"]?.stringValue ?? "paper")
                 KeyValueRow(key: "Paper enabled",
                             value: p?.config?["paper_enabled"]?.boolValue == true ? "yes" : "no")
@@ -522,58 +679,91 @@ struct RX3View: View {
                 KeyValueRow(key: "Universe",
                             value: "\((p?.config?["universe"]?.arrayValue ?? []).count) names")
                 if let note = p?.meta?.note {
-                    Divider().padding(.vertical, 2)
-                    Text(note).font(.caption2).foregroundStyle(.secondary)
+                    Rectangle().fill(DS.divider).frame(height: 1).padding(.vertical, 2)
+                    Text(note).font(DSFont.body(12)).foregroundStyle(DS.textMuted)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
-        } label: { Label("Rotation config", systemImage: "gearshape") }
+        }
     }
 
     @ViewBuilder
     private var historyCard: some View {
         let hist = p?.history ?? []
         if !hist.isEmpty {
-            GroupBox {
-                VStack(spacing: 6) {
+            Card("Daily decisions", subtitle: "one row per paper day, straight from the engine") {
+                VStack(spacing: 0) {
+                    THeader(columns: ["Date", "Equity", "Leaders", "Defensive",
+                                      "RISKX", "Vol", "Cash"],
+                            weights: [1, 1, 1.4, 1.2, 1, 1, 1],
+                            alignments: [.leading, .trailing, .leading, .leading,
+                                         .trailing, .trailing, .trailing])
+                    Rectangle().fill(DS.divider).frame(height: 1)
                     ForEach(hist) { day in
-                        HStack(spacing: 8) {
-                            Text(day.date ?? "—").font(.caption.monospaced())
-                                .frame(width: 84, alignment: .leading)
-                            Text(Fmt.usd(day.equity)).font(.caption.monospacedDigit())
-                                .frame(width: 70, alignment: .trailing)
-                            Text((day.leaders ?? []).joined(separator: "+"))
-                                .font(.caption2.monospaced()).foregroundStyle(Color.up)
-                            if let def = day.defensive, !def.isEmpty {
-                                Text(def.joined(separator: "+"))
-                                    .font(.caption2.monospaced()).foregroundStyle(Color.caution)
+                        TRow(showsDivider: day.id != hist.last?.id) {
+                            TCell {
+                                Text(day.date ?? "—").font(DSFont.num(12))
+                                    .foregroundStyle(DS.text)
                             }
-                            Spacer()
-                            Text("riskx \(Fmt.num(day.riskx, dp: 2))")
-                                .font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
-                            Text("vol \(Fmt.num(day.volScale, dp: 2))")
-                                .font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
-                            Text("cash \(Fmt.pct((day.cashW ?? 0) * 100, dp: 0, signed: false))")
-                                .font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
+                            TCell(align: .trailing) {
+                                Text(Fmt.usd(day.equity)).font(DSFont.num(12, .semibold))
+                                    .foregroundStyle(DS.text)
+                            }
+                            TCell(weight: 1.4) {
+                                Text((day.leaders ?? []).joined(separator: " + "))
+                                    .font(DSFont.num(12)).foregroundStyle(DS.up).lineLimit(1)
+                            }
+                            TCell(weight: 1.2) {
+                                Text((day.defensive ?? []).joined(separator: " + "))
+                                    .font(DSFont.num(12)).foregroundStyle(DS.caution).lineLimit(1)
+                            }
+                            TCell(align: .trailing) {
+                                Text(Fmt.num(day.riskx, dp: 2)).font(DSFont.num(12))
+                                    .foregroundStyle(DS.textMuted)
+                            }
+                            TCell(align: .trailing) {
+                                Text(Fmt.num(day.volScale, dp: 2)).font(DSFont.num(12))
+                                    .foregroundStyle(DS.textMuted)
+                            }
+                            TCell(align: .trailing) {
+                                Text(Fmt.pct((day.cashW ?? 0) * 100, dp: 0, signed: false))
+                                    .font(DSFont.num(12)).foregroundStyle(DS.textMuted)
+                            }
                         }
                     }
                 }
-            } label: { Label("Daily decisions", systemImage: "calendar.day.timeline.left") }
+            }
         }
     }
 
-    private var configCard: some View {
-        GroupBox {
-            Text(p?.config?.pretty ?? "—")
-                .font(.caption.monospaced())
-                .textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading)
-        } label: { Label("Raw rotation config", systemImage: "curlybraces") }
-    }
-
-    private func chip(_ text: String, _ color: Color) -> some View {
-        Text(text).font(.caption.bold().monospaced())
-            .padding(.horizontal, 7).padding(.vertical, 2)
-            .background(color.opacity(0.15), in: Capsule())
-            .foregroundStyle(color)
+    private var rawConfigCard: some View {
+        Card {
+            VStack(alignment: .leading, spacing: DS.s3) {
+                Button { showRawConfig.toggle() } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: showRawConfig ? "chevron.down" : "chevron.right")
+                            .font(.system(size: 10, weight: .bold))
+                        Text("Raw rotation config").font(DSFont.semibold(14))
+                        Spacer()
+                    }
+                    .foregroundStyle(DS.text)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                if showRawConfig {
+                    ScrollView {
+                        Text(p?.config?.pretty ?? "—")
+                            .font(DSFont.mono(11))
+                            .foregroundStyle(DS.consoleText)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .textSelection(.enabled)
+                            .padding(DS.s3)
+                    }
+                    .frame(maxHeight: 360)
+                    .background(DS.consoleBG,
+                                in: RoundedRectangle(cornerRadius: DS.rMd, style: .continuous))
+                }
+            }
+        }
     }
 }
