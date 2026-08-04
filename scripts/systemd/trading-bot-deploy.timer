@@ -1,0 +1,9 @@
+[Unit]
+Description=Run trading-bot-deploy daily, before pre-market research (04:25 ET anchor)
+
+[Timer]
+OnCalendar=*-*-* 02:47:00 America/New_York
+Persistent=true
+
+[Install]
+WantedBy=timers.target

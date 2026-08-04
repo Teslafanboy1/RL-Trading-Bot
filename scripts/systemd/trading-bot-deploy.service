@@ -1,0 +1,12 @@
+[Unit]
+Description=Trading bot daily deploy from git (test-gated)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=opc
+# Copy the deploy script to a stable path before running it, so a deploy
+# that updates scripts/vm_deploy.sh itself can never overwrite the file
+# bash is actively executing mid-run.
+ExecStart=/bin/bash -c 'install -m 755 /home/opc/trading-bot/scripts/vm_deploy.sh /home/opc/vm_deploy_run.sh && /home/opc/vm_deploy_run.sh'
