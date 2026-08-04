@@ -2385,6 +2385,10 @@ def _run_shadow_passes(raw_sigs, log):
         process_rx3_paper(log)
     except Exception as e:
         print(f"  [rx3] paper pass failed: {e}")
+    try:
+        process_rx4_paper(log)
+    except Exception as e:
+        print(f"  [rx4] paper pass failed: {e}")
 
 
 def process_cycle_state(log, actions, broker_positions, exit_info=None):
@@ -2598,6 +2602,7 @@ def write_stop_snapshot(log, strategy):
 
 # ---------------- RX-3 paper track (approved 2026-07-06; promotion gate #1) ----
 RX3_STATE_PATH = os.path.join(ROOT, "shadow", "rx3_paper.json")
+RX4_STATE_PATH = os.path.join(ROOT, "shadow", "rx4_paper.json")
 
 
 def _rx3_universe(strategy):
@@ -2734,6 +2739,116 @@ def process_rx3_paper(log):
           f"leaders={tb['leaders']} defensive={list(tb['defensive'])} "
           f"riskx={tb['riskx']} vol_scale={tb['vol_scale']} cash={tb['cash']}")
     append_audit_log("rx3", f"RX-3 paper {datetime.now(ET):%Y-%m-%d}",
+                     json.dumps(paper["history"][-1], indent=2))
+
+
+def process_rx4_paper(log):
+    """RX-4 (operator-directed 2026-08-04): the exact same rotation_engine.py
+    brain as RX-3, run with full_deploy=True (always 100% invested, no RISKX
+    defensive carve-out, no vol-throttle — 'turn up the volume, use all the
+    money'). top_n is a live config knob (strategy.json -> rotation_rx4.top_n,
+    default here matches RX-3's 2): briefly widened to 6 the same day after
+    operator pushback ('use my whole portfolio' was not a request to put it
+    all on 2 names), backtested both ways, then reverted to 2 after top_n=6
+    gave back most of the extra return for a smoother ride — see strategy.json
+    rotation_rx4._note for the numbers. Paper-only, ZERO real dollars,
+    NOT on any promotion ladder to live. Isolated + never raises into the
+    loop, same contract as process_rx3_paper / the options shadow passes."""
+    if not (rotation_engine and signals):
+        return
+    if not is_market_open():
+        return
+    strategy = load_strategy()
+    rcfg = strategy.get("rotation_rx4") or {}
+    if rcfg.get("paper_enabled") is False:
+        return
+    st = log.setdefault("_state", {})
+    h = _hours_since(st.get("last_rx4_ts"))
+    if h is not None and h < 20:
+        return
+    st["last_rx4_ts"] = now_iso()
+    save_trade_log(log)
+
+    universe = rcfg.get("universe") or _rx3_universe(strategy)
+    comp_syms = [s for pair in rotation_engine.RISKX_COMPONENTS for s in pair if s]
+    def_syms = list(rotation_engine.DEFENSIVE_ASSETS)
+    closes = _rx3_fetch_closes(sorted(set(universe + comp_syms + def_syms)))
+    if len([s for s in universe if s in closes]) < 5:
+        print("  [rx4] data fetch too thin — skipping today's paper pass")
+        return
+
+    hist = lambda s: closes[s][:-1]          # decisions: through yesterday only
+    marks = {s: closes[s][-1] for s in closes}
+
+    paper = load_json("shadow/rx4_paper.json", None) or {
+        "_note": "RX-4 paper track record (operator-directed 2026-08-04, "
+                 "HYPOTHETICAL 'turn up the volume' test of RX-3's engine). "
+                 "No real money, not on the RX-3 promotion ladder.",
+        "start_date": now_iso(), "start_equity": 100.0,
+        "cash": 100.0, "positions": {}, "leaders": [],
+        "sleeve_rets": [], "history": [],
+    }
+
+    prev_leaders = paper.get("leaders") or []
+    rets = []
+    for sym in prev_leaders:
+        c = closes.get(sym)
+        if c and len(c) >= 2 and c[-2] > 0:
+            rets.append(c[-1] / c[-2] - 1)
+    if rets:
+        paper["sleeve_rets"] = (paper.get("sleeve_rets", [])
+                                + [sum(rets) / len(rets)])[-60:]
+
+    tb = rotation_engine.target_book(
+        {s: hist(s) for s in universe if s in closes},
+        {s: hist(s) for s in comp_syms if s in closes},
+        {s: hist(s) for s in def_syms if s in closes},
+        paper.get("sleeve_rets", []),
+        held=prev_leaders,
+        sector_of=lambda s: sector_for(s, strategy),
+        leverage_factor=lambda s: leverage_factor(s, strategy),
+        full_deploy=True, top_n=rcfg.get("top_n", 2))
+    targets = {**tb["weights"], **tb["defensive"]}
+
+    positions = paper.get("positions", {})
+    cash = float(paper.get("cash") or 0)
+    equity = cash + sum(float(p.get("shares") or 0) * marks.get(s, float(p.get("last_px") or 0))
+                        for s, p in positions.items())
+    if equity <= 0:
+        equity = paper.get("start_equity", 100.0)
+    for sym in sorted(set(list(positions) + list(targets))):
+        px = marks.get(sym)
+        if not px or px <= 0:
+            continue
+        cur_val = float(positions.get(sym, {}).get("shares") or 0) * px
+        tgt_val = targets.get(sym, 0.0) * equity
+        delta = tgt_val - cur_val
+        if abs(delta) < 0.005 * equity:      # rebalance band: skip dust trades
+            if sym in positions:
+                positions[sym]["last_px"] = px
+            continue
+        cash -= delta + abs(delta) * 0.0005  # 5bps per side
+        if tgt_val <= 0:
+            positions.pop(sym, None)
+        else:
+            positions[sym] = {"shares": round(tgt_val / px, 6), "last_px": px}
+    equity = cash + sum(float(p["shares"]) * marks.get(s, float(p.get("last_px") or 0))
+                        for s, p in positions.items())
+
+    paper.update({"cash": round(cash, 4), "positions": positions,
+                  "leaders": tb["leaders"], "equity": round(equity, 4),
+                  "last_run": now_iso()})
+    paper.setdefault("history", []).append({
+        "date": datetime.now(ET).strftime("%Y-%m-%d"),
+        "equity": round(equity, 4), "leaders": tb["leaders"],
+        "defensive": list(tb["defensive"]), "riskx": tb["riskx"],
+        "vol_scale": tb["vol_scale"], "cash_w": tb["cash"]})
+    os.makedirs(os.path.dirname(RX4_STATE_PATH), exist_ok=True)
+    save_json("shadow/rx4_paper.json", paper)
+    ret_pct = (equity / paper.get("start_equity", 100.0) - 1) * 100
+    print(f"  [rx4] paper: equity {equity:.2f} ({ret_pct:+.2f}% since start) | "
+          f"leaders={tb['leaders']} cash={tb['cash']}")
+    append_audit_log("rx4", f"RX-4 paper {datetime.now(ET):%Y-%m-%d}",
                      json.dumps(paper["history"][-1], indent=2))
 
 

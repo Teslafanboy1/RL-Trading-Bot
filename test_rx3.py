@@ -172,6 +172,51 @@ class TestTargetBook:
         total = sum(tb["weights"].values()) + sum(tb["defensive"].values()) + tb["cash"]
         assert total <= 1.001
 
+    def test_full_deploy_ignores_riskx_off(self):
+        # RX-4: even with RISKX off and high sleeve vol, full_deploy stays
+        # 100% in the leaders instead of carving into DEFENS/cash.
+        u, cc, dc = self._inputs("off")
+        tb = re_.target_book(u, cc, dc, [0.06, -0.06] * 15, full_deploy=True)
+        assert tb["scale"] == 1.0
+        assert tb["defensive"] == {}
+        assert abs(tb["weights"]["AAA"] - 0.5) < 0.01
+        assert abs(tb["weights"]["BBB"] - 0.5) < 0.01
+        assert tb["cash"] < 0.01
+
+    def test_full_deploy_still_applies_leverage_haircut(self):
+        # buying-power throttle is skipped, but the per-name leverage safety
+        # rule (LR002) is not — a 3x ETF still gets sized down.
+        u, cc, dc = self._inputs("on")
+        tb = re_.target_book(u, cc, dc, [0.001] * 30, full_deploy=True,
+                             leverage_factor=lambda s: 3.0 if s == "AAA" else 1.0)
+        assert tb["weights"]["AAA"] == pytest.approx(tb["weights"]["BBB"] / 3, abs=0.01)
+
+    def test_full_deploy_default_false_unchanged(self):
+        # default behavior (RX-3) must be byte-for-byte unchanged.
+        u, cc, dc = self._inputs("off")
+        rets = [0.06, -0.06] * 15
+        assert re_.target_book(u, cc, dc, rets) == re_.target_book(u, cc, dc, rets, full_deploy=False)
+
+    def test_top_n_widens_leader_count(self):
+        # RX-4: top_n=6 should fill up to 6 slots (fewer if fewer names qualify)
+        # instead of RX-3's default 2, spreading the same full deployment wider.
+        u = {f"S{i}": geo_series(300, 8.0 - i * 0.5) for i in range(8)}
+        cc = {"HYG": geo_series(60, 0.3), "IEF": geo_series(60, 0.0),
+              "XLY": geo_series(60, 0.3), "XLP": geo_series(60, 0.0),
+              "CPER": geo_series(60, 0.3), "GLD": geo_series(60, 0.0),
+              "IWM": geo_series(60, 0.3), "SPY": geo_series(60, 0.0),
+              "BTC-USD": geo_series(60, 0.3)}
+        dc = {"GLD": geo_series(60, 0.08)}
+        tb = re_.target_book(u, cc, dc, [0.001] * 30, full_deploy=True, top_n=6)
+        assert len(tb["leaders"]) == 6
+        assert sum(tb["weights"].values()) == pytest.approx(1.0, abs=0.01)
+        for w in tb["weights"].values():
+            assert w == pytest.approx(1 / 6, abs=0.01)
+
+    def test_top_n_defaults_to_module_constant(self):
+        u, cc, dc = self._inputs("on")
+        assert re_.target_book(u, cc, dc, [0.001] * 30) == re_.target_book(u, cc, dc, [0.001] * 30, top_n=re_.TOP_N)
+
 
 # ------------------------------------------------------------- risk guard
 class TestRiskGuard:

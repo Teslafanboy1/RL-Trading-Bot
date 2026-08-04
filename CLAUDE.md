@@ -308,6 +308,39 @@ size → full; see `research/redesign_proposal_2026-07-06.md`).
   `edge_lab2.py`, `edge_lab3.py` (28 mechanisms tested; survivors documented in
   the proposal addendum). Every future strategy idea must win there first.
 
+### RX-4 (operator-directed 2026-08-04) — "turn up the volume", paper-only hypothetical
+
+Same `rotation_engine.py` brain as RX-3, run through `target_book(..., full_deploy=True,
+top_n=2)`: always 100% invested (no RISKX defensive carve-out, no vol-throttle — the
+per-name leverage haircut on 3x ETFs still applies, that's a safety rule not a
+buying-power throttle), concentrated in the top-2 strongest movers, same as RX-3's
+picking logic. `top_n` is a live config knob (`strategy.json → rotation_rx4.top_n`,
+threaded through `rotation_engine.target_book()`/`select_leaders()`) — it was briefly
+widened to 6 the same day (operator pushback: "use my whole portfolio" ≠ "put it all on
+2 stocks") and backtested both ways:
+
+| | Final ($100 start) | CAGR | Sharpe | maxDD |
+|---|---|---|---|---|
+| RX-3 baseline | $1,795 | 38.1%/yr | 1.23 | 32% |
+| RX-4, top_n=2 | $3,342 | 48.1%/yr | 1.09 | 51% |
+| RX-4, top_n=6 | $1,871 | 38.8%/yr | 1.45 | 29% |
+
+top_n=6 came out **smoother than RX-3 on both risk measures** (lower maxDD, higher
+Sharpe) — but gave back almost all of top_n=2's extra return in the process, showing the
+extra CAGR at top_n=2 was mostly concentration risk premium, not something full_deploy
+added on its own. The operator saw that tradeoff and **reverted to top_n=2**, choosing the
+higher-return/higher-drawdown version knowingly. A monthly-profit-cap variant (stop
+trading once the paper book is up 10% for the calendar month) was also tested and came
+out **worse** (CAGR ~28%/yr, maxDD still ~52%) — it only trims the best months, it does
+nothing to the worst ones, so it gave back upside without buying any real downside
+protection. Not implemented.
+
+`agent.process_rx4_paper()` mirrors `process_rx3_paper()` structurally (own daily gate,
+own Yahoo fetch, own 5bps/side paper rebalance) and writes to `shadow/rx4_paper.json`,
+gated by `strategy.json → rotation_rx4.paper_enabled`. Paper-only, **zero real dollars**,
+and deliberately **not** on the RX-3 promotion ladder to live — it exists to observe the
+tradeoff, not to graduate.
+
 ## TradeCommand dashboard (`dashboard/`) — operator command center
 
 A stdlib-only server (no pip deps, no build step) that reads every bot state

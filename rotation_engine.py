@@ -204,7 +204,7 @@ def defensive_pick(defensive_closes, lookback=DEFENS_LOOKBACK):
 # ------------------------------------------------------------------ target book
 def target_book(universe_closes, component_closes, defensive_closes,
                 sleeve_daily_returns, held=None, sector_of=None,
-                leverage_factor=None):
+                leverage_factor=None, full_deploy=False, top_n=None):
     """The whole RX-3 allocation in one call. Returns a dict:
 
       {"weights": {SYM: w, ...},          # rotation leaders
@@ -215,25 +215,38 @@ def target_book(universe_closes, component_closes, defensive_closes,
 
     Weights sum to 1.0. Leveraged names get their weight divided by
     leverage_factor(sym) (the existing LR002 haircut), freed weight -> cash.
-    All inputs are closes through YESTERDAY; execute at today's prices."""
+    All inputs are closes through YESTERDAY; execute at today's prices.
+
+    full_deploy (RX-4, operator-directed 2026-08-04 hypothetical): skip the
+    RISKX/vol-throttle sizing and the DEFENS carve-out entirely, always
+    putting 100% into the top-N leaders (leverage haircut still applies —
+    that's a per-name safety rule, not a buying-power throttle).
+
+    top_n (RX-4, operator-directed 2026-08-04): how many leaders to hold,
+    overriding the module default TOP_N (2). RX-4 uses a wider spread (6) so
+    "use the whole portfolio" doesn't mean "all of it on 2 names" — same
+    momentum ranking and same max_per_sector cap as RX-3, just filling more
+    slots off the same ranked list before the money runs out."""
+    n = top_n or TOP_N
     g = riskx_score(component_closes)
     v = vol_scale(sleeve_daily_returns)
-    scale = g * v
-    leaders, scored = select_leaders(universe_closes, held=held, sector_of=sector_of)
+    scale = 1.0 if full_deploy else g * v
+    leaders, scored = select_leaders(universe_closes, top_n=n, held=held, sector_of=sector_of)
 
     weights = {}
     if leaders:
-        per = scale * (len(leaders) / TOP_N) / len(leaders)  # unfilled slot stays cash
+        per = scale * (len(leaders) / n) / len(leaders)  # unfilled slot stays cash
         for sym in leaders:
             lf = float(leverage_factor(sym)) if leverage_factor else 1.0
             weights[sym] = round(per / lf if lf > 1 else per, 4)
 
     defensive = {}
-    freed = max(0.0, 1.0 - g)              # RISKX-freed fraction only (tested form)
-    if freed > DEFENS_MIN_FREED:
-        pick, _ = defensive_pick(defensive_closes)
-        if pick:
-            defensive[pick] = round(freed, 4)
+    if not full_deploy:
+        freed = max(0.0, 1.0 - g)          # RISKX-freed fraction only (tested form)
+        if freed > DEFENS_MIN_FREED:
+            pick, _ = defensive_pick(defensive_closes)
+            if pick:
+                defensive[pick] = round(freed, 4)
 
     invested = sum(weights.values()) + sum(defensive.values())
     return {"weights": weights, "defensive": defensive,

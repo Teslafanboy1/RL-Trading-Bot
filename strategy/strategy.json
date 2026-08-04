@@ -540,7 +540,8 @@
       "target_dte_min": 30,
       "target_dte_max": 45,
       "strike_rule": "ATM (nearest listed strike to the underlying price)",
-      "max_bid_ask_pct_of_mid": 0.1
+      "max_bid_ask_pct_of_mid": 0.15,
+      "_max_bid_ask_note": "Loosened 0.10 -> 0.15 on 2026-08-04 (operator-directed diagnostic): the shadow had opened ZERO trades since inception despite qualifying BUY signals (NET conf 75, SNOW conf 72) sitting in front of it for days. Checked real Robinhood quotes directly: NET's ATM Sep-04 30-45DTE call (strike 285, spot ~283) was bid 21.95 / ask 25.30 = 14.2% spread; SNOW's ATM call (strike 310, spot ~308) was bid 27.05 / ask 30.45 = 11.8% spread, OI 52 / vol 28 (genuinely tradable, not a ghost quote). Both real, fillable contracts were bounced by the 10% gate. 10% is closer to a mega-cap (AAPL/SPY) spread than what a $100-300 mid-cap growth name's monthly ATM option realistically trades at. 15% lets these through while still rejecting truly illiquid strikes; entry is still the real ask, so the wider spread's cost stays fully captured in the paper P&L, not hidden."
     },
     "shadow_exit": {
       "_note": "Close a shadow when the underlying ribbon flips to SELL state, OR the option premium is down >= premium_stop_pct (long-option stop), OR DTE < min_dte_close (avoid gamma/expiry). Mirrors the equity exit discipline so the comparison is apples-to-apples.",
@@ -1052,5 +1053,11 @@
       "FAS",
       "TNA"
     ]
+  },
+  "rotation_rx4": {
+    "_note": "RX-4 (operator-directed 2026-08-04, HYPOTHETICAL): the same rotation_engine.py brain as RX-3, run with full_deploy=True ('turn up the volume, use all the money' — no RISKX defensive carve-out, no vol-throttle; leverage haircut on 3x ETFs still applies, that's a per-name safety rule not a buying-power throttle). top_n REVERTED to 2 (2026-08-04, same day): briefly widened to 6 after operator pushback ('use my whole portfolio' ≠ 'put it all on 2 stocks'), backtested both widths, and top_n=6 came out smoother (maxDD ~29%, Sharpe ~1.45, better than RX-3 on both) but gave back almost all the extra return (~39%/yr, versus top_n=2's ~48%/yr) — the concentration WAS most of the edge. Operator saw that tradeoff and chose to keep the $100->$3,342 concentrated version over the $100->$1,871 smoother one. Same momentum ranking + max_per_sector=2 cap as RX-3 either way; top_n is still a live config knob (agent.py/rotation_engine.py both support any value) if this gets revisited. Backtested 2017-2026 (agent's own replay, not the official edge_lab run) at top_n=2: CAGR ~48%/yr vs RX-3's ~38%/yr, but maxDD ~55% vs RX-3's ~32% and Sharpe ~1.0 vs ~1.2 — bigger swings both ways, a knowing tradeoff. A monthly-profit-cap variant (stop trading once +10% for the month is hit) was also tested and came out WORSE (CAGR ~28%, maxDD still ~52%) because it only trims winning months, not losing ones — rejected, not implemented here. Paper-only, ZERO real dollars, NOT on the RX-3 promotion ladder to live. agent.process_rx4_paper -> shadow/rx4_paper.json, gated by paper_enabled.",
+    "mode": "paper",
+    "paper_enabled": true,
+    "top_n": 2
   }
 }
