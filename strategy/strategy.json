@@ -1,5 +1,5 @@
 {
-  "version": 43,
+  "version": 44,
   "goal": "100% monthly portfolio return",
   "last_updated": "2026-08-11",
   "account": {
@@ -986,6 +986,13 @@
       "timestamp": "2026-08-11T09:02:23-04:00",
       "change": "OPERATOR-DIRECTED: add code_patches config for the new autonomous code-patch pipeline (skill_5 can now propose real Python fixes, test-gated in an isolated worktree, commit+push to origin/main on a clean pass). Off by default (enabled=false) until armed. No trading rule changed.",
       "trade_ids": []
+    },
+    {
+      "version": 44,
+      "date": "2026-08-11",
+      "timestamp": "2026-08-11T09:10:31-04:00",
+      "change": "OPERATOR-DIRECTED: arm the autonomous code-patch pipeline (code_patches.enabled: false -> true). Mechanism was built, tested (18 new tests + full 374-test suite on both dev machine and VM Python 3.9/git 2.52), and reviewed in the same session. skill_5 may now propose real Python patches for genuine code-level bugs; every proposal still has to clear the full safety chain (forbidden-files list, protected-symbol check, isolated-worktree test gate) before it can even reach git, and the VMs separate deploy pipeline re-tests independently before anything goes live. No trading rule changed.",
+      "trade_ids": []
     }
   ],
   "concentration": {
@@ -1069,7 +1076,7 @@
   },
   "code_patches": {
     "_comment": "Autonomous Python code-patch pipeline (skill_5 -> isolated worktree test gate -> commit+push to origin/main). See CLAUDE.md. enabled=false until the operator arms it.",
-    "enabled": false,
+    "enabled": true,
     "forbidden_files": [
       "risk_guard.py",
       "usage_governor.py",
