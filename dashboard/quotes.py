@@ -67,12 +67,24 @@ def quote(symbol):
     if hit is not None:
         return hit
     try:
+        # range=5d (not 1d): pre-market/overnight, today's session has only a
+        # handful of real ticks so far — a 1d spark degenerates to 2-3 flat
+        # points. 5d keeps the tail of the prior session(s) in the window so
+        # the chart always has real shape; still sliced to the most recent 70
+        # points below, so once today's session is underway this converges
+        # back to "mostly today" same as before.
         d = _fetch_json("https://query1.finance.yahoo.com/v8/finance/chart/"
-                        f"{symbol}?range=1d&interval=5m&includePrePost=true")
+                        f"{symbol}?range=5d&interval=5m&includePrePost=true")
         res = d["chart"]["result"][0]
         meta = res["meta"]
         price = meta.get("regularMarketPrice")
-        prev = meta.get("chartPreviousClose") or meta.get("previousClose")
+        # previousClose is always yesterday's close regardless of range;
+        # chartPreviousClose is relative to the start of whatever `range` was
+        # requested — since range=5d above, that field silently became "the
+        # close from 5 days ago" and inflated the day-change % accordingly
+        # (caught 2026-08-11: a fabricated +2.82%/+$10.05 "today"). previousClose
+        # must come first now that range isn't always 1d.
+        prev = meta.get("previousClose") or meta.get("chartPreviousClose")
         closes = [c for c in res["indicators"]["quote"][0].get("close", []) if c is not None]
         if price is None and closes:
             price = closes[-1]

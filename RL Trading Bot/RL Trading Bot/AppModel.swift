@@ -181,11 +181,12 @@ final class AppModel {
     private var pollTask: Task<Void, Never>?
 
     init() {
-        #if os(macOS)
-        let fallback = "http://127.0.0.1:8787"
-        #else
-        let fallback = ""
-        #endif
+        // The bot itself lives on the Oracle VM (trading-bot.tail79e604.ts.net)
+        // — nothing runs locally on the Mac or phone. Both platforms default to
+        // the VM's Tailscale-only HTTPS endpoint so a fresh install (including
+        // iOS, which has no local files to point at) just works once the
+        // device is signed into the same tailnet.
+        let fallback = "https://trading-bot.tail79e604.ts.net"
         let saved = UserDefaults.standard.string(forKey: "serverURL")
         serverURLString = (saved?.isEmpty == false) ? saved! : fallback
         appearance = UserDefaults.standard.string(forKey: "appearance")

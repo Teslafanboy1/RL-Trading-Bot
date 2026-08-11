@@ -174,7 +174,15 @@ def overview():
         })
     cash = pf.get("cash")
     total_broker = pf.get("total")
-    live_total = (live_equity + cash) if (cash is not None and live_equity) else None
+    # Re-marking the broker's last snapshot against live Yahoo quotes is only
+    # trustworthy while the market's open — pre/post-market those quotes are
+    # thin and can drift from the broker's own mark by real money (caught
+    # 2026-08-11: live_total read $1.50 high against a broker-confirmed total
+    # that matched the actual Robinhood app to the penny). The real kill-switch
+    # (risk_guard.check_halt) never reads this value — it always uses agent.py's
+    # own read_broker_state() — so this only affects this display card.
+    live_total = ((live_equity + cash) if (cash is not None and live_equity
+                  and quotes.market_open_now()) else None)
     rs = readers.risk_state()
     peak = float(rs.get("peak") or 0)
     ref_total = live_total or total_broker

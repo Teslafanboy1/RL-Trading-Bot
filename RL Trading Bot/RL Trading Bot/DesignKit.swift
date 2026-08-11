@@ -106,6 +106,7 @@ struct StatCard: View {
     var delta: String? = nil
     var deltaTone: DeltaTone = .neutral
     var sublabel: String? = nil
+    var sublabelTone: Color = DS.textMuted
     var valueSize: CGFloat = 26
 
     var body: some View {
@@ -131,7 +132,7 @@ struct StatCard: View {
             if let sublabel {
                 Text(sublabel)
                     .font(DSFont.body(13))
-                    .foregroundStyle(DS.textMuted)
+                    .foregroundStyle(sublabelTone)
                     .fixedSize(horizontal: false, vertical: true)
             }
         }

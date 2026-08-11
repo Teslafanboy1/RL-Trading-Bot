@@ -53,35 +53,63 @@ struct OverviewView: View {
 
     // MARK: stat tiles
 
+    /// A broker read this old is no longer trustworthy enough to show at face
+    /// value — the dashboard's own background poller dies silently (e.g. an
+    /// expired OAuth token demotes it to on-demand-only) and this app used to
+    /// just keep rendering the last successful snapshot forever with no cue
+    /// beyond a small timestamp caption. Mirrors the staleness thresholds
+    /// dashboard/server.py already uses for the heartbeat: 30 min while the
+    /// market's open (should be refreshing every poll), much more slack
+    /// off-hours, but never indefinite.
+    private func brokerReadStale(_ updated: String?) -> Bool {
+        guard let d = Fmt.date(updated) else { return true }
+        let age = Date().timeIntervalSince(d)
+        let marketOpen = model.meta?.marketOpen == true
+        return age > (marketOpen ? 30 * 60 : 26 * 3600)
+    }
+
     private var statTiles: some View {
         let a = ov?.account
-        let total = a?.liveTotal ?? a?.total
+        // live_total re-marks the broker's last confirmed snapshot against
+        // fresh Yahoo spot quotes — useful intraday, but pre/post-market
+        // those quotes are thin and can drift from Robinhood's own mark by
+        // real money (caught 2026-08-11: live_total read $368.20 against a
+        // broker-confirmed $366.70, itself within 3c of the Robinhood app).
+        // Only trust it while the market is actually open; otherwise the
+        // broker-confirmed total is the more correct number to show.
+        let total = model.meta?.marketOpen == true ? (a?.liveTotal ?? a?.total) : a?.total
         let day = (ov?.dayPnlPositions ?? 0) + (ov?.realizedToday ?? 0)
         let dayPct = (total ?? 0) > 0 ? day / (total! - day) * 100 : nil
         let s = ov?.summary
+        let stale = brokerReadStale(a?.updated)
         return StatRow {
             StatCard(label: "Portfolio value",
-                     value: total == nil ? "$ —" : Fmt.usd(total),
+                     value: (total == nil || stale) ? "$ —" : Fmt.usd(total),
                      delta: "\(Fmt.usdSigned(day)) today"
                         + (dayPct != nil ? " · \(Fmt.pct(dayPct, dp: 2))" : ""),
                      deltaTone: .forValue(day),
                      sublabel: a?.updated == nil
                         ? "no broker read yet — hit Broker refresh"
-                        : "broker read \(Fmt.when(a?.updated))")
+                        : (stale ? "⚠︎ stale — last broker read \(Fmt.when(a?.updated))"
+                                 : "broker read \(Fmt.when(a?.updated))"),
+                     sublabelTone: stale ? DS.caution : DS.textMuted)
             StatCard(label: "Total P&L",
                      value: Fmt.usdSigned(s?.totalPnl),
                      delta: "win rate \(Fmt.pct((s?.winRate ?? 0) * 100, dp: 1, signed: false))",
                      deltaTone: .forValue(s?.totalPnl),
                      sublabel: "\(s?.wins ?? 0)W / \(s?.losses ?? 0)L over \(s?.totalTrades ?? 0) trades")
             StatCard(label: "Cash",
-                     value: Fmt.usd(a?.cash),
-                     delta: a?.cashPct != nil
+                     value: stale ? "$ —" : Fmt.usd(a?.cash),
+                     delta: (!stale && a?.cashPct != nil)
                         ? "\(Fmt.num(a?.cashPct, dp: 1))% of book" : nil,
                      deltaTone: .neutral,
-                     sublabel: "Settled — available for new positions")
+                     sublabel: stale ? "stale broker read" : "Settled — available for new positions",
+                     sublabelTone: stale ? DS.caution : DS.textMuted)
             StatCard(label: "Buying power",
-                     value: Fmt.usd(a?.buyingPower),
-                     sublabel: "Account \(model.meta?.broker?.account ?? "—")")
+                     value: stale ? "$ —" : Fmt.usd(a?.buyingPower),
+                     sublabel: "Account \(model.meta?.broker?.account ?? "—")"
+                        + (stale ? " · stale" : ""),
+                     sublabelTone: stale ? DS.caution : DS.textMuted)
         }
     }
 

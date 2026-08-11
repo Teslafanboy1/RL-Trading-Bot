@@ -41,7 +41,7 @@ CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
 CHECK_MODEL = os.environ.get("CHECK_MODEL", "claude-haiku-4-5-20251001")
 ORDER_MODEL = os.environ.get("MODEL", "claude-opus-4-8")
 
-_RH = "mcp__robinhood-cli__"
+_RH = "mcp__" + os.environ.get("RH_MCP_SERVER", "robinhood-cli") + "__"
 RH_READ = [_RH + t for t in ("get_accounts", "get_portfolio", "get_equity_positions",
                              "get_equity_orders", "get_equity_quotes",
                              "get_equity_tradability", "get_earnings_calendar",
@@ -182,6 +182,21 @@ class ClaudeCLI:
     name = "claude-cli"
 
     def _run(self, system, user, tools, model, timeout=240):
+        # When several claude.ai connectors share this account (Gmail/Calendar/
+        # Drive/Trading — the VM's actual setup), the CLI defers most MCP tools
+        # behind ToolSearch. A headless model with no human to approve anything
+        # just stalls asking for permission instead of resolving that itself —
+        # see agent.run_model's identical preamble for the same failure mode.
+        if tools:
+            system = (
+                "You are running fully autonomously and headlessly — there is no "
+                "human available to approve or confirm anything. Every tool you "
+                "were granted is already pre-authorized: if one is not immediately "
+                "visible in your tool list, call ToolSearch yourself (e.g. "
+                "`select:<tool_name>`) to load it, then call it directly. Never "
+                "pause to ask for confirmation or permission — that question "
+                "would go unanswered.\n\n" + system
+            )
         cmd = [CLAUDE_BIN, "-p", "--model", model, "--output-format", "json",
                "--permission-mode", "default",
                "--disallowedTools", "Skill", "Task", "Agent",
