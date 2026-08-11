@@ -2,20 +2,28 @@
   "_note": "RX-3 paper track record (approved 2026-07-06). No real money. Promotion gate: >=10 trading days, decisions match engine, behavior consistent with backtest envelope.",
   "start_date": "2026-07-08T09:42:55-04:00",
   "start_equity": 100.0,
-  "cash": -0.0477,
+  "cash": -40.5436,
   "positions": {
     "NET": {
-      "shares": 0.163796,
-      "last_px": 295.5400085449219
+      "shares": 0.12548,
+      "last_px": 291.4700012207031
     },
     "SNOW": {
-      "shares": 0.154274,
-      "last_px": 313.4100036621094
+      "shares": 0.113855,
+      "last_px": 321.2300109863281
+    },
+    "CRWD": {
+      "shares": 0.216971,
+      "last_px": 225.73550415039062
+    },
+    "FNGU": {
+      "shares": 0.477116,
+      "last_px": 34.224998474121094
     }
   },
   "leaders": [
-    "SNOW",
-    "NET"
+    "CRWD",
+    "FNGU"
   ],
   "sleeve_rets": [
     -0.047885033218953266,
@@ -33,7 +41,11 @@
     -0.0011816676148210803,
     0.04146164447460676,
     0.034640586122659967,
-    0.03219572104267643
+    0.03219572104267643,
+    -0.003159752962701712,
+    -0.009070860303872663,
+    0.004384817400573504,
+    0.03675016118551744
   ],
   "history": [
     {
@@ -249,8 +261,74 @@
       "riskx": 1.0,
       "vol_scale": 1.0,
       "cash_w": 0.0
+    },
+    {
+      "date": "2026-08-05",
+      "equity": 97.8129,
+      "leaders": [
+        "SNOW",
+        "NET"
+      ],
+      "defensive": [
+        "XLP"
+      ],
+      "riskx": 0.5,
+      "vol_scale": 1.0,
+      "cash_w": 0.0
+    },
+    {
+      "date": "2026-08-05",
+      "equity": 97.5975,
+      "leaders": [
+        "SNOW",
+        "NET"
+      ],
+      "defensive": [
+        "XLP"
+      ],
+      "riskx": 0.5,
+      "vol_scale": 1.0,
+      "cash_w": 0.0
+    },
+    {
+      "date": "2026-08-06",
+      "equity": 97.4806,
+      "leaders": [
+        "SNOW",
+        "NET"
+      ],
+      "defensive": [
+        "GLD"
+      ],
+      "riskx": 0.75,
+      "vol_scale": 1.0,
+      "cash_w": 0.0
+    },
+    {
+      "date": "2026-08-10",
+      "equity": 97.911,
+      "leaders": [
+        "CRWD",
+        "FNGU"
+      ],
+      "defensive": [],
+      "riskx": 1.0,
+      "vol_scale": 1.0,
+      "cash_w": 0.3333
+    },
+    {
+      "date": "2026-08-10",
+      "equity": 97.9111,
+      "leaders": [
+        "CRWD",
+        "FNGU"
+      ],
+      "defensive": [],
+      "riskx": 1.0,
+      "vol_scale": 1.0,
+      "cash_w": 0.3333
     }
   ],
-  "equity": 96.7116,
-  "last_run": "2026-08-04T10:21:50-04:00"
+  "equity": 97.9111,
+  "last_run": "2026-08-10T23:47:30-04:00"
 }

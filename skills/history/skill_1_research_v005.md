@@ -311,30 +311,6 @@ Under each pick heading include:
 - Symbols in blackout (with the earnings/Fed date)
 - Approaching-crossover names with the trigger level to watch
 
-Prose is fine for the narrative above, but it is NOT enough on its own — a name only
-mentioned in prose here gets no ribbon computed for it for the rest of the day, so a
-real BUY signal on it can go completely unconfirmed (2026-08-04: MU/NVDA/AVGO/ANET
-were flagged "confirm ribbon at execution" here and then never actually checked,
-because nothing downstream reads free-form watchlist prose). ALSO emit this exact
-machine-readable block — same hard-contract pattern as MOMENTUM OPTIONS WATCH below —
-listing every symbol from this section (or the pre-market tape) worth actively
-tracking, so the deterministic layer computes its real EMA ribbon every remaining
-cycle today and can wake execution on a fresh signal instead of the name silently
-going stale:
-
-`## WATCHLIST CONFIRM`
-then exactly one line: `- SYMBOL1, SYMBOL2, SYMBOL3` (comma-separated tickers, no
-company names or commentary on this line). Do not include names already issued as a
-`### #N` ranked pick (they're tracked automatically) or names in an earnings/Fed
-blackout (nothing can be done with them regardless of signal). If nothing needs
-tracking, write the heading followed by `- (none)`.
-
-Example:
-```
-## WATCHLIST CONFIRM
-- MU, NVDA, AVGO, ANET
-```
-
 ### MOMENTUM OPTIONS WATCH
 The cheap-momentum names (price < $30, from the options-sleeve universe + any cheap dynamic-scan movers) that show **real multi-timeframe momentum AND a durable catalyst** — these feed the paper-options momentum sleeve. The agent parses this block verbatim, so the format is a **hard contract**: this exact `## MOMENTUM OPTIONS WATCH` heading, then ONE line per name:
 

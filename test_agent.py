@@ -1201,6 +1201,35 @@ class TestMomentumShadowWiring(TmpDirMixin):
                           return_value="### #1 — NVDA | Confidence: 80/100\n"):
             self.assertEqual(agent_module.momentum_options_watch(), {})
 
+    def test_watchlist_confirm_symbols_parses_research_block(self):
+        sample = (
+            "### #1 — SNOW | Confidence: 72/100\nequity pick\n\n"
+            "## WATCHLIST CONFIRM\n"
+            "- MU, NVDA, AVGO, ANET\n\n"
+            "## MOMENTUM OPTIONS WATCH\n- (none this week)\n")
+        with patch.object(agent_module, "load_latest_research_file", return_value=sample):
+            w = agent_module.watchlist_confirm_symbols()
+        self.assertEqual(w, ["MU", "NVDA", "AVGO", "ANET"])
+
+    def test_watchlist_confirm_symbols_none_placeholder(self):
+        sample = "### #1 — SNOW | Confidence: 72/100\n\n## WATCHLIST CONFIRM\n- (none)\n"
+        with patch.object(agent_module, "load_latest_research_file", return_value=sample):
+            self.assertEqual(agent_module.watchlist_confirm_symbols(), [])
+
+    def test_watchlist_confirm_symbols_missing_block(self):
+        with patch.object(agent_module, "load_latest_research_file",
+                          return_value="### #1 — SNOW | Confidence: 72/100\n"):
+            self.assertEqual(agent_module.watchlist_confirm_symbols(), [])
+
+    def test_watchlist_symbols_includes_confirm_names(self):
+        with patch.object(agent_module, "weekend_pick_symbols", return_value=["SNOW"]), \
+             patch.object(agent_module, "watchlist_confirm_symbols",
+                          return_value=["MU", "NVDA"]):
+            syms = agent_module.watchlist_symbols({"open_positions": []})
+        self.assertIn("MU", syms)
+        self.assertIn("NVDA", syms)
+        self.assertIn("SNOW", syms)
+
     def test_run_shadow_passes_invokes_both(self):
         log = {"summary": {"current_value": 100.0}, "_state": {}}
         with patch.object(agent_module, "process_options_shadow") as opt, \
@@ -1463,6 +1492,33 @@ class TestTimeGateAndEnterLongDedup(TmpDirMixin):
         self._write_picks("NVDA")
         log = self._log(last_exec_ts=self._ts(0.2))
         skip, _ = self._skip({"NVDA": self._sig("HOLD", state="BUY")}, log)
+        self.assertTrue(skip)
+
+    # ---------------- pending_buy gate covers WATCHLIST CONFIRM names too -----
+    def _write_watchlist_confirm(self, *symbols):
+        path = os.path.join(self.tmpdir, "research", "weekend_picks_2026-06-10.md")
+        with open(path, "a") as f:
+            f.write("\n## WATCHLIST CONFIRM\n- " + ", ".join(symbols) + "\n")
+
+    def test_watchlist_confirm_name_in_buy_state_wakes(self):
+        """2026-08-04 gap: a name research flagged 'confirm at execution' but
+        couldn't rank (already in BUY state, not a fresh crossover) must still
+        wake the model via the same periodic gate ranked picks get — not just
+        silently sit unconfirmed all day."""
+        self._write_picks("SNOW")
+        self._write_watchlist_confirm("MU", "NVDA")
+        log = self._log(last_call_ts=None)
+        skip, reason = self._skip({"SNOW": self._sig("HOLD", state="SELL"),
+                                   "MU": self._sig("HOLD", state="BUY")}, log)
+        self.assertFalse(skip)
+        self.assertEqual(reason, "pending_buy:MU")
+
+    def test_watchlist_confirm_name_still_gated_by_fresh_ts(self):
+        self._write_picks("SNOW")
+        self._write_watchlist_confirm("MU")
+        log = self._log(last_exec_ts=self._ts(0.2))
+        skip, _ = self._skip({"SNOW": self._sig("HOLD", state="SELL"),
+                              "MU": self._sig("HOLD", state="BUY")}, log)
         self.assertTrue(skip)
 
     # ---------------- ENTER_LONG dedup ----------------

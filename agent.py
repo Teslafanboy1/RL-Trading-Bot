@@ -700,10 +700,36 @@ def weekend_pick_confidences():
     return out
 
 
+def watchlist_confirm_symbols():
+    """Symbols from the latest weekend_picks_*.md '## WATCHLIST CONFIRM' block —
+    names research flagged as worth tracking but didn't rank as a '### #N' pick
+    (e.g. momentum leaders it couldn't independently confirm a ribbon for). Without
+    this, those names got no EMA computed for the rest of the day despite the
+    research file explicitly saying they'd be "confirmed at execution" (2026-08-04:
+    MU/NVDA/AVGO/ANET flagged this way, never actually checked again). Hard
+    contract, same pattern as momentum_options_watch(): one comma-separated line
+    after the exact heading. Returns [] if the file or block is absent, or the
+    line is the literal '(none)' placeholder."""
+    try:
+        text = load_latest_research_file("weekend_picks_") or ""
+    except Exception:
+        return []
+    if not text:
+        return []
+    m = re.search(r"##\s*WATCHLIST CONFIRM\s*\n-\s*(.+)", text)
+    if not m:
+        return []
+    line = m.group(1).strip()
+    if not line or line.lower().startswith("(none"):
+        return []
+    return [s.strip().upper() for s in line.split(",") if s.strip()]
+
+
 def watchlist_symbols(log):
-    """SPY + open positions + WATCHLIST env + latest weekend picks, de-duped."""
+    """SPY + open positions + WATCHLIST env + latest weekend picks (ranked +
+    WATCHLIST CONFIRM), de-duped."""
     syms = (["SPY"] + [p["symbol"] for p in log.get("open_positions", [])]
-            + WATCHLIST + weekend_pick_symbols())
+            + WATCHLIST + weekend_pick_symbols() + watchlist_confirm_symbols())
     seen, out = set(), []
     for s in syms:
         if s.upper() not in seen:
@@ -1078,8 +1104,12 @@ def should_skip_model_call(raw_sigs, log):
         if s.get("state") == "SELL" and sym in held and exit_on_ribbon:
             return False, f"ema_sell_held:{sym}"
 
-    # Collect weekend picks that are in BUY zone, not yet held, and not blocked.
-    picks = {s.upper() for s in weekend_pick_symbols()}
+    # Collect weekend picks (ranked + WATCHLIST CONFIRM) that are in BUY zone,
+    # not yet held, and not blocked. WATCHLIST CONFIRM names matter here too — a
+    # name research couldn't independently rank may already be sitting in BUY
+    # state (an established uptrend, not a fresh crossover), which only this
+    # periodic gate — not the ENTER_LONG edge check above — would ever catch.
+    picks = {s.upper() for s in weekend_pick_symbols()} | {s.upper() for s in watchlist_confirm_symbols()}
     pending_buys = [sym for sym in picks - held - dnt
                     if raw_sigs.get(sym, {}).get("ok")
                     and raw_sigs.get(sym, {}).get("state") == "BUY"]
