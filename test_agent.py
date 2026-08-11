@@ -18,6 +18,7 @@ import json
 import math
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -3374,6 +3375,226 @@ class TestBrokerRereadOnlyAfterASell(TmpDirMixin):
             agent_module.run_agent()
         self.assertEqual(fs.call_count, 0, "must not double-sell")
         self.assertEqual(rbs.call_count, 1, "no wasted re-read when nothing sold")
+
+
+class TestParsePythonPatches(unittest.TestCase):
+    """parse_python_patches() — extraction only, no filesystem/git involved."""
+
+    def test_single_patch(self):
+        text = (
+            "some prose\n\n"
+            "## PYTHON PATCH: dashboard/quotes.py\n"
+            "```python\nprint('hello')\n```\n"
+            "## END PYTHON PATCH\n\nmore prose")
+        patches = agent_module.parse_python_patches(text)
+        self.assertEqual(patches, [("dashboard/quotes.py", "print('hello')")])
+
+    def test_multiple_patches(self):
+        text = (
+            "## PYTHON PATCH: a.py\n```python\nX = 1\n```\n## END PYTHON PATCH\n"
+            "## PYTHON PATCH: b.py\n```python\nY = 2\n```\n## END PYTHON PATCH\n")
+        patches = agent_module.parse_python_patches(text)
+        self.assertEqual(patches, [("a.py", "X = 1"), ("b.py", "Y = 2")])
+
+    def test_no_patches_returns_empty(self):
+        self.assertEqual(agent_module.parse_python_patches("no patches here"), [])
+
+    def test_unterminated_block_ignored(self):
+        text = "## PYTHON PATCH: a.py\n```python\nX = 1\n```\n"  # no END marker
+        self.assertEqual(agent_module.parse_python_patches(text), [])
+
+
+class TestApplyPythonPatchesRejections(TmpDirMixin):
+    """Rejection paths that short-circuit before any git operation — a plain
+    tmpdir (no git repo) is enough since these never reach the worktree step."""
+
+    def _enable(self):
+        s = agent_module.load_strategy()
+        s["code_patches"] = {"enabled": True}
+        agent_module.save_strategy(s)
+
+    def test_disabled_by_default_rejects(self):
+        # DEFAULT_STRATEGY fixture has no code_patches block at all.
+        applied, detail = agent_module.apply_python_patches(
+            [("dashboard/quotes.py", "X = 1")])
+        self.assertFalse(applied)
+        self.assertIn("enabled is false", detail)
+
+    def test_empty_patch_list(self):
+        applied, detail = agent_module.apply_python_patches([])
+        self.assertFalse(applied)
+        self.assertEqual(detail, "no patches")
+
+    def test_forbidden_file_always_rejected_even_if_configured_allowed(self):
+        self._enable()
+        applied, detail = agent_module.apply_python_patches(
+            [("risk_guard.py", "X = 1")])
+        self.assertFalse(applied)
+        self.assertIn("forbidden-files list", detail)
+
+    def test_watchdog_and_usage_governor_also_forbidden(self):
+        self._enable()
+        for f in ("usage_governor.py", "watchdog.py"):
+            applied, detail = agent_module.apply_python_patches([(f, "X = 1")])
+            self.assertFalse(applied, f)
+            self.assertIn("forbidden-files list", detail, f)
+
+    def test_non_py_file_rejected(self):
+        self._enable()
+        applied, detail = agent_module.apply_python_patches(
+            [("strategy/strategy.json", "{}")])
+        self.assertFalse(applied)
+        self.assertIn("not a .py file", detail)
+
+    def test_path_traversal_rejected(self):
+        self._enable()
+        applied, detail = agent_module.apply_python_patches(
+            [("../outside_repo.py", "X = 1")])
+        self.assertFalse(applied)
+        self.assertIn("unsafe path", detail)
+
+    def test_absolute_path_rejected(self):
+        self._enable()
+        applied, detail = agent_module.apply_python_patches(
+            [("/etc/evil.py", "X = 1")])
+        self.assertFalse(applied)
+        self.assertIn("unsafe path", detail)
+
+    def test_missing_protected_symbol_rejected(self):
+        self._enable()
+        # agent.py is not itself forbidden, but force_sell etc. are protected —
+        # a rewrite that drops one must be rejected before it's even tested.
+        applied, detail = agent_module.apply_python_patches(
+            [("agent.py", "def something_else():\n    pass\n")])
+        self.assertFalse(applied)
+        self.assertIn("missing protected symbol", detail)
+        self.assertIn("force_sell", detail)
+
+    def test_agent_py_with_all_protected_symbols_present_clears_that_check(self):
+        self._enable()
+        content = "\n".join(
+            f"def {sym}():\n    pass\n"
+            for sym in ("check_stop_loss_alerts", "check_trailing_stop_alerts",
+                       "force_sell", "read_broker_state", "notify_operator"))
+        # No git repo in this tmpdir, so it fails at the worktree step instead —
+        # proves the protected-symbol gate itself let it through.
+        applied, detail = agent_module.apply_python_patches([("agent.py", content)])
+        self.assertFalse(applied)
+        self.assertNotIn("missing protected symbol", detail)
+
+    def test_syntax_error_rejected(self):
+        self._enable()
+        applied, detail = agent_module.apply_python_patches(
+            [("dashboard/quotes.py", "def broken(:\n")])
+        self.assertFalse(applied)
+        self.assertIn("fails to compile", detail)
+
+    def test_operator_can_widen_forbidden_list_but_not_narrow_it(self):
+        s = agent_module.load_strategy()
+        s["code_patches"] = {"enabled": True, "forbidden_files": ["momentum_screen.py"]}
+        agent_module.save_strategy(s)
+        # Widened: momentum_screen.py now also forbidden.
+        applied, detail = agent_module.apply_python_patches(
+            [("momentum_screen.py", "X = 1")])
+        self.assertFalse(applied)
+        self.assertIn("forbidden-files list", detail)
+        # But the hardcoded defaults can't be removed by config.
+        applied, detail = agent_module.apply_python_patches(
+            [("risk_guard.py", "X = 1")])
+        self.assertFalse(applied)
+        self.assertIn("forbidden-files list", detail)
+
+
+class TestApplyPythonPatchesGitFlow(TmpDirMixin):
+    """End-to-end through a real (local, throwaway) git repo — proves the
+    isolated-worktree + test-gate + commit + push mechanics actually work,
+    not just the pre-flight checks."""
+
+    def setUp(self):
+        super().setUp()
+        self._enable_patches = agent_module.load_strategy()
+        self._enable_patches["code_patches"] = {"enabled": True}
+        agent_module.save_strategy(self._enable_patches)
+
+        self.origin_dir = tempfile.mkdtemp(prefix="trading_test_origin_")
+        self._run(["git", "init", "--bare", "-q"], cwd=self.origin_dir)
+
+        self._run(["git", "init", "-q"], cwd=self.tmpdir)
+        self._run(["git", "config", "user.email", "test@example.com"], cwd=self.tmpdir)
+        self._run(["git", "config", "user.name", "Test"], cwd=self.tmpdir)
+        self._run(["git", "remote", "add", "origin", self.origin_dir], cwd=self.tmpdir)
+
+        # Minimal, fast, self-contained stub test suite — deliberately NOT the
+        # real test_agent.py/test_dashboard.py (this test proves the git/test-
+        # gate MECHANISM works, independent of the real suite's size or content).
+        with open(os.path.join(self.tmpdir, "test_agent.py"), "w") as f:
+            f.write("import unittest\n"
+                   "class T(unittest.TestCase):\n"
+                   "    def test_ok(self): self.assertTrue(True)\n")
+        with open(os.path.join(self.tmpdir, "test_dashboard.py"), "w") as f:
+            f.write("import unittest\n"
+                   "class T(unittest.TestCase):\n"
+                   "    def test_ok(self): self.assertTrue(True)\n")
+        self._run(["git", "add", "-A"], cwd=self.tmpdir)
+        self._run(["git", "commit", "-q", "-m", "baseline"], cwd=self.tmpdir)
+        self._run(["git", "push", "-q", "origin", "HEAD:main"], cwd=self.tmpdir)
+
+    def tearDown(self):
+        shutil.rmtree(self.origin_dir, ignore_errors=True)
+        shutil.rmtree(os.path.join(self.tmpdir, ".code_patch_staging"), ignore_errors=True)
+        super().tearDown()
+
+    @staticmethod
+    def _run(cmd, cwd):
+        res = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+        assert res.returncode == 0, f"{cmd} failed: {res.stderr}"
+        return res
+
+    def _origin_log(self):
+        return subprocess.run(["git", "log", "--oneline", "main"], cwd=self.origin_dir,
+                              capture_output=True, text=True).stdout
+
+    def test_clean_patch_commits_and_pushes(self):
+        applied, detail = agent_module.apply_python_patches(
+            [("new_module.py", "VALUE = 42\n")],
+            reason="test: add new_module")
+        self.assertTrue(applied, detail)
+        self.assertIn("new_module.py", detail)
+        log = self._origin_log()
+        self.assertIn("skill_5 autonomous code patch", log)
+        # Never written into the live working tree — only committed/pushed.
+        self.assertFalse(os.path.exists(os.path.join(self.tmpdir, "new_module.py")))
+        # Worktree cleaned up.
+        self.assertFalse(os.path.exists(os.path.join(self.tmpdir, ".code_patch_staging")))
+
+    def test_failing_test_suite_blocks_the_patch(self):
+        # A patch that's syntactically fine but breaks the (stub) test suite
+        # once applied — e.g. it shadows a name the tests import.
+        with open(os.path.join(self.tmpdir, "test_agent.py"), "w") as f:
+            f.write("import unittest, sabotage_target\n"
+                   "class T(unittest.TestCase):\n"
+                   "    def test_ok(self): self.assertEqual(sabotage_target.VALUE, 1)\n")
+        self._run(["git", "add", "-A"], cwd=self.tmpdir)
+        self._run(["git", "commit", "-q", "-m", "add failing expectation"], cwd=self.tmpdir)
+        self._run(["git", "push", "-q", "origin", "HEAD:main"], cwd=self.tmpdir)
+
+        applied, detail = agent_module.apply_python_patches(
+            [("sabotage_target.py", "VALUE = 999\n")])  # test expects 1
+        self.assertFalse(applied)
+        self.assertIn("tests failed", detail)
+        before = self._origin_log()
+        self.assertNotIn("autonomous code patch", before)
+
+    def test_change_event_logged_on_success(self):
+        agent_module.apply_python_patches(
+            [("new_module.py", "VALUE = 42\n")], reason="test reason", trade_ids=["T001"])
+        events_path = os.path.join(self.tmpdir, "logs", "change_events.jsonl")
+        with open(events_path) as f:
+            events = [json.loads(line) for line in f]
+        code_events = [e for e in events if e["kind"] == "code"]
+        self.assertEqual(len(code_events), 1)
+        self.assertEqual(code_events[0]["trade_ids"], ["T001"])
+        self.assertEqual(code_events[0]["severity"], "MAJOR")
 
 
 if __name__ == "__main__":

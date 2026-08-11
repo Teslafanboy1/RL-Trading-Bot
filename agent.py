@@ -24,6 +24,7 @@ Flat files only, no database.
 
 import os
 import re
+import sys
 import json
 import time
 import shutil
@@ -1771,6 +1772,154 @@ def _postmortems_for_rewrite(analysis_file):
     return "\n\n".join(out)
 
 
+# ------------------------------------------------------------- CODE PATCHES
+# Autonomous Python code-patch pipeline (operator-approved 2026-08-11): skill_5
+# can propose an actual code fix — not just a strategy.json/skill-prompt edit —
+# when postmortem evidence points at a bug in the bot's own Python rather than a
+# tunable parameter. Two INDEPENDENT test gates protect the live bot: this
+# function runs the full suite in an isolated git worktree before anything is
+# committed, and the VM's separately-scheduled deploy pipeline
+# (scripts/vm_deploy.sh) re-runs its own suite again before the change ever
+# touches the live tree. A patch that passes here still has to clear that
+# second, unrelated gate. This function only ever commits+pushes to git — it
+# never writes into the live working tree, so a bug in this function itself
+# cannot corrupt the running process.
+_DEFAULT_CODE_PATCH_FORBIDDEN = {"risk_guard.py", "usage_governor.py", "watchdog.py"}
+_DEFAULT_CODE_PATCH_PROTECTED = {
+    "agent.py": ["check_stop_loss_alerts", "check_trailing_stop_alerts",
+                 "force_sell", "read_broker_state", "notify_operator"],
+}
+
+
+def _code_patch_config():
+    """code_patches block from strategy.json, merged with hardcoded Python-level
+    minimums that apply regardless of what strategy.json says — a config read
+    failure or an edited-down config must never default to permissive. Returns
+    (enabled, forbidden_files: set, protected_symbols: dict)."""
+    try:
+        cfg = load_strategy().get("code_patches") or {}
+    except Exception:
+        cfg = {}
+    forbidden = set(cfg.get("forbidden_files") or []) | _DEFAULT_CODE_PATCH_FORBIDDEN
+    protected = dict(_DEFAULT_CODE_PATCH_PROTECTED)
+    for path, syms in (cfg.get("protected_symbols") or {}).items():
+        protected[path] = sorted(set(protected.get(path, [])) | set(syms))
+    return bool(cfg.get("enabled", False)), forbidden, protected
+
+
+def parse_python_patches(text):
+    """Extract '## PYTHON PATCH: <path>' ... ```python ... ``` ... 'END PYTHON
+    PATCH' blocks from skill_5's output — same complete-file-not-diff convention
+    as SKILL FILE UPDATE. Returns [(path, new_file_content), ...]."""
+    return [(path.strip(), content) for path, content in re.findall(
+        r"## PYTHON PATCH:\s*(\S+)\s*\n```python\n(.*?)\n```\s*\n## END PYTHON PATCH",
+        text, re.DOTALL)]
+
+
+def apply_python_patches(patches, *, reason="", trade_ids=None, timeout=600):
+    """Test-gate and apply skill_5-proposed Python code changes.
+
+    Safety model (defense in depth — any one of these rejecting is enough):
+    1. Config gate — code_patches.enabled must be true in strategy.json. Off by
+       default; arming this is an explicit operator decision, never assumed.
+    2. Path allowlist — must be a tracked .py file under ROOT, no path
+       traversal, never one of the forbidden files. risk_guard.py/
+       usage_governor.py/watchdog.py are never patchable by the bot itself
+       REGARDLESS of strategy.json config — the safety net must never depend
+       on the bot's own judgment about its own code.
+    3. Protected-symbol check — for files with a protected_symbols entry,
+       every listed function must still be present in the new content. Crude
+       (string search, not an AST diff) but effective against "the stop-loss
+       check silently vanished."
+    4. Syntax check on every patch before anything touches disk.
+    5. Applied in an ISOLATED git worktree off current HEAD — the live
+       process's already-imported code is never touched by this function,
+       win or lose.
+    6. Full test suite run in that worktree; ANY failure aborts, the worktree
+       is discarded, nothing is committed or pushed. Worst case of a bad
+       patch: nothing happens.
+    7. Only on a clean pass: commit + push to origin/main. This does not put
+       anything live — it lands in git like a human commit, and the VM's own
+       deploy pipeline re-tests it independently before ever touching the
+       live tree.
+
+    Returns (applied: bool, detail: str). Never raises — same contract as the
+    rest of the rewrite path: a patch failure must not crash the trading loop."""
+    if not patches:
+        return False, "no patches"
+    trade_ids = trade_ids or []
+    enabled, forbidden, protected = _code_patch_config()
+    if not enabled:
+        return False, "rejected: code_patches.enabled is false in strategy.json"
+
+    for path, content in patches:
+        norm = os.path.normpath(path)
+        if norm.startswith("..") or os.path.isabs(norm) or norm.split(os.sep)[0] == ".git":
+            return False, f"rejected: unsafe path {path!r}"
+        if not norm.endswith(".py"):
+            return False, f"rejected: {path} is not a .py file"
+        base = os.path.basename(norm)
+        if base in forbidden or norm in forbidden:
+            return False, f"rejected: {path} is on the forbidden-files list"
+        required = protected.get(base, []) or protected.get(norm, [])
+        missing = [sym for sym in required if f"def {sym}(" not in content]
+        if missing:
+            return False, f"rejected: {path} is missing protected symbol(s) {missing}"
+        try:
+            compile(content, path, "exec")
+        except SyntaxError as e:
+            return False, f"rejected: {path} fails to compile: {e}"
+
+    staging = os.path.join(ROOT, ".code_patch_staging")
+    subprocess.run(["git", "worktree", "remove", "--force", staging],
+                   cwd=ROOT, capture_output=True, text=True)
+    try:
+        wt = subprocess.run(["git", "worktree", "add", "--detach", staging, "HEAD"],
+                            cwd=ROOT, capture_output=True, text=True, timeout=60)
+        if wt.returncode != 0:
+            return False, f"rejected: git worktree add failed: {wt.stderr[-300:]}"
+
+        for path, content in patches:
+            dest = os.path.join(staging, path)
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            with open(dest, "w") as f:
+                f.write(content)
+
+        test_res = subprocess.run(
+            [sys.executable, "-m", "unittest", "test_agent", "test_dashboard"],
+            cwd=staging, capture_output=True, text=True, timeout=timeout)
+        if test_res.returncode != 0:
+            tail = (test_res.stderr or test_res.stdout or "")[-600:]
+            return False, f"rejected: tests failed in staging worktree: {tail}"
+
+        add = subprocess.run(["git", "add"] + [p for p, _ in patches],
+                             cwd=staging, capture_output=True, text=True)
+        if add.returncode != 0:
+            return False, f"rejected: git add failed: {add.stderr[-300:]}"
+
+        msg = f"skill_5 autonomous code patch: {reason or ', '.join(p for p, _ in patches)}"
+        commit = subprocess.run(["git", "commit", "-m", msg],
+                                cwd=staging, capture_output=True, text=True)
+        if commit.returncode != 0:
+            return False, f"rejected: git commit failed: {commit.stderr[-300:]}"
+
+        new_sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=staging,
+                                 capture_output=True, text=True).stdout.strip()
+
+        push = subprocess.run(["git", "push", "origin", "HEAD:main"],
+                              cwd=staging, capture_output=True, text=True, timeout=60)
+        if push.returncode != 0:
+            return False, f"tests passed but push failed (not applied): {push.stderr[-300:]}"
+
+        record_change_event("code", ", ".join(p for p, _ in patches), new_sha,
+                            trade_ids=trade_ids, severity="MAJOR",
+                            summary=f"autonomous code patch: {reason}"[:300])
+        return True, f"committed {new_sha[:8]} and pushed: {[p for p, _ in patches]}"
+    finally:
+        subprocess.run(["git", "worktree", "remove", "--force", staging],
+                       cwd=ROOT, capture_output=True, text=True)
+
+
 def process_strategy_rewrite_queue():
     """Read research/strategy_rewrite_queue.md and process the first entry not yet
     marked [DONE]: run skill_5 (headless, no file-write tool), parse its output, and
@@ -1921,6 +2070,16 @@ Your job:
                 print(f"  [skill_5] skill updated: {skill_name}")
             else:
                 print(f"  [skill_5] WARNING: unknown skill name in update block: {skill_name}")
+
+        # Parse and apply proposed Python code patches (test-gated; see
+        # apply_python_patches for the full safety model). A rejection just
+        # means the patch is silently dropped this cycle — never a crash.
+        patches = parse_python_patches(text)
+        if patches:
+            applied, detail = apply_python_patches(
+                patches, reason=f"skill_5 review of {target_line[:120]}",
+                trade_ids=review_trades)
+            print(f"  [skill_5] code patch {'applied' if applied else 'rejected'}: {detail[:200]}")
 
         # Audit trail -> single monthly rolling log (was one skill5_run_*.md per run)
         stamp = datetime.now(ET).strftime("%Y-%m-%d_%H%M")

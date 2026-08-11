@@ -75,3 +75,39 @@ Rules:
 - Never output a SKILL FILE UPDATE block for skill_5_strategy_rewriter itself —
   that would create a self-modification loop
 - The json block for strategy.json must come AFTER any skill update blocks
+
+### Python code patch output (rare — only when the bug is in the CODE, not a tunable)
+Most postmortems point at a strategy parameter (a weight, a threshold, a target) —
+that's what the sections above are for. Occasionally the root cause is a genuine
+bug in agent.py or dashboard/*.py itself (wrong variable, missing edge case, a
+function that silently does the wrong thing) that no amount of strategy.json
+tuning can fix. For that, and ONLY that, output a complete replacement file using
+EXACTLY this format:
+
+## PYTHON PATCH: relative/path/to/file.py
+```python
+[complete file content — not a diff, the entire file]
+```
+## END PYTHON PATCH
+
+This is held to a stricter bar than everything else in this document:
+- Only propose one when you can point at the specific lines and explain exactly
+  why the current code produces the wrong behavior — never a speculative
+  refactor or "this could be cleaner."
+- Never target risk_guard.py, usage_governor.py, or watchdog.py — those are
+  permanently off-limits to this pipeline regardless of what you write; agent.py
+  enforces this itself, so proposing one there is simply wasted effort.
+- Never remove or change the signature of a function agent.py's config marks as
+  protected (currently: check_stop_loss_alerts, check_trailing_stop_alerts,
+  force_sell, read_broker_state, notify_operator in agent.py) — a patch missing
+  any of these is rejected outright before it's even tested.
+- Output the COMPLETE file, exactly like a skill file update — never a partial
+  diff or a snippet.
+- A patch you propose is NOT applied on your say-so: agent.py runs the full test
+  suite against it in an isolated environment first, and only pushes it to git
+  on a clean pass. A rejected patch is simply dropped — say so honestly in your
+  prose rather than treating it as done.
+- This capability must be gated on (strategy.json `code_patches.enabled`) before
+  any patch you write can ever be applied — if it's off, proposing one is inert,
+  which is fine; still propose it if the evidence warrants, the gate is an
+  operator decision, not yours to route around.

@@ -1,7 +1,7 @@
 {
-  "version": 42,
+  "version": 43,
   "goal": "100% monthly portfolio return",
-  "last_updated": "2026-08-03",
+  "last_updated": "2026-08-11",
   "account": {
     "type": "true_cash",
     "settlement": "T+1",
@@ -979,6 +979,13 @@
       "date": "2026-08-03",
       "timestamp": "2026-08-03T00:00:00-04:00",
       "change": "OPERATOR-DIRECTED (not a skill_5 review): added the `usage` block backing the new usage_governor.py. Problem: the bot runs 24/7 and kept losing research / postmortems / strategy rewrites to the Claude 5-hour session limit \u2014 on 2026-07-06 a 429 at 09:45 was followed by ~26 more identical failing calls through the close. Claude usage is metered in rolling 5h windows that OPEN on the first call after the previous expired, which makes the start time schedulable. The daily schedule now places each phase in its own window: a tiny preflight anchor 305 min before the open (04:25 ET) starts window A so it EXPIRES 5 min before the bell; research runs 35 min before the open inside it; the 09:30 cycle therefore opens a FRESH window for trading; postmortems and skill_5 rewrites are deferred to a maintenance drain at 19:35 ET in a window of its own. Every claude -p call now declares a priority tier and is admitted against tier_ceiling_pct, so shadow/learning work stops long before execution does, and a 429's parsed reset time drives a real cooldown instead of blind retries. NO trading rule changed \u2014 this is scheduling only."
+    },
+    {
+      "version": 43,
+      "date": "2026-08-11",
+      "timestamp": "2026-08-11T09:02:23-04:00",
+      "change": "OPERATOR-DIRECTED: add code_patches config for the new autonomous code-patch pipeline (skill_5 can now propose real Python fixes, test-gated in an isolated worktree, commit+push to origin/main on a clean pass). Off by default (enabled=false) until armed. No trading rule changed.",
+      "trade_ids": []
     }
   ],
   "concentration": {
@@ -1055,9 +1062,27 @@
     ]
   },
   "rotation_rx4": {
-    "_note": "RX-4 (operator-directed 2026-08-04, HYPOTHETICAL): the same rotation_engine.py brain as RX-3, run with full_deploy=True ('turn up the volume, use all the money' — no RISKX defensive carve-out, no vol-throttle; leverage haircut on 3x ETFs still applies, that's a per-name safety rule not a buying-power throttle). top_n REVERTED to 2 (2026-08-04, same day): briefly widened to 6 after operator pushback ('use my whole portfolio' ≠ 'put it all on 2 stocks'), backtested both widths, and top_n=6 came out smoother (maxDD ~29%, Sharpe ~1.45, better than RX-3 on both) but gave back almost all the extra return (~39%/yr, versus top_n=2's ~48%/yr) — the concentration WAS most of the edge. Operator saw that tradeoff and chose to keep the $100->$3,342 concentrated version over the $100->$1,871 smoother one. Same momentum ranking + max_per_sector=2 cap as RX-3 either way; top_n is still a live config knob (agent.py/rotation_engine.py both support any value) if this gets revisited. Backtested 2017-2026 (agent's own replay, not the official edge_lab run) at top_n=2: CAGR ~48%/yr vs RX-3's ~38%/yr, but maxDD ~55% vs RX-3's ~32% and Sharpe ~1.0 vs ~1.2 — bigger swings both ways, a knowing tradeoff. A monthly-profit-cap variant (stop trading once +10% for the month is hit) was also tested and came out WORSE (CAGR ~28%, maxDD still ~52%) because it only trims winning months, not losing ones — rejected, not implemented here. Paper-only, ZERO real dollars, NOT on the RX-3 promotion ladder to live. agent.process_rx4_paper -> shadow/rx4_paper.json, gated by paper_enabled.",
+    "_note": "RX-4 (operator-directed 2026-08-04, HYPOTHETICAL): the same rotation_engine.py brain as RX-3, run with full_deploy=True ('turn up the volume, use all the money' \u2014 no RISKX defensive carve-out, no vol-throttle; leverage haircut on 3x ETFs still applies, that's a per-name safety rule not a buying-power throttle). top_n REVERTED to 2 (2026-08-04, same day): briefly widened to 6 after operator pushback ('use my whole portfolio' \u2260 'put it all on 2 stocks'), backtested both widths, and top_n=6 came out smoother (maxDD ~29%, Sharpe ~1.45, better than RX-3 on both) but gave back almost all the extra return (~39%/yr, versus top_n=2's ~48%/yr) \u2014 the concentration WAS most of the edge. Operator saw that tradeoff and chose to keep the $100->$3,342 concentrated version over the $100->$1,871 smoother one. Same momentum ranking + max_per_sector=2 cap as RX-3 either way; top_n is still a live config knob (agent.py/rotation_engine.py both support any value) if this gets revisited. Backtested 2017-2026 (agent's own replay, not the official edge_lab run) at top_n=2: CAGR ~48%/yr vs RX-3's ~38%/yr, but maxDD ~55% vs RX-3's ~32% and Sharpe ~1.0 vs ~1.2 \u2014 bigger swings both ways, a knowing tradeoff. A monthly-profit-cap variant (stop trading once +10% for the month is hit) was also tested and came out WORSE (CAGR ~28%, maxDD still ~52%) because it only trims winning months, not losing ones \u2014 rejected, not implemented here. Paper-only, ZERO real dollars, NOT on the RX-3 promotion ladder to live. agent.process_rx4_paper -> shadow/rx4_paper.json, gated by paper_enabled.",
     "mode": "paper",
     "paper_enabled": true,
     "top_n": 2
+  },
+  "code_patches": {
+    "_comment": "Autonomous Python code-patch pipeline (skill_5 -> isolated worktree test gate -> commit+push to origin/main). See CLAUDE.md. enabled=false until the operator arms it.",
+    "enabled": false,
+    "forbidden_files": [
+      "risk_guard.py",
+      "usage_governor.py",
+      "watchdog.py"
+    ],
+    "protected_symbols": {
+      "agent.py": [
+        "check_stop_loss_alerts",
+        "check_trailing_stop_alerts",
+        "force_sell",
+        "read_broker_state",
+        "notify_operator"
+      ]
+    }
   }
 }
