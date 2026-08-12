@@ -30,6 +30,7 @@ extension AppTab {
         case .library: "chart.bar.doc.horizontal"
         case .shadow: "moon.stars"
         case .rx3: "arrow.triangle.2.circlepath"
+        case .rx4: "bolt.horizontal.circle"
         case .performance: "chart.line.uptrend.xyaxis"
         case .trades: "list.bullet.rectangle"
         case .risk: "shield"
@@ -56,7 +57,8 @@ extension AppTab {
         case .learning: "The post-trade learning loop, end to end."
         case .library: "Every research file, postmortem and victory."
         case .shadow: "Paper options sleeve and its go-live checklist."
-        case .rx3: "Deterministic rotation × vol throttle × RISKX — paper phase."
+        case .rx3: "Deterministic rotation × vol throttle × RISKX — the live book."
+        case .rx4: "Same engine, full-deploy variant — paper only, for comparison."
         case .performance: "Equity curve, drawdown and per-trade P&L."
         case .trades: "Full closed-trade history."
         case .risk: "Stops, overrides, kill-switch and the watchdog."
@@ -210,6 +212,7 @@ struct ContentView: View {
         case .library: LibraryView()
         case .shadow: ShadowView()
         case .rx3: RX3View()
+        case .rx4: RX4View()
         case .performance: PerformanceView()
         case .trades: TradesView()
         case .risk: RiskView()

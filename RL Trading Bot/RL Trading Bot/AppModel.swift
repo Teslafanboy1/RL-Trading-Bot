@@ -12,7 +12,7 @@ enum AppTab: String, CaseIterable, Identifiable, Hashable {
     // Intelligence
     case thinking, signals, screener, news, calendar
     // Strategy & learning
-    case strategy, learning, library, shadow, rx3
+    case strategy, learning, library, shadow, rx3, rx4
     // Operations
     case performance, trades, risk, activity, health, console
 
@@ -31,7 +31,7 @@ enum AppTab: String, CaseIterable, Identifiable, Hashable {
         switch self {
         case .overview, .positions, .orders, .market, .analyzer: .trading
         case .thinking, .signals, .screener, .news, .calendar: .intelligence
-        case .strategy, .learning, .library, .shadow, .rx3: .strategyLearning
+        case .strategy, .learning, .library, .shadow, .rx3, .rx4: .strategyLearning
         case .performance, .trades, .risk, .activity, .health, .console: .operations
         }
     }
@@ -53,6 +53,7 @@ enum AppTab: String, CaseIterable, Identifiable, Hashable {
         case .library: "Library"
         case .shadow: "Shadow"
         case .rx3: "RX-3 Rotation"
+        case .rx4: "RX-4 Tracker"
         case .performance: "Performance"
         case .trades: "Trades"
         case .risk: "Risk"
@@ -78,6 +79,7 @@ enum AppTab: String, CaseIterable, Identifiable, Hashable {
         case .library: "books.vertical.fill"
         case .shadow: "moon.stars.fill"
         case .rx3: "arrow.triangle.2.circlepath"
+        case .rx4: "bolt.horizontal.circle.fill"
         case .performance: "chart.line.uptrend.xyaxis"
         case .trades: "list.bullet.rectangle.portrait"
         case .risk: "shield.lefthalf.filled"
@@ -145,6 +147,7 @@ final class AppModel {
     var screenPayload: ScreenPayload?
     var ordersPayload: OrdersPayload?
     var rx3Payload: RX3Payload?
+    var rx4Payload: RX4Payload?
     var healthPayload: HealthPayload?
     var learningPayload: LearningPayload?
     var calendarPayload: CalendarPayload?
@@ -276,6 +279,8 @@ final class AppModel {
                 shadowPayload = try await api.get("/api/shadow", as: ShadowPayload.self)
             case .rx3:
                 rx3Payload = try await api.get("/api/rx3", as: RX3Payload.self)
+            case .rx4:
+                rx4Payload = try await api.get("/api/rx4", as: RX4Payload.self)
             case .performance:
                 performance = try await api.get("/api/performance", as: Performance.self)
             case .trades:

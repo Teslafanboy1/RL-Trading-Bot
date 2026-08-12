@@ -677,7 +677,8 @@ class TestAgentControlPlane(TmpRootMixin):
         with patch.object(agent_module, "signals") as sig, \
              patch.object(agent_module, "is_market_open", return_value=True), \
              patch.object(agent_module, "read_broker_state",
-                          side_effect=[(broker_positions, set(), 322.0), ([], set(), 322.0)]), \
+                          side_effect=[(broker_positions, set(), 322.0, 0.0),
+                                       ([], set(), 322.0, 322.0)]), \
              patch.object(agent_module, "force_sell",
                           return_value=(True, 880.0)) as fs, \
              patch.object(agent_module, "run_model") as rm, \
@@ -707,8 +708,8 @@ class TestAgentControlPlane(TmpRootMixin):
         with patch.object(agent_module, "signals") as sig, \
              patch.object(agent_module, "is_market_open", return_value=True), \
              patch.object(agent_module, "read_broker_state",
-                          side_effect=[(broker_positions, set(), 322.0),
-                                       (broker_positions, set(), 322.0)]), \
+                          side_effect=[(broker_positions, set(), 322.0, 0.0),
+                                       (broker_positions, set(), 322.0, 0.0)]), \
              patch.object(agent_module, "force_sell") as fs, \
              patch.object(agent_module, "run_model") as rm, \
              patch.object(agent_module, "active_skill",
@@ -821,6 +822,121 @@ class TestCommandCenterEndpoints(TmpRootMixin):
         self.assertEqual(out["paper_days"], 0)
         self.assertEqual(out["positions"], [])
         self.assertIsNone(out["latest"])
+
+    def _arm_live(self, capital_pct=1.0):
+        s = readers.strategy()
+        s["rotation"] = {"mode": "live", "top_n": 2,
+                         "live": {"enabled": True, "capital_pct": capital_pct,
+                                  "max_orders_per_day": 8}}
+        self._write("strategy/strategy.json", json.dumps(s))
+
+    def test_rx3_view_switches_to_the_live_desk_when_armed(self):
+        """The badge is read from strategy.json, not from whether a state file
+        happens to exist — the UI must never say 'paper' while real orders fly."""
+        self._arm_live()
+        self._write("logs/rx3_live.json", json.dumps({
+            "mode": "live", "equity": 1000.0, "buying_power": 200.0,
+            "targets": {"AAA": 0.5, "BBB": 0.5},
+            "orders_today": {"date": "2026-08-13", "count": 2},
+            "plan": [{"side": "buy", "symbol": "BBB", "dollar_amount": 300.0}],
+            "orders": [{"ts": "2026-08-13T09:35:00-04:00", "side": "buy",
+                        "symbol": "AAA", "dollar_amount": 500.0, "placed": True}],
+            "history": [{"date": "2026-08-13", "equity": 1000.0,
+                         "leaders": ["AAA", "BBB"], "defensive": [],
+                         "riskx": 1.0, "vol_scale": 1.0, "cash_w": 0.0,
+                         "orders": 2, "placed": 2}],
+        }))
+        self.log["open_positions"] = [{"id": "P1", "symbol": "AAA", "shares": 2.0,
+                                       "entry_price": 90.0}]
+        self._flush_log()
+        out = server_mod.rx3_view()
+        self.assertEqual(out["mode"], "live")
+        self.assertEqual(out["meta"]["equity"], 1000.0)
+        self.assertEqual(out["meta"]["orders_today"], 2)
+        book = {r["symbol"]: r for r in out["book"]}
+        # AAA: 2 shares × $100 quote = $200 of a $1,000 deployable book = 20%
+        self.assertEqual(book["AAA"]["current_pct"], 20.0)
+        self.assertEqual(book["AAA"]["target_pct"], 50.0)
+        self.assertEqual(book["AAA"]["drift_usd"], 300.0)
+        self.assertTrue(book["AAA"]["in_book"])
+        self.assertEqual(book["BBB"]["shares"], 0)
+        self.assertEqual(len(out["orders"]), 1)
+
+    def test_rx3_live_keeps_the_pre_live_paper_record_visible(self):
+        """The paper curve is the evidence the promotion decision rested on; it
+        stays reachable after go-live instead of being replaced."""
+        self._write("shadow/rx3_paper.json", json.dumps({
+            "start_equity": 100.0, "equity": 102.0, "positions": {},
+            "history": [{"date": "2026-07-08", "equity": 100.0},
+                        {"date": "2026-07-09", "equity": 102.0}]}))
+        self._arm_live()
+        out = server_mod.rx3_view()
+        self.assertEqual(out["paper_record"]["days"], 2)
+        self.assertEqual(out["paper_record"]["meta"]["return_pct"], 2.0)
+
+    def test_rx3_live_capital_pct_scales_the_reported_weights(self):
+        self._arm_live(capital_pct=0.5)
+        self._write("logs/rx3_live.json", json.dumps({
+            "equity": 1000.0, "targets": {"AAA": 1.0}, "history": []}))
+        self.log["open_positions"] = [{"id": "P1", "symbol": "AAA", "shares": 2.0,
+                                       "entry_price": 90.0}]
+        self._flush_log()
+        book = {r["symbol"]: r for r in server_mod.rx3_view()["book"]}
+        # $200 held against a HALF-size deployable book ($500) = 40%
+        self.assertEqual(book["AAA"]["current_pct"], 40.0)
+
+    def test_rx3_live_missing_state_file_is_safe(self):
+        """Armed but not yet run (the state file appears on the first live pass):
+        the desk still renders, and anything the account holds shows as
+        out-of-book — which is exactly what the engine is about to sell."""
+        self._arm_live()
+        out = server_mod.rx3_view()
+        self.assertEqual(out["mode"], "live")
+        self.assertEqual(out["orders"], [])
+        self.assertEqual(out["targets"], {})
+        self.assertTrue(all(not r["in_book"] and r["target_pct"] == 0.0
+                            for r in out["book"]))
+
+    def test_rx4_view_parses_the_paper_track(self):
+        self._write("shadow/rx4_paper.json", json.dumps({
+            "_note": "rx4", "start_date": "2026-08-05T09:33:00-04:00",
+            "start_equity": 100.0, "cash": 0.5, "equity": 93.0,
+            "positions": {"SNOW": {"shares": 0.14, "last_px": 320.0}},
+            "leaders": ["CRWD", "SNOW"],
+            "history": [{"date": "2026-08-05", "equity": 100.0,
+                         "leaders": ["SNOW"], "defensive": [], "riskx": 1.0,
+                         "vol_scale": 1.0, "cash_w": 0.0},
+                        {"date": "2026-08-06", "equity": 93.0,
+                         "leaders": ["CRWD"], "defensive": [], "riskx": 0.5,
+                         "vol_scale": 1.0, "cash_w": 0.0}],
+        }))
+        out = server_mod.rx4_view()
+        self.assertEqual(out["mode"], "paper")
+        self.assertEqual(out["meta"]["return_pct"], -7.0)
+        self.assertEqual(out["days"], 2)
+        self.assertEqual(out["history"][0]["date"], "2026-08-06")   # newest first
+        self.assertEqual(out["positions"][0]["symbol"], "SNOW")
+
+    def test_rx4_view_compares_against_the_live_book_once_rx3_is_live(self):
+        self._arm_live()
+        self._write("shadow/rx4_paper.json", json.dumps({
+            "start_date": "2026-08-05T09:33:00-04:00", "start_equity": 100.0,
+            "equity": 93.0, "positions": {},
+            "history": [{"date": "2026-08-05", "equity": 100.0}]}))
+        self._write("logs/equity_curve.jsonl",
+                    '{"ts": "2026-08-05T10:00:00-04:00", "total": 400.0}\n'
+                    '{"ts": "2026-08-06T10:00:00-04:00", "total": 420.0}\n')
+        out = server_mod.rx4_view()
+        self.assertEqual(out["rx3_comparison"]["source"], "live")
+        # rebased to 100 at RX-4's start so the two curves are comparable
+        self.assertEqual([p["value"] for p in out["rx3_comparison"]["curve"]],
+                         [100.0, 105.0])
+
+    def test_rx4_view_missing_file_safe(self):
+        out = server_mod.rx4_view()
+        self.assertEqual(out["days"], 0)
+        self.assertEqual(out["positions"], [])
+        self.assertEqual(out["rx3_comparison"]["curve"], [])
 
     def test_health_view_reports_freshness_and_control_plane(self):
         self._write("logs/heartbeat", "2026-07-10T09:35:00-04:00")

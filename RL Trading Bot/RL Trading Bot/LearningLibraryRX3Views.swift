@@ -452,23 +452,38 @@ struct RX3View: View {
 
     private var p: RX3Payload? { model.rx3Payload }
 
+    private var isLive: Bool { p?.isLive == true }
+
     var body: some View {
         Group {
             if p == nil {
-                LoadingScreen(title: "Loading RX-3 paper track…",
+                LoadingScreen(title: "Loading RX-3…",
                               detail: "rotation × vol throttle × RISKX")
                     .background(DS.bg)
             } else {
                 Screen(title: "RX-3 Rotation", subtitle: AppTab.rx3.blurb,
                        refresh: { await model.load(.rx3) }) {
                     if let err = model.tabErrors[.rx3] { ErrorBox(text: err) }
-                    statTiles
-                    promotionCard
-                    curveCard
-                    AdaptivePair(compactBelow: 860, ratio: 1.4) {
-                        bookCard
-                    } second: {
-                        gatesCard
+                    if isLive {
+                        liveBanner
+                        liveStatTiles
+                        curveCard
+                        AdaptivePair(compactBelow: 860, ratio: 1.5) {
+                            liveBookCard
+                        } second: {
+                            gatesCard
+                        }
+                        orderTrailCard
+                        paperRecordCard
+                    } else {
+                        statTiles
+                        promotionCard
+                        curveCard
+                        AdaptivePair(compactBelow: 860, ratio: 1.4) {
+                            bookCard
+                        } second: {
+                            gatesCard
+                        }
                     }
                     historyCard
                     rawConfigCard
@@ -477,6 +492,234 @@ struct RX3View: View {
         }
         .task { if p == nil { await model.load(.rx3) } }
     }
+
+    // MARK: live desk
+
+    /// The one thing that must never be ambiguous: whether real money is moving.
+    private var liveBanner: some View {
+        Card {
+            HStack(spacing: DS.s3) {
+                ZStack {
+                    Circle().fill(DS.up.opacity(0.16)).frame(width: 34, height: 34)
+                    Image(systemName: "bolt.fill")
+                        .font(.system(size: 15, weight: .bold)).foregroundStyle(DS.up)
+                }
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 7) {
+                        Text("LIVE — real orders").font(DSFont.semibold(14))
+                            .foregroundStyle(DS.text)
+                        Tag("deterministic", tone: .sage, size: 11)
+                        if let cp = p?.meta?.capitalPct {
+                            Tag(Fmt.pct(cp * 100, dp: 0, signed: false) + " of account",
+                                tone: .neutral, size: 11)
+                        }
+                    }
+                    Text("The rotation engine places the orders; the discretionary "
+                         + "research/execution loop is retired. Stops, trailing stops, "
+                         + "PAUSE, do-not-trade and the kill-switch all still gate it.")
+                        .font(DSFont.body(12)).foregroundStyle(DS.textMuted)
+                }
+                Spacer()
+                VStack(alignment: .trailing, spacing: 2) {
+                    Text("Orders today").font(DSFont.label(10)).kerning(0.5)
+                        .foregroundStyle(DS.textFaint)
+                    Text("\(p?.meta?.ordersToday ?? 0)/\(p?.meta?.maxOrdersPerDay ?? 0)")
+                        .font(DSFont.num(15, .bold)).foregroundStyle(DS.text)
+                }
+            }
+        }
+    }
+
+    private var liveStatTiles: some View {
+        let m = p?.meta
+        return StatRow {
+            StatCard(label: "Account equity", value: Fmt.usd(m?.equity),
+                     delta: m?.investedPct.map {
+                        Fmt.pct($0, dp: 0, signed: false) + " invested" } ?? nil,
+                     deltaTone: .neutral,
+                     sublabel: "updated \(Fmt.when(m?.updated))")
+            StatCard(label: "Buying power", value: Fmt.usd(m?.buyingPower),
+                     delta: "settled cash only", deltaTone: .neutral,
+                     sublabel: "T+1: unsettled proceeds can't be spent")
+            StatCard(label: "RISKX gate",
+                     value: Fmt.pct((p?.latest?.riskx ?? 0) * 100, dp: 0, signed: false),
+                     delta: "vol scale \(Fmt.pct((p?.latest?.volScale ?? 0) * 100, dp: 0, signed: false))",
+                     deltaTone: (p?.latest?.riskx ?? 0) >= 0.6 ? .up : .caution,
+                     sublabel: "5-signal cross-asset risk appetite")
+            StatCard(label: "Leaders",
+                     value: (p?.latest?.leaders ?? p?.leaders ?? []).joined(separator: " + "),
+                     delta: (p?.latest?.defensive ?? []).isEmpty ? "no defensive sleeve"
+                            : "defensive: " + (p?.latest?.defensive ?? []).joined(separator: " + "),
+                     deltaTone: .neutral,
+                     sublabel: "top-\(p?.config?["top_n"]?.compact ?? "2") momentum")
+        }
+    }
+
+    private var liveBookCard: some View {
+        let rows = p?.book ?? []
+        return Card("Target vs actual",
+                    subtitle: "the gap in Drift is what the engine trades next") {
+            if rows.isEmpty {
+                EmptyNote(text: "No book yet — the first live pass runs at the open.",
+                          icon: "circle.dashed")
+            } else {
+                VStack(spacing: 0) {
+                    THeader(columns: ["Ticker", "Target", "Actual", "Drift",
+                                      "Value", "P&L"],
+                            weights: [1.2, 1, 1, 1, 1, 1],
+                            alignments: [.leading, .trailing, .trailing, .trailing,
+                                         .trailing, .trailing])
+                    Rectangle().fill(DS.divider).frame(height: 1)
+                    ForEach(rows) { r in
+                        TRow(showsDivider: r.id != rows.last?.id) {
+                            TCell(weight: 1.2) {
+                                HStack(spacing: 6) {
+                                    Text(r.symbol).font(DSFont.bold(14))
+                                        .foregroundStyle(DS.text)
+                                    if r.inBook != true {
+                                        Tag("exiting", tone: .down, size: 10)
+                                    }
+                                }
+                            }
+                            TCell(align: .trailing) {
+                                Text(Fmt.pct(r.targetPct, dp: 1, signed: false))
+                                    .font(DSFont.num(13, .semibold))
+                                    .foregroundStyle(r.inBook == true ? DS.up : DS.textFaint)
+                            }
+                            TCell(align: .trailing) {
+                                Text(Fmt.pct(r.currentPct, dp: 1, signed: false))
+                                    .font(DSFont.num(13)).foregroundStyle(DS.text)
+                            }
+                            TCell(align: .trailing) {
+                                Text(Fmt.usdSigned(r.driftUsd))
+                                    .font(DSFont.num(12, .semibold))
+                                    .foregroundStyle(abs(r.driftUsd ?? 0) < 0.01
+                                                     ? DS.textFaint : DS.caution)
+                            }
+                            TCell(align: .trailing) {
+                                Text(Fmt.usd(r.value)).font(DSFont.num(13))
+                                    .foregroundStyle(DS.text)
+                            }
+                            TCell(align: .trailing) {
+                                Text(Fmt.pct(r.unrealizedPct))
+                                    .font(DSFont.num(12, .semibold))
+                                    .foregroundStyle(r.unrealizedPct.pnlColor)
+                            }
+                        }
+                    }
+                }
+                if let latest = p?.latest {
+                    Rectangle().fill(DS.divider).frame(height: 1).padding(.top, DS.s2)
+                    HStack(spacing: DS.s4) {
+                        gauge("RISKX", latest.riskx, "risk-appetite gate")
+                        gauge("Vol scale", latest.volScale, "vol throttle")
+                        gauge("Cash", latest.cashW, "weight parked")
+                    }
+                    .padding(.top, DS.s2)
+                }
+            }
+        }
+    }
+
+    private var orderTrailCard: some View {
+        let orders = p?.orders ?? []
+        let plan = p?.plan ?? []
+        return Card("Rotation orders",
+                    subtitle: "every order the engine has placed, newest first") {
+            VStack(alignment: .leading, spacing: DS.s3) {
+                if !plan.isEmpty {
+                    HStack(spacing: 7) {
+                        Text("Pending this cycle").font(DSFont.body(12))
+                            .foregroundStyle(DS.textMuted)
+                        ForEach(plan) { o in
+                            Tag("\((o.side ?? "").uppercased()) \(o.symbol ?? "") "
+                                + Fmt.usd(o.dollarAmount ?? 0, dp: 0),
+                                tone: o.side == "sell" ? .down : .sage, size: 11)
+                        }
+                        Spacer()
+                    }
+                }
+                if orders.isEmpty {
+                    EmptyNote(text: "No rotation orders placed yet.",
+                              icon: "arrow.left.arrow.right")
+                } else {
+                    VStack(spacing: 0) {
+                        THeader(columns: ["When", "Side", "Ticker", "Size",
+                                          "Reason", "Fill", "Status"],
+                                weights: [1.2, 0.7, 1, 1, 1.3, 1, 0.9],
+                                alignments: [.leading, .leading, .leading, .trailing,
+                                             .leading, .trailing, .leading])
+                        Rectangle().fill(DS.divider).frame(height: 1)
+                        ForEach(orders) { o in
+                            TRow(showsDivider: o.id != orders.last?.id) {
+                                TCell(weight: 1.2) {
+                                    Text(Fmt.when(o.ts)).font(DSFont.num(12))
+                                        .foregroundStyle(DS.textMuted)
+                                }
+                                TCell(weight: 0.7) {
+                                    Text((o.side ?? "—").uppercased())
+                                        .font(DSFont.num(12, .bold))
+                                        .foregroundStyle(o.side == "sell" ? DS.down : DS.up)
+                                }
+                                TCell {
+                                    Text(o.symbol ?? "—").font(DSFont.bold(13))
+                                        .foregroundStyle(DS.text)
+                                }
+                                TCell(align: .trailing) {
+                                    Text(o.dollarAmount != nil
+                                         ? Fmt.usd(o.dollarAmount)
+                                         : Fmt.num(o.shares, dp: 4) + " sh")
+                                        .font(DSFont.num(12)).foregroundStyle(DS.text)
+                                }
+                                TCell(weight: 1.3) {
+                                    Text(o.reason ?? "—").font(DSFont.num(11))
+                                        .foregroundStyle(DS.textMuted).lineLimit(1)
+                                }
+                                TCell(align: .trailing) {
+                                    Text(Fmt.usd(o.fillPrice)).font(DSFont.num(12))
+                                        .foregroundStyle(DS.textMuted)
+                                }
+                                TCell(weight: 0.9) {
+                                    Tag(o.placed == true ? "placed" : "failed",
+                                        tone: o.placed == true ? .sage : .down, size: 10)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private var paperRecordCard: some View {
+        let rec = p?.paperRecord
+        return Card("Pre-live paper record",
+                    subtitle: "the evidence this sleeve was promoted on — frozen at go-live") {
+            HStack(spacing: DS.s4) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("PAPER DAYS").font(DSFont.label(10)).kerning(0.5)
+                        .foregroundStyle(DS.textFaint)
+                    Text("\(rec?.days ?? 0)").font(DSFont.num(18, .bold))
+                        .foregroundStyle(DS.text)
+                }
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("PAPER RETURN").font(DSFont.label(10)).kerning(0.5)
+                        .foregroundStyle(DS.textFaint)
+                    Text(Fmt.pct(rec?.meta?.returnPct)).font(DSFont.num(18, .bold))
+                        .foregroundStyle(rec?.meta?.returnPct.pnlColor ?? DS.text)
+                }
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("STARTED").font(DSFont.label(10)).kerning(0.5)
+                        .foregroundStyle(DS.textFaint)
+                    Text(Fmt.when(rec?.meta?.startDate)).font(DSFont.num(13))
+                        .foregroundStyle(DS.textMuted)
+                }
+                Spacer()
+            }
+        }
+    }
+
+    // MARK: paper phase (pre-go-live shape, kept for a config rollback)
 
     private var statTiles: some View {
         let m = p?.meta
@@ -556,10 +799,13 @@ struct RX3View: View {
     }
 
     private var curveCard: some View {
-        Card("Paper equity vs SPY", subtitle: "indexed to 100 at the paper start") {
+        Card(isLive ? "Live equity vs SPY" : "Paper equity vs SPY",
+             subtitle: isLive ? "the real account, indexed to 100 at go-live"
+                              : "indexed to 100 at the paper start") {
             let data = curveData
             if data.count < 3 {
-                EmptyNote(text: "Curve appears after a few paper days.",
+                EmptyNote(text: isLive ? "Curve appears after a few live days."
+                                       : "Curve appears after a few paper days.",
                           icon: "chart.xyaxis.line")
                     .frame(minHeight: 80)
             } else {
@@ -672,8 +918,21 @@ struct RX3View: View {
         Card("Rotation config", subtitle: "what the deterministic engine is running with") {
             VStack(spacing: DS.s2) {
                 KeyValueRow(key: "Mode", value: p?.config?["mode"]?.stringValue ?? "paper")
-                KeyValueRow(key: "Paper enabled",
-                            value: p?.config?["paper_enabled"]?.boolValue == true ? "yes" : "no")
+                if isLive {
+                    KeyValueRow(key: "Capital deployed",
+                                value: Fmt.pct((p?.meta?.capitalPct ?? 1) * 100,
+                                               dp: 0, signed: false))
+                    KeyValueRow(key: "Rebalance band",
+                                value: Fmt.pct((p?.liveConfig?["rebalance_band_pct"]?.numberValue ?? 0) * 100,
+                                               dp: 1, signed: false))
+                    KeyValueRow(key: "Min order",
+                                value: Fmt.usd(p?.liveConfig?["min_order_usd"]?.numberValue))
+                    KeyValueRow(key: "Daily order cap",
+                                value: "\(p?.meta?.maxOrdersPerDay ?? 0)")
+                } else {
+                    KeyValueRow(key: "Paper enabled",
+                                value: p?.config?["paper_enabled"]?.boolValue == true ? "yes" : "no")
+                }
                 KeyValueRow(key: "Top N", value: p?.config?["top_n"]?.compact ?? "—")
                 KeyValueRow(key: "Target vol", value: p?.config?["target_vol"]?.compact ?? "—")
                 KeyValueRow(key: "Universe",
@@ -760,6 +1019,306 @@ struct RX3View: View {
                             .padding(DS.s3)
                     }
                     .frame(maxHeight: 360)
+                    .background(DS.consoleBG,
+                                in: RoundedRectangle(cornerRadius: DS.rMd, style: .continuous))
+                }
+            }
+        }
+    }
+}
+
+// MARK: - RX-4 tracker (paper-only variant of the live engine)
+
+/// RX-4 is the same `rotation_engine.py` brain as RX-3 run full-deploy: always
+/// 100% invested, no RISKX defensive carve-out, no vol throttle. It exists to
+/// answer one question with real data — what did the throttles cost, and what
+/// did they save — so the comparison against the LIVE RX-3 book is the point of
+/// the screen, not a decoration. It never places an order.
+struct RX4View: View {
+    @Environment(AppModel.self) private var model
+    @State private var showRawConfig = false
+
+    private var p: RX4Payload? { model.rx4Payload }
+
+    var body: some View {
+        Group {
+            if p == nil {
+                LoadingScreen(title: "Loading RX-4 tracker…",
+                              detail: "same engine, full deploy — paper only")
+                    .background(DS.bg)
+            } else {
+                Screen(title: "RX-4 Tracker", subtitle: AppTab.rx4.blurb,
+                       refresh: { await model.load(.rx4) }) {
+                    if let err = model.tabErrors[.rx4] { ErrorBox(text: err) }
+                    paperBanner
+                    statTiles
+                    comparisonCard
+                    AdaptivePair(compactBelow: 860, ratio: 1.4) {
+                        bookCard
+                    } second: {
+                        configCard
+                    }
+                    historyCard
+                    rawConfigCard
+                }
+            }
+        }
+        .task { if p == nil { await model.load(.rx4) } }
+    }
+
+    private var paperBanner: some View {
+        Card {
+            HStack(spacing: DS.s3) {
+                ZStack {
+                    Circle().fill(DS.caution.opacity(0.16)).frame(width: 34, height: 34)
+                    Image(systemName: "flask.fill")
+                        .font(.system(size: 14, weight: .bold)).foregroundStyle(DS.caution)
+                }
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 7) {
+                        Text("PAPER — hypothetical").font(DSFont.semibold(14))
+                            .foregroundStyle(DS.text)
+                        Tag("zero real dollars", tone: .neutral, size: 11)
+                        Tag("not on the live ladder", tone: .neutral, size: 11)
+                    }
+                    Text(p?.note ?? "Same rotation engine as RX-3, run full-deploy: "
+                         + "always 100% invested, no RISKX carve-out, no vol throttle.")
+                        .font(DSFont.body(12)).foregroundStyle(DS.textMuted)
+                }
+                Spacer()
+            }
+        }
+    }
+
+    private var statTiles: some View {
+        let m = p?.meta
+        return StatRow {
+            StatCard(label: "Paper equity", value: Fmt.usd(m?.equity),
+                     delta: Fmt.pct(m?.returnPct) + " since start",
+                     deltaTone: .forValue(m?.returnPct),
+                     sublabel: "started \(Fmt.when(m?.startDate))")
+            StatCard(label: "Tracked days", value: "\(p?.days ?? 0)",
+                     delta: "last run \(Fmt.when(m?.lastRun))",
+                     deltaTone: .neutral,
+                     sublabel: "one decision per market day")
+            StatCard(label: "Leaders",
+                     value: (p?.latest?.leaders ?? p?.leaders ?? []).joined(separator: " + "),
+                     delta: "top-\(p?.config?["top_n"]?.compact ?? "2") concentrated",
+                     deltaTone: .neutral,
+                     sublabel: "same ranking as RX-3")
+            StatCard(label: "Cash weight",
+                     value: Fmt.pct((p?.latest?.cashW ?? 0) * 100, dp: 0, signed: false),
+                     delta: "full deploy: throttles off",
+                     deltaTone: .caution,
+                     sublabel: "the variable being tested")
+        }
+    }
+
+    private struct CurvePoint: Identifiable {
+        let id = UUID()
+        let date: Date
+        let series: String
+        let value: Double
+    }
+
+    private var curveData: [CurvePoint] {
+        var out: [CurvePoint] = []
+        func add(_ pts: [RX3Point]?, _ series: String) {
+            let pts = pts ?? []
+            guard let base = pts.first?.value, base > 0 else { return }
+            for pt in pts {
+                if let v = pt.value, let d = Fmt.date(pt.ts) {
+                    out.append(CurvePoint(date: d, series: series, value: v / base * 100))
+                }
+            }
+        }
+        add(p?.curve, "RX-4")
+        // Already rebased server-side to RX-4's start date so the two are comparable.
+        let cmp = p?.rx3Comparison
+        add(cmp?.curve, cmp?.source == "live" ? "RX-3 (live)" : "RX-3 (paper)")
+        return out.sorted { $0.date < $1.date }
+    }
+
+    private var comparisonCard: some View {
+        let cmp = p?.rx3Comparison
+        let rx3Label = cmp?.source == "live" ? "RX-3 (live)" : "RX-3 (paper)"
+        return Card("RX-4 vs \(rx3Label)",
+                    subtitle: "both indexed to 100 at RX-4's start — the cost of the throttles") {
+            let data = curveData
+            if data.count < 3 {
+                EmptyNote(text: "Comparison appears after a few tracked days.",
+                          icon: "chart.xyaxis.line")
+                    .frame(minHeight: 80)
+            } else {
+                Chart(data) { pt in
+                    LineMark(x: .value("Day", pt.date), y: .value("Indexed", pt.value))
+                        .foregroundStyle(by: .value("Series", pt.series))
+                        .interpolationMethod(.monotone)
+                        .lineStyle(StrokeStyle(lineWidth: pt.series == "RX-4" ? 2.4 : 1.6,
+                                               lineCap: .round))
+                }
+                .chartForegroundStyleScale([
+                    "RX-4": DS.caution,
+                    rx3Label: DS.accent,
+                ])
+                .chartYScale(domain: .automatic(includesZero: false))
+                .chartXAxis {
+                    AxisMarks(values: .automatic(desiredCount: 5)) { value in
+                        AxisGridLine().foregroundStyle(DS.divider.opacity(0.5))
+                        AxisValueLabel {
+                            if let d = value.as(Date.self) {
+                                Text(d, format: .dateTime.month(.abbreviated).day())
+                                    .font(DSFont.num(10)).foregroundStyle(DS.textMuted)
+                            }
+                        }
+                    }
+                }
+                .chartYAxis {
+                    AxisMarks(position: .leading) { _ in
+                        AxisGridLine().foregroundStyle(DS.divider)
+                        AxisValueLabel().font(DSFont.num(10))
+                    }
+                }
+                .frame(height: 220)
+            }
+        }
+    }
+
+    private var bookCard: some View {
+        Card("Current paper book", subtitle: "top-N leaders, always fully deployed") {
+            let positions = p?.positions ?? []
+            VStack(alignment: .leading, spacing: DS.s3) {
+                HStack(spacing: 7) {
+                    Text("Leaders").font(DSFont.body(12)).foregroundStyle(DS.textMuted)
+                    ForEach(p?.latest?.leaders ?? p?.leaders ?? [], id: \.self) { s in
+                        Tag(s, tone: .up, size: 11)
+                    }
+                    Spacer()
+                }
+                if positions.isEmpty {
+                    EmptyNote(text: "No paper positions yet.", icon: "banknote")
+                } else {
+                    VStack(spacing: 0) {
+                        THeader(columns: ["Ticker", "Shares", "Price", "Change", "Value"],
+                                alignments: [.leading, .trailing, .trailing, .trailing, .trailing])
+                        Rectangle().fill(DS.divider).frame(height: 1)
+                        ForEach(positions) { pos in
+                            TRow(showsDivider: pos.id != positions.last?.id) {
+                                TCell {
+                                    Text(pos.symbol).font(DSFont.bold(14))
+                                        .foregroundStyle(DS.text)
+                                }
+                                TCell(align: .trailing) {
+                                    Text(Fmt.num(pos.shares, dp: 4)).font(DSFont.num(12))
+                                        .foregroundStyle(DS.textMuted)
+                                }
+                                TCell(align: .trailing) {
+                                    Text(Fmt.usd(pos.price ?? pos.lastPx))
+                                        .font(DSFont.num(13)).foregroundStyle(DS.text)
+                                }
+                                TCell(align: .trailing) {
+                                    Text(Fmt.pct(pos.changePct))
+                                        .font(DSFont.num(12, .semibold))
+                                        .foregroundStyle(pos.changePct.pnlColor)
+                                }
+                                TCell(align: .trailing) {
+                                    Text(Fmt.usd(pos.value)).font(DSFont.num(13, .semibold))
+                                        .foregroundStyle(DS.text)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private var configCard: some View {
+        Card("RX-4 config", subtitle: "the deltas from RX-3, and nothing else") {
+            VStack(spacing: DS.s2) {
+                KeyValueRow(key: "Mode", value: p?.config?["mode"]?.stringValue ?? "paper")
+                KeyValueRow(key: "Paper enabled",
+                            value: p?.config?["paper_enabled"]?.boolValue == true ? "yes" : "no")
+                KeyValueRow(key: "Top N", value: p?.config?["top_n"]?.compact ?? "—")
+                KeyValueRow(key: "Full deploy", value: "yes (no RISKX, no vol throttle)")
+                KeyValueRow(key: "Leverage haircut", value: "still applied (safety rule)")
+                if let note = p?.meta?.note {
+                    Rectangle().fill(DS.divider).frame(height: 1).padding(.vertical, 2)
+                    Text(note).font(DSFont.body(12)).foregroundStyle(DS.textMuted)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var historyCard: some View {
+        let hist = p?.history ?? []
+        if !hist.isEmpty {
+            Card("Daily decisions", subtitle: "one row per tracked day, straight from the engine") {
+                VStack(spacing: 0) {
+                    THeader(columns: ["Date", "Equity", "Leaders", "RISKX", "Vol", "Cash"],
+                            weights: [1, 1, 1.6, 1, 1, 1],
+                            alignments: [.leading, .trailing, .leading, .trailing,
+                                         .trailing, .trailing])
+                    Rectangle().fill(DS.divider).frame(height: 1)
+                    ForEach(hist) { day in
+                        TRow(showsDivider: day.id != hist.last?.id) {
+                            TCell {
+                                Text(day.date ?? "—").font(DSFont.num(12))
+                                    .foregroundStyle(DS.text)
+                            }
+                            TCell(align: .trailing) {
+                                Text(Fmt.usd(day.equity)).font(DSFont.num(12, .semibold))
+                                    .foregroundStyle(DS.text)
+                            }
+                            TCell(weight: 1.6) {
+                                Text((day.leaders ?? []).joined(separator: " + "))
+                                    .font(DSFont.num(12)).foregroundStyle(DS.up).lineLimit(1)
+                            }
+                            TCell(align: .trailing) {
+                                Text(Fmt.num(day.riskx, dp: 2)).font(DSFont.num(12))
+                                    .foregroundStyle(DS.textMuted)
+                            }
+                            TCell(align: .trailing) {
+                                Text(Fmt.num(day.volScale, dp: 2)).font(DSFont.num(12))
+                                    .foregroundStyle(DS.textMuted)
+                            }
+                            TCell(align: .trailing) {
+                                Text(Fmt.pct((day.cashW ?? 0) * 100, dp: 0, signed: false))
+                                    .font(DSFont.num(12)).foregroundStyle(DS.textMuted)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private var rawConfigCard: some View {
+        Card {
+            VStack(alignment: .leading, spacing: DS.s3) {
+                Button { showRawConfig.toggle() } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: showRawConfig ? "chevron.down" : "chevron.right")
+                            .font(.system(size: 10, weight: .bold))
+                        Text("Raw RX-4 config").font(DSFont.semibold(14))
+                        Spacer()
+                    }
+                    .foregroundStyle(DS.text)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                if showRawConfig {
+                    ScrollView {
+                        Text(p?.config?.pretty ?? "—")
+                            .font(DSFont.mono(11))
+                            .foregroundStyle(DS.consoleText)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .textSelection(.enabled)
+                            .padding(DS.s3)
+                    }
+                    .frame(maxHeight: 300)
                     .background(DS.consoleBG,
                                 in: RoundedRectangle(cornerRadius: DS.rMd, style: .continuous))
                 }

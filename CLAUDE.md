@@ -44,6 +44,13 @@ SIGNAL_INTERVAL=1d python3 signals.py SPY    # daily-chart mode
 
 ### Core loop (`agent.py`)
 
+> **Read [RX-3 — LIVE](#rx-3--live-since-2026-08-13-deterministic-rotation-owns-the-book) first.**
+> Steps 1–4 below describe the **discretionary** loop, which is currently
+> retired: with `rotation.mode: "live"` the cycle routes to
+> `run_rotation_cycle()` instead of the model turn. Everything from step 5 on
+> (broker reconciliation, forced exits, adoption, alerts) still applies exactly
+> as written — the live rotation path reuses those same functions.
+
 `main()` schedules `run_agent()` every `POLL_MINUTES` during market hours, and **stops for the day when the market closes — it does NOT run an end-of-day research cycle** (that run routed to Opus research whose output `persist_phase_output()` then discarded, since it won't clobber the morning's picks; it was ~$44/mo of pure waste). Tomorrow's picks come from the pre-market research run (the `w` startup path). Each cycle:
 1. Calls `signals.signals_with_raw()` to compute EMA signals once (reused for both skip check and prompt).
 2. **Smart skip** (`should_skip_model_call`): if all signals are NEUTRAL/HOLD, no stop-loss is triggered, and no weekend pick is pending execution, the cycle returns immediately with 0 tokens used. This eliminates ~90% of model calls on flat days.
@@ -266,11 +273,74 @@ Per-cycle model transcripts and skill_5 outputs append to a **single monthly rol
 - **Account**: always use account `696283985` (Agentic cash, not the margin account).
 - **Core rule changes** require 3+ similar outcomes before applying; minor tweaks (weights, targets, sizing) auto-apply.
 
-## RX-3 (approved 2026-07-06) — deterministic rotation, paper phase
+## RX-3 — LIVE since 2026-08-13 (deterministic rotation owns the book)
 
-The operator-approved next-generation strategy runs **paper-only** alongside the
-legacy live loop until its promotion ladder passes (2 weeks paper → 2 weeks half
-size → full; see `research/redesign_proposal_2026-07-06.md`).
+**RX-3 now trades the real account.** The operator armed it on 2026-08-13 after
+22 paper days (`shadow/rx3_paper.json`, promotion gate #1 was ≥10), at **full
+size**, with the **discretionary LLM loop retired**. What that means concretely:
+
+| | Before (legacy) | Now (RX-3 live) |
+|---|---|---|
+| Who decides | `skill_1` research picks → `skill_2` execution turn (Opus/Haiku prompts) | `rotation_engine.py`, pure Python, same math as the backtest |
+| Model's role | analyst *and* trader | **transport only** — read the broker, place one named order |
+| Daily research | Opus + web every morning | **off** (nothing reads the picks) |
+| Cycle cost | full execution turn per wake | one broker read + one call per actual order |
+
+Armed by `strategy.json → rotation.mode: "live"` **and** `rotation.live.enabled:
+true` — both required, `rotation_live_config()` fails closed on anything else
+(missing key, unreadable strategy, un-importable engine). Set either to false and
+the legacy discretionary loop comes back unchanged on the next cycle.
+
+- **`agent.run_rotation_cycle()`** replaces the model turn when live. Order of
+  operations per cycle: heartbeat → HALT check → manual cash flows → stops and
+  trailing stops computed → operator PAUSE → **authoritative broker read** →
+  **protective exits first** (`force_sell`) → rotation pass → re-read → trade-log
+  bookkeeping. The engine never gets to override a stop, and a failed broker read
+  places nothing (unknown is never "flat").
+- **`process_rx3_live()`** decides the target book **once per market day**
+  (`rx3_decide_targets`, cached in `logs/rx3_live.json`, decisions from closes
+  **through yesterday** — same lag discipline as the paper pass and backtest),
+  then **reconciles every cycle** toward that standing target. This split exists
+  because T+1 settlement is real: a buy leg starved of settled cash today simply
+  fills on a later cycle, and the plan is idempotent so re-running never
+  double-buys.
+- **`rx3_order_plan()`** is a **pure function** and the entire safety surface —
+  full exit for a name the engine dropped (deliberately bypassing the rebalance
+  band so old dust can't linger), trims for over-weights, buys capped by the
+  broker's **buying power** (not total-minus-positions, which would silently
+  spend unsettled proceeds), `do_not_trade` blocking buys but never exits,
+  manual-lock and already-working-sell skips, and a daily order cap. 20 unit
+  tests cover it; nothing here lives in a prompt.
+- **`place_rotation_order()`** places exactly one order per call and self-confirms
+  via `get_equity_orders` — the `force_sell` contract, for the same 2026-06-12
+  reason (a chatty turn narrating an order it never placed). Buys use
+  `dollar_amount` (fractional), full exits use `quantity`.
+- **Buys are not self-reported.** `process_rx3_live` returns sell actions only;
+  new positions are picked up by `adopt_untracked_positions()` at the broker's
+  real average cost on the next read, so the trade log never records a guessed
+  fill price.
+- **Rotation exits skip the learning pipeline** (`skip_pipeline` in
+  `process_cycle_state`): a mechanical rotation has no thesis to autopsy and the
+  rules live in `rotation_engine.py`, not in the skills. Stop-loss and
+  trailing-stop exits still get the full postmortem.
+- **Config is not model-editable.** skill_5's strategy rewrite carries the
+  `rotation`/`rotation_rx4` blocks over verbatim, and `rotation_engine.py` is on
+  the code-patch forbidden list (its value is that it is provably the same math
+  the backtest ran).
+- **Retired when live:** pre-market research (the schedule skips it), the
+  midweek review, `skill_2` turns, the RX-3 paper twin (the real book is now the
+  record; the paper curve stays on disk as the promotion evidence), and stale
+  weekend picks leave the watchlist.
+- Dashboard: `/api/rx3` switches to the **live desk** shape (mode badge read from
+  strategy.json, target-vs-actual book with the drift the engine will trade next,
+  order trail, real equity curve, frozen paper record). `/api/rx4` is the new
+  paper tracker. Mac app: RX-3 tab shows the live desk; new **RX-4 Tracker** tab.
+
+### RX-3 as designed (approved 2026-07-06)
+
+The engine itself is unchanged from the paper phase (that was the point of the
+ladder: 2 weeks paper → half size → full; see
+`research/redesign_proposal_2026-07-06.md`).
 
 - **`rotation_engine.py`** — pure deterministic brain (no I/O): top-2 momentum
   rotation (rank `0.5·r1m + 0.3·r1w + 0.2·r6m`, eligibility = momentum gate +
@@ -279,13 +349,16 @@ size → full; see `research/redesign_proposal_2026-07-06.md`).
   **DEFENS** (RISKX-freed capital → strongest of GLD/TLT/XLU/XLP). All inputs are
   closes **through yesterday** (strict lag discipline — three same-day look-ahead
   bugs were caught in research; backtest and live share these exact functions).
-  Config lives in `strategy.json → rotation` (universe, `paper_enabled`, `mode`).
-- **`agent.process_rx3_paper()`** — once per market day (any cycle, incl. skips):
-  fetches daily closes from Yahoo (zero model tokens), computes the target book,
-  rebalances the paper portfolio at 5bps/side, appends the equity curve to
-  `shadow/rx3_paper.json`. Promotion gate #1 = ≥10 paper days whose decisions
-  match the engine and behavior consistent with the backtest envelope
-  (10y lagged: ~+51%/yr, Sharpe ~1.5, maxDD 33%; honest forward +25–40%/yr).
+  Config lives in `strategy.json → rotation` (universe, `mode`, `live`).
+- **`agent.process_rx3_paper()`** — the pre-live paper pass: once per market day,
+  fetched daily closes from Yahoo (zero model tokens), computed the target book,
+  rebalanced a paper portfolio at 5bps/side into `shadow/rx3_paper.json`.
+  Promotion gate #1 was ≥10 paper days whose decisions match the engine and
+  behavior consistent with the backtest envelope (10y lagged: ~+51%/yr, Sharpe
+  ~1.5, maxDD 33%; honest forward +25–40%/yr) — it recorded 22 before go-live.
+  **No-ops now that RX-3 is live**: the real book is the record, and running the
+  twin would fork the history into two curves that drift apart (paper fills at
+  the mark, live fills at the spread).
 - **`risk_guard.py`** — account-level kill-switch + heartbeat: every cycle writes
   `logs/heartbeat`; `check_halt(broker_total)` tracks the month-peak equity in
   `logs/risk_state.json` and on a ≥25% monthly drawdown writes the **`HALT`**
@@ -335,11 +408,15 @@ out **worse** (CAGR ~28%/yr, maxDD still ~52%) — it only trims the best months
 nothing to the worst ones, so it gave back upside without buying any real downside
 protection. Not implemented.
 
-`agent.process_rx4_paper()` mirrors `process_rx3_paper()` structurally (own daily gate,
-own Yahoo fetch, own 5bps/side paper rebalance) and writes to `shadow/rx4_paper.json`,
-gated by `strategy.json → rotation_rx4.paper_enabled`. Paper-only, **zero real dollars**,
-and deliberately **not** on the RX-3 promotion ladder to live — it exists to observe the
-tradeoff, not to graduate.
+`agent.process_rx4_paper()` mirrors the old `process_rx3_paper()` structurally (own daily
+gate, own Yahoo fetch, own 5bps/side paper rebalance) and writes to
+`shadow/rx4_paper.json`, gated by `strategy.json → rotation_rx4.paper_enabled`.
+Paper-only, **zero real dollars**, and deliberately **not** on the RX-3 promotion ladder
+to live — it exists to observe the tradeoff, not to graduate. It keeps running after
+RX-3 went live (it is the only rotation paper track left), and is surfaced by `/api/rx4`
++ the Mac app's **RX-4 Tracker** tab, which charts it against the LIVE RX-3 equity curve
+rebased to RX-4's start — i.e. what the throttles actually cost or saved, measured
+against real fills rather than against another simulation.
 
 ## TradeCommand dashboard (`dashboard/`) — operator command center
 

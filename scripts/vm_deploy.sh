@@ -35,6 +35,7 @@ PROTECTED_PATHS=(
     "skills/skill_6_pattern_detector.md"
     "shadow/options_shadow_log.json"
     "shadow/rx3_paper.json"
+    "shadow/rx4_paper.json"
     "shadow/momentum_last_scan.json"
     "research/strategy_rewrite_queue.md"
 )

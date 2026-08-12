@@ -656,6 +656,12 @@ def is_market_open():
 def active_skill():
     now = datetime.now(ET)
     wd = now.weekday()  # 0=Mon … 6=Sun
+    # RX-3 LIVE owns the book: the discretionary skills (research, execution,
+    # midweek) are retired, so there is no skill prompt to load at all. The
+    # rotation decision is Python, and the model is only an order transport.
+    live, cfg = rotation_live_config()
+    if live and cfg.get("retire_llm_loop", True):
+        return "", "rx3_live"
     if is_market_open():
         # Wednesday at noon: fire midweek review once per day
         if wd == 2 and now.hour >= 12:
@@ -728,9 +734,16 @@ def watchlist_confirm_symbols():
 
 def watchlist_symbols(log):
     """SPY + open positions + WATCHLIST env + latest weekend picks (ranked +
-    WATCHLIST CONFIRM), de-duped."""
+    WATCHLIST CONFIRM), de-duped.
+
+    Under RX-3 live the research picks are not regenerated (skill_1 is retired),
+    so they are dropped rather than left to age into a stale watchlist — the
+    only symbols that need EMA signals then are the ones actually held, for the
+    stop/trailing-stop monitors."""
+    picks = ([] if rotation_live_config()[0]
+             else weekend_pick_symbols() + watchlist_confirm_symbols())
     syms = (["SPY"] + [p["symbol"] for p in log.get("open_positions", [])]
-            + WATCHLIST + weekend_pick_symbols() + watchlist_confirm_symbols())
+            + WATCHLIST + picks)
     seen, out = set(), []
     for s in syms:
         if s.upper() not in seen:
@@ -1784,10 +1797,17 @@ def _postmortems_for_rewrite(analysis_file):
 # second, unrelated gate. This function only ever commits+pushes to git — it
 # never writes into the live working tree, so a bug in this function itself
 # cannot corrupt the running process.
-_DEFAULT_CODE_PATCH_FORBIDDEN = {"risk_guard.py", "usage_governor.py", "watchdog.py"}
+# rotation_engine.py joined this list when RX-3 went live: it is now the thing
+# that decides what real money buys, and it is valuable precisely because it is
+# the SAME math the 10y backtest and the paper record ran. A bot-authored edit to
+# it would invalidate that provenance silently — the TEMA lesson, one level up.
+_DEFAULT_CODE_PATCH_FORBIDDEN = {"risk_guard.py", "usage_governor.py",
+                                 "watchdog.py", "rotation_engine.py"}
 _DEFAULT_CODE_PATCH_PROTECTED = {
     "agent.py": ["check_stop_loss_alerts", "check_trailing_stop_alerts",
-                 "force_sell", "read_broker_state", "notify_operator"],
+                 "force_sell", "read_broker_state", "notify_operator",
+                 "rx3_order_plan", "process_rx3_live", "rotation_live_config",
+                 "place_rotation_order"],
 }
 
 
@@ -2043,6 +2063,15 @@ Your job:
         if new_strategy and isinstance(new_strategy, dict) and "version" in new_strategy:
             current = load_strategy()
             old_v = current.get("version", 1)
+            # The rotation blocks are OPERATOR config for deterministic engines
+            # (what RX-3 trades, with how much, and whether it is live at all).
+            # skill_5 echoes the whole file back from a prompt, so a dropped or
+            # "helpfully" edited key here would silently change real position
+            # sizing — or disarm the live book — as a side effect of a
+            # postmortem. They are carried over verbatim, never model-editable.
+            for protected in ("rotation", "rotation_rx4"):
+                if protected in current:
+                    new_strategy[protected] = current[protected]
             # snapshot before overwriting
             src = os.path.join(ROOT, "strategy", "strategy.json")
             dst = os.path.join(ROOT, "strategy", "history", f"strategy_v{old_v}.json")
@@ -2157,7 +2186,7 @@ def read_broker_state(tier=TIER_EXECUTION):
     both still held at full size and ZERO orders placed. Trusting that footer
     phantom-closed both positions and fired two bogus postmortems.
 
-    Returns (positions, sell_symbols_today, account_total):
+    Returns (positions, sell_symbols_today, account_total, buying_power):
       positions          — list of {symbol, shares, avg_price, last_price}, or
                            None if the read itself failed (caller must then NOT
                            treat anything as closed — a failed read is unknown,
@@ -2168,7 +2197,13 @@ def read_broker_state(tier=TIER_EXECUTION):
       account_total      — the broker's real total account value (get_portfolio),
                            or None. Feeds the monthly-drawdown kill-switch and the
                            deposit-aware equity rebase (the $255-vs-$395 sizing
-                           drift found in the 2026-07-06 audit)."""
+                           drift found in the 2026-07-06 audit).
+      buying_power       — cash actually available to buy with RIGHT NOW, i.e.
+                           net of unsettled proceeds (get_portfolio), or None.
+                           RX-3 live sizes its buy leg off this and nothing else:
+                           total_value minus positions would silently include
+                           T+1 proceeds from the same cycle's sells, which is how
+                           a cash account earns a good-faith violation."""
     system = ("You are a read-only Robinhood query tool. Use only the MCP read "
               "tools. Do not place, modify, or cancel any order.")
     today = datetime.now(ET).strftime("%Y-%m-%d")
@@ -2177,26 +2212,37 @@ def read_broker_state(tier=TIER_EXECUTION):
         "1. Call get_equity_positions and list every currently held position.\n"
         f"2. Call get_equity_orders (created_at_gte={today}) and note which symbols "
         "have a SELL-side order placed today (any state).\n"
-        "3. Call get_portfolio and read total_value (the account's total value).\n"
+        "3. Call get_portfolio and read total_value (the account's total value) "
+        "AND the buying power available to buy stocks right now (the settled "
+        "cash figure, NOT including unsettled sale proceeds).\n"
         "Output ONLY one fenced ```json block, no prose:\n"
         '{"positions": [{"symbol": "X", "shares": <float>, "avg_price": <float>, '
         '"last_price": <float|null>}], "sell_orders_today": ["SYM", ...], '
-        '"account_total": <float|null>}\n'
+        '"account_total": <float|null>, "buying_power": <float|null>}\n'
         "shares = quantity held (use 0 only if truly flat). If no positions, use []."
     )
     text, _ = run_model(system, user, mcp=True, read_only=True, model=CHECK_MODEL,
                         timeout=240, tier=tier)
     block = extract_last_json_block(text)
     if not (block and isinstance(block, dict) and isinstance(block.get("positions"), list)):
-        return None, set(), None
+        return None, set(), None, None
     positions = [p for p in block["positions"]
                  if p.get("symbol") and float(p.get("shares") or 0) > 0]
     sells = {s.upper() for s in (block.get("sell_orders_today") or []) if isinstance(s, str)}
-    try:
-        total = float(block.get("account_total") or 0) or None
-    except (TypeError, ValueError):
-        total = None
-    return positions, sells, total
+
+    def _num(key):
+        try:
+            return float(block.get(key) or 0) or None
+        except (TypeError, ValueError):
+            return None
+
+    total = _num("account_total")
+    bp = _num("buying_power")
+    # Buying power can never exceed the whole account; a model that misreads the
+    # field must not be able to authorize a buy bigger than the account.
+    if bp is not None and total is not None:
+        bp = min(bp, total)
+    return positions, sells, total, bp
 
 
 def force_sell(symbol, shares, reason):
@@ -2632,9 +2678,15 @@ def process_cycle_state(log, actions, broker_positions, exit_info=None):
         is_stop_loss = reason == "stop_loss"
         price = (info.get("price") or a.get("price")
                  or last_by_sym.get(sym) or prev_last.get(sym) or op["entry_price"])
+        # A plain RX-3 rotation exit is mechanical — the name simply stopped
+        # ranking — so there is no thesis to autopsy and nothing for skill_5 to
+        # rewrite (the rules live in rotation_engine.py, not in the skills).
+        # Firing the learning loop on it would spend an Opus web-search call per
+        # rotation to conclude "the engine rotated". Stop-loss and trailing-stop
+        # exits still go through the full pipeline: those ARE worth a postmortem.
+        skip = reason in ("manual", "rotation_exit")
         log_trade_outcome(log, op, price, now, stop_loss=is_stop_loss,
-                          exit_reason=reason or None,
-                          skip_pipeline=(reason == "manual"))
+                          exit_reason=reason or None, skip_pipeline=skip)
 
     # 3. snapshot the authoritative broker positions for next cycle's diff.
     log["_state"]["last_positions"] = broker_positions
@@ -2838,6 +2890,13 @@ def process_rx3_paper(log):
     rcfg = strategy.get("rotation") or {}
     if rcfg.get("paper_enabled") is False:
         return
+    # Once RX-3 is LIVE the real book IS the track record — running the paper
+    # twin alongside it would fork the history into two curves that drift apart
+    # (paper fills at the mark, live fills at the spread) and doubles the Yahoo
+    # pull for no new information. The paper curve up to go-live stays on disk
+    # as the pre-live record the promotion decision was made on.
+    if rotation_live_config(strategy)[0]:
+        return
     st = log.setdefault("_state", {})
     h = _hours_since(st.get("last_rx3_ts"))
     if h is not None and h < 20:
@@ -3039,6 +3098,482 @@ def process_rx4_paper(log):
           f"leaders={tb['leaders']} cash={tb['cash']}")
     append_audit_log("rx4", f"RX-4 paper {datetime.now(ET):%Y-%m-%d}",
                      json.dumps(paper["history"][-1], indent=2))
+
+
+# ================================================================ RX-3 LIVE
+# The deterministic rotation engine trading REAL money (operator-armed
+# 2026-08-13 after 22 paper days on shadow/rx3_paper.json — promotion gate #1
+# was >=10). This is the same rotation_engine.py brain the paper track and the
+# 10y backtest run; nothing about the MATH changes when it goes live, only who
+# pays for the fills. Two things are deliberately different from the paper pass:
+#
+# 1. T+1 settlement is real. The paper book rebalances instantly against its own
+#    equity; a cash account cannot buy with proceeds from a sale that has not
+#    settled. So the DECISION is made once per market day (leaders come from
+#    closes through yesterday — the engine's lag discipline) and cached, while
+#    the RECONCILIATION toward that standing target runs every cycle: a buy leg
+#    starved of settled cash today simply executes on a later cycle, and the
+#    plan is idempotent so re-running it never double-buys.
+# 2. Every rail the legacy loop had still gates it: HALT (kill-switch), PAUSE,
+#    control/do_not_trade.json (buys only), control/locks/SYM.manual.lock, the
+#    hard + trailing stops (which run BEFORE the rotation pass and can force an
+#    exit the engine did not ask for), and a daily order cap. The engine can
+#    never be the reason a protective exit does not fire — forced exits are
+#    placed first, and a name sold protectively is simply not re-bought until
+#    the next day's decision.
+ROTATION_LIVE_DEFAULTS = {
+    "capital_pct": 1.0,          # fraction of the account the engine may deploy
+    "rebalance_band_pct": 0.05,  # ignore drift smaller than this * deployable
+    "min_order_usd": 5.0,        # never place a trade smaller than this
+    "min_exit_usd": 1.0,         # ...except a full exit, which goes down to here
+    "max_orders_per_day": 8,     # hard circuit breaker on churn/runaway loops
+    "cash_buffer_pct": 0.01,     # never spend the last 1% of buying power
+    "retire_llm_loop": True,     # skill_1/2/3 stop running: RX-3 owns the book
+}
+
+
+def rotation_live_config(strategy=None):
+    """(enabled, cfg) for the live rotation executor.
+
+    Fails CLOSED in every direction: live trading needs rotation.mode == 'live'
+    AND rotation.live.enabled == true AND an importable rotation_engine. A
+    missing/garbled strategy file, a half-written config, or an import failure
+    all resolve to (False, defaults) — i.e. the bot does not trade."""
+    try:
+        strategy = strategy if strategy is not None else load_strategy()
+    except Exception:
+        return False, dict(ROTATION_LIVE_DEFAULTS)
+    r = strategy.get("rotation") or {}
+    live_cfg = r.get("live") or {}
+    cfg = dict(ROTATION_LIVE_DEFAULTS)
+    for k, v in live_cfg.items():
+        if k in cfg and v is not None:
+            cfg[k] = v
+    enabled = (str(r.get("mode", "paper")).lower() == "live"
+               and bool(live_cfg.get("enabled", False))
+               and rotation_engine is not None and signals is not None)
+    return enabled, cfg
+
+
+def load_rx3_live_state():
+    return load_json("logs/rx3_live.json", None) or {
+        "_note": "RX-3 LIVE state — the day's cached target book plus the order "
+                 "trail. Decisions are made once per market day from closes "
+                 "through yesterday; reconciliation toward them runs every cycle.",
+        "sleeve_rets": [], "history": [], "orders": [],
+    }
+
+
+def save_rx3_live_state(st):
+    # ROOT is resolved at call time, not import time: save_json() writes under
+    # the CURRENT ROOT, so a module-level path constant would create the
+    # directory somewhere else entirely (and does, under a patched ROOT).
+    os.makedirs(os.path.join(ROOT, "logs"), exist_ok=True)
+    save_json("logs/rx3_live.json", st)
+
+
+def rx3_decide_targets(strategy, st, held):
+    """Today's target book from the engine, cached once per market day.
+
+    Returns (targets, meta) where targets is {SYMBOL: weight} summing to <= 1.0,
+    or (None, {"error": ...}) when the data is too thin to decide (in which case
+    the caller must NOT trade — an unknown book is never a flat book).
+
+    Lag discipline: the last Yahoo daily bar during market hours is today's
+    PARTIAL bar, so decisions drop it (`[:-1]`) exactly like the paper pass and
+    the backtest. Mixing today's partial into the decision series is the
+    look-ahead bug that was caught three times in research."""
+    today = datetime.now(ET).strftime("%Y-%m-%d")
+    cached = st.get("decision") or {}
+    if cached.get("date") == today and isinstance(cached.get("targets"), dict):
+        return cached["targets"], cached
+
+    universe = _rx3_universe(strategy)
+    comp_syms = [s for pair in rotation_engine.RISKX_COMPONENTS for s in pair if s]
+    def_syms = list(rotation_engine.DEFENSIVE_ASSETS)
+    closes = _rx3_fetch_closes(sorted(set(universe + comp_syms + def_syms)))
+    if len([s for s in universe if s in closes]) < 5:
+        return None, {"error": "data fetch too thin"}
+
+    hist = lambda s: closes[s][:-1]
+    # Realized return of yesterday's leaders feeds the vol throttle (the sleeve's
+    # OWN trailing vol, strictly through yesterday).
+    prev_leaders = (cached.get("leaders") or [])
+    rets = [closes[s][-1] / closes[s][-2] - 1 for s in prev_leaders
+            if closes.get(s) and len(closes[s]) >= 2 and closes[s][-2] > 0]
+    if rets:
+        st["sleeve_rets"] = (st.get("sleeve_rets", []) + [sum(rets) / len(rets)])[-60:]
+
+    tb = rotation_engine.target_book(
+        {s: hist(s) for s in universe if s in closes},
+        {s: hist(s) for s in comp_syms if s in closes},
+        {s: hist(s) for s in def_syms if s in closes},
+        st.get("sleeve_rets", []),
+        held=list(held or []),
+        sector_of=lambda s: sector_for(s, strategy),
+        leverage_factor=lambda s: leverage_factor(s, strategy))
+    targets = {**tb["weights"], **tb["defensive"]}
+    meta = {"date": today, "targets": targets, "leaders": tb["leaders"],
+            "defensive": list(tb["defensive"]), "riskx": tb["riskx"],
+            "vol_scale": tb["vol_scale"], "cash_w": tb["cash"],
+            "scale": tb["scale"], "decided_at": now_iso()}
+    st["decision"] = meta
+    return targets, meta
+
+
+def rx3_order_plan(targets, positions, equity, buying_power, cfg, *,
+                   do_not_trade=(), locked=(), sells_today=(), orders_left=None):
+    """PURE: diff the real book against the target book -> the orders to place.
+
+    positions — [{"symbol", "shares", "last_price"}] from the broker read.
+    equity    — the broker's total account value (positions + cash).
+    Returns [{side, symbol, dollar_amount|shares, reason, target_pct,
+              current_pct, drift_usd}], sells first (they free the cash the buys
+    need, and an exit is always more urgent than an entry).
+
+    Rules encoded here rather than in a prompt, so they are testable and cannot
+    be talked out of: a name the engine no longer wants is fully exited; drift
+    inside the rebalance band is ignored (churn costs real spread); buys are
+    capped by actual buying power minus a cash buffer, so a rebalance can never
+    depend on unsettled proceeds; do-not-trade blocks BUYS only (never an exit);
+    a symbol with the operator's own dashboard order in flight is skipped
+    entirely this cycle; and a symbol that already has a sell order working
+    today is never sold twice."""
+    deployable = max(0.0, float(equity or 0)) * float(cfg.get("capital_pct", 1.0))
+    if deployable <= 0:
+        return []
+    band = float(cfg.get("rebalance_band_pct", 0.05)) * deployable
+    min_order = float(cfg.get("min_order_usd", 5.0))
+    min_exit = float(cfg.get("min_exit_usd", 1.0))
+    buffer_usd = float(cfg.get("cash_buffer_pct", 0.01)) * max(0.0, float(equity or 0))
+    dnt = {s.upper() for s in (do_not_trade or [])}
+    locked = {s.upper() for s in (locked or [])}
+    sells_today = {s.upper() for s in (sells_today or [])}
+
+    held = {}
+    for p in positions or []:
+        sym = str(p.get("symbol") or "").upper()
+        sh = float(p.get("shares") or 0)
+        px = float(p.get("last_price") or 0)
+        if sym and sh > 0:
+            held[sym] = {"shares": sh, "price": px, "value": sh * px}
+
+    sells, buys = [], []
+    for sym in sorted(set(list(held) + list(targets or {}))):
+        if sym in locked:
+            continue
+        cur = held.get(sym, {})
+        cur_val = float(cur.get("value") or 0)
+        tgt_val = float((targets or {}).get(sym, 0.0)) * deployable
+        drift = tgt_val - cur_val
+        row = {"symbol": sym, "target_pct": round(float((targets or {}).get(sym, 0.0)), 4),
+               "current_pct": round(cur_val / deployable, 4) if deployable else 0.0,
+               "drift_usd": round(drift, 2)}
+        if drift < 0 and sym in held:
+            if sym in sells_today:
+                continue          # a sell is already working — never double-sell
+            if tgt_val <= 0:
+                # full exit: the engine dropped this name. Bypasses the band on
+                # purpose — a stale sub-band position would otherwise linger in
+                # the book forever, which is exactly how the legacy loop's dust
+                # accumulated.
+                if cur_val < min_exit:
+                    continue
+                sells.append({**row, "side": "sell", "shares": cur["shares"],
+                              "reason": "rotation_exit"})
+            elif abs(drift) >= max(band, min_order):
+                sells.append({**row, "side": "sell", "dollar_amount": round(abs(drift), 2),
+                              "reason": "rotation_trim"})
+        elif drift > 0 and tgt_val > 0:
+            if sym in dnt:
+                continue          # operator do-not-trade: blocks buys, not exits
+            if drift >= max(band, min_order):
+                buys.append({**row, "side": "buy", "dollar_amount": round(drift, 2),
+                             "reason": "rotation_entry" if sym not in held else "rotation_add"})
+
+    sells.sort(key=lambda o: o["drift_usd"])          # most over-weight first
+    buys.sort(key=lambda o: -o["drift_usd"])          # most under-weight first
+
+    # Buys spend only what the broker says is actually available RIGHT NOW.
+    # Anything the settled balance can't cover is simply dropped: the plan is
+    # recomputed every cycle, so it re-appears once the proceeds settle.
+    spendable = max(0.0, float(buying_power or 0) - buffer_usd)
+    funded = []
+    for o in buys:
+        amt = min(o["dollar_amount"], round(spendable, 2))
+        if amt < max(min_order, 1.0):
+            continue
+        o = {**o, "dollar_amount": round(amt, 2)}
+        spendable -= amt
+        funded.append(o)
+
+    plan = sells + funded
+    if orders_left is not None:
+        plan = plan[:max(0, int(orders_left))]
+    return plan
+
+
+def place_rotation_order(side, symbol, *, dollar_amount=None, shares=None,
+                         reason="rotation"):
+    """Place ONE deterministic rotation order via a tight, single-purpose
+    `claude -p` call, then self-confirm via get_equity_orders — the same contract
+    as force_sell(), for the same reason: the chatty analytical turn has been
+    observed to narrate an order it never placed (2026-06-12). Here there is no
+    analysis to do at all, because the decision was already made in Python.
+
+    Returns (placed: bool, fill_price: float|None, order_id: str|None)."""
+    if EXECUTION_MODE != "live":
+        print(f"  [rx3-live] ADVISORY MODE — would {side} {symbol} "
+              f"({dollar_amount or shares}) reason={reason}")
+        return False, None, None
+    if dollar_amount:
+        spec = f"dollar_amount='{float(dollar_amount):.2f}' (a notional dollar order)"
+        what = f"${float(dollar_amount):.2f} of {symbol}"
+    else:
+        spec = f"quantity='{shares}'"
+        what = f"{shares} shares of {symbol}"
+    system = ("You place exactly one Robinhood order and then confirm it. No "
+              "analysis, no review step, no hedging, no second-guessing.")
+    user = (
+        f"Place a MARKET {side.upper()} order for {what} in Robinhood account "
+        f"{ACCOUNT_NUMBER} using place_equity_order RIGHT NOW. This is a "
+        f"pre-authorized deterministic rotation order (reason={reason}) computed "
+        "by the engine — do not analyze it, do not call review_equity_order, do "
+        "not skip it.\n"
+        f"Use type='market', {spec}, market_hours='regular_hours', "
+        "time_in_force='gfd'.\n"
+        "After placing it, call get_equity_orders to confirm the order exists.\n"
+        "Output ONLY one fenced ```json block, no prose:\n"
+        '{"placed": true|false, "symbol": "' + symbol + '", "order_id": "<id or null>", '
+        '"fill_price": <float|null>, "shares": <float|null>}\n'
+        "Set placed=true ONLY if place_equity_order returned an order id."
+    )
+    text, _ = run_model(system, user, mcp=True, allow_write=True, model=MODEL,
+                        timeout=240, tier=TIER_EXECUTION)
+    block = extract_last_json_block(text) or {}
+
+    def _f(v):
+        try:
+            return float(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    return bool(block.get("placed")), _f(block.get("fill_price")), block.get("order_id")
+
+
+def process_rx3_live(log, strategy, cfg, broker_positions, broker_total,
+                     buying_power, sells_today, blocked_buys=()):
+    """Reconcile the REAL book toward today's RX-3 target book.
+
+    blocked_buys — names the protective rails sold TODAY. They stay in the
+    target book (the engine still ranks them), so without this the very next
+    reconciliation would see a flat slot against a 50% target and buy straight
+    back into the position a stop just closed. The block is persisted for the
+    rest of the day and clears with tomorrow's fresh decision, which re-derives
+    eligibility from scratch.
+
+    Returns (actions, exit_info, placed_count). `actions` are footer-shaped sell
+    records for process_cycle_state (buys are deliberately NOT reported as
+    actions — they are picked up by adopt_untracked_positions() at the broker's
+    own average cost on the next read, so the trade log records the price that
+    actually filled instead of one this function guessed)."""
+    st = load_rx3_live_state()
+    held_syms = [p["symbol"] for p in (broker_positions or [])
+                 if float(p.get("shares") or 0) > 0]
+    targets, meta = rx3_decide_targets(strategy, st, held_syms)
+    if targets is None:
+        save_rx3_live_state(st)
+        print(f"  [rx3-live] no decision this cycle ({meta.get('error')}) — "
+              "book left untouched.")
+        return [], {}, 0
+
+    today = datetime.now(ET).strftime("%Y-%m-%d")
+    counter = st.get("orders_today") or {}
+    if counter.get("date") != today:
+        counter = {"date": today, "count": 0}
+    max_orders = int(cfg.get("max_orders_per_day", 8))
+    orders_left = max_orders - int(counter.get("count") or 0)
+
+    locked = [p["symbol"] for p in (broker_positions or [])
+              if _manual_lock_active(p["symbol"])]
+    locked += [s for s in targets if s not in locked and _manual_lock_active(s)]
+
+    blocked = st.get("blocked_buys") or {}
+    if blocked.get("date") != today:
+        blocked = {"date": today, "symbols": []}
+    blocked["symbols"] = sorted(set(blocked.get("symbols") or [])
+                                | {s.upper() for s in (blocked_buys or [])})
+    st["blocked_buys"] = blocked
+    if blocked["symbols"]:
+        print(f"  [rx3-live] no re-entry today for {blocked['symbols']} "
+              "(protective exit already fired on them)")
+
+    plan = rx3_order_plan(targets, broker_positions or [], broker_total,
+                          buying_power, cfg,
+                          do_not_trade=list(_do_not_trade()) + blocked["symbols"],
+                          locked=locked,
+                          sells_today=sells_today, orders_left=orders_left)
+
+    print(f"  [rx3-live] leaders={meta.get('leaders')} "
+          f"defensive={meta.get('defensive')} riskx={meta.get('riskx')} "
+          f"vol_scale={meta.get('vol_scale')} target_cash={meta.get('cash_w')} "
+          f"equity={broker_total} bp={buying_power}")
+    if orders_left <= 0:
+        print(f"  [rx3-live] daily order cap ({max_orders}) reached — no more "
+              "orders today. Protective exits are unaffected.")
+    if not plan:
+        print("  [rx3-live] book already inside the rebalance band — no orders.")
+
+    actions, exit_info, placed_n = [], {}, 0
+    for o in plan:
+        sym = o["symbol"]
+        print(f"  [rx3-live] {o['side'].upper()} {sym} "
+              f"{o.get('dollar_amount') or o.get('shares')} "
+              f"(cur {o['current_pct']*100:.1f}% -> tgt {o['target_pct']*100:.1f}%) "
+              f"reason={o['reason']}")
+        placed, fill, order_id = place_rotation_order(
+            o["side"], sym, dollar_amount=o.get("dollar_amount"),
+            shares=o.get("shares"), reason=o["reason"])
+        print(f"  [rx3-live] {sym} placed={placed} fill={fill} id={order_id}")
+        st.setdefault("orders", []).append(
+            {"ts": now_iso(), "date": today, **o, "placed": placed,
+             "fill_price": fill, "order_id": order_id})
+        if not placed:
+            continue
+        placed_n += 1
+        counter["count"] = int(counter.get("count") or 0) + 1
+        if o["side"] == "sell":
+            actions.append({"type": "sell", "symbol": sym, "reason": o["reason"],
+                            "price": fill, "shares": o.get("shares")})
+            # Only a FULL exit closes the position; a trim leaves it open, so it
+            # must not be handed to close detection as an exit reason.
+            if o["reason"] == "rotation_exit":
+                exit_info[sym] = {"reason": "rotation_exit", "price": fill}
+
+    st["orders"] = st.get("orders", [])[-200:]
+    st["orders_today"] = counter
+    st.update({"mode": "live", "updated": now_iso(), "equity": broker_total,
+               "buying_power": buying_power, "capital_pct": cfg.get("capital_pct"),
+               "targets": targets, "plan": plan})
+    hist = [h for h in st.get("history", []) if h.get("date") != today]
+    hist.append({"date": today, "equity": broker_total,
+                 "leaders": meta.get("leaders"), "defensive": meta.get("defensive"),
+                 "riskx": meta.get("riskx"), "vol_scale": meta.get("vol_scale"),
+                 "cash_w": meta.get("cash_w"), "targets": targets,
+                 "orders": len([o for o in plan]), "placed": placed_n})
+    st["history"] = hist[-180:]
+    save_rx3_live_state(st)
+    if placed_n:
+        append_audit_log("rx3_live", f"RX-3 live {today}",
+                         json.dumps({"decision": meta, "plan": plan}, indent=2))
+    return actions, exit_info, placed_n
+
+
+def run_rotation_cycle(log, strategy, must_sell, task):
+    """A full market cycle with RX-3 LIVE owning the book — no analytical model
+    turn at all. The model is used only as an order/broker transport (read the
+    account, place a specific order), never as a decision maker.
+
+    Deliberately self-contained rather than threaded through the legacy path:
+    the discretionary loop is one config flip away from coming back, and the two
+    execution models should not be interleaved in one function where a change to
+    either can silently alter the other."""
+    stamp = datetime.now(ET).strftime("%Y-%m-%d_%H%M")
+    _enabled, cfg = rotation_live_config(strategy)
+
+    if not is_market_open():
+        # Nothing can fill with the market closed, so an authoritative broker
+        # read is pure waste (the same reasoning as the legacy off-hours path).
+        # Off-hours is where the deferred learning work belongs.
+        try:
+            process_strategy_rewrite_queue()
+        except Exception as e:
+            print(f"  [skill_5] rewrite queue processing failed: {e}")
+        write_cycle_status("idle", task, "off-hours")
+        print(f"[{stamp}] task={task} off-hours — no broker read, no orders.")
+        return
+
+    broker_positions, sells_today, broker_total, buying_power = read_broker_state(
+        TIER_PROTECTIVE if must_sell else TIER_EXECUTION)
+
+    if broker_total:
+        sync_account_equity(log, broker_total)
+        append_equity_point(broker_total)
+        if risk_guard:
+            g_status, g_detail = risk_guard.check_halt(broker_total)
+            if g_status == "halt":
+                print(f"[{stamp}] KILL-SWITCH: {g_detail} — flattening book and halting.")
+                notify_operator(
+                    "Trading bot: MONTHLY KILL-SWITCH TRIPPED — flattening",
+                    f"{g_detail}. All positions are being force-sold and the bot "
+                    "will not trade until you review and delete the HALT file.")
+                for p in (broker_positions or []):
+                    must_sell.setdefault(p["symbol"], "halt")
+
+    if broker_positions is None:
+        print(f"[{stamp}] WARNING: could not read authoritative broker state — "
+              "no rotation orders and no close detection this cycle (a failed "
+              "read is unknown, never flat). Retries next cycle.")
+        write_cycle_status("idle", task, "broker-read-failed")
+        return
+
+    # 1) Protective exits FIRST — the engine never gets to override a stop.
+    exit_info, sold_any, protective_exits = {}, False, []
+    held_at_broker = {p["symbol"]: p for p in broker_positions}
+    for sym, reason in must_sell.items():
+        if sym not in held_at_broker or sym in sells_today:
+            continue
+        if _manual_lock_active(sym):
+            print(f"  [FORCED-SELL] {sym} deferred — manual dashboard order in flight.")
+            continue
+        print(f"  [FORCED-SELL] {sym} (reason={reason}) — placing dedicated market sell.")
+        placed, fill = force_sell(sym, held_at_broker[sym].get("shares"), reason)
+        exit_info[sym] = {"reason": reason, "price": fill}
+        print(f"  [FORCED-SELL] {sym} placed={placed} fill={fill}")
+        sold_any = True
+        protective_exits.append(sym)
+    if sold_any:
+        reread, sells2, total2, bp2 = read_broker_state(TIER_PROTECTIVE)
+        if reread is not None:
+            broker_positions, sells_today = reread, (sells_today | sells2)
+            broker_total = total2 or broker_total
+            buying_power = bp2 if bp2 is not None else buying_power
+
+    # 2) The rotation pass itself. A name just force-sold is gone from the
+    #    broker snapshot, so the planner sees a flat slot; it will not be
+    #    re-bought until settled cash exists, and the stop that fired stays
+    #    respected because tomorrow's decision re-derives eligibility.
+    actions = []
+    if not _control_paused():          # belt-and-braces: the caller already checked
+        try:
+            actions, rot_exits, placed_n = process_rx3_live(
+                log, strategy, cfg, broker_positions, broker_total,
+                buying_power, sells_today, blocked_buys=protective_exits)
+            exit_info.update(rot_exits)
+            if placed_n:
+                reread, _, total3, _bp3 = read_broker_state(TIER_EXECUTION)
+                if reread is not None:
+                    broker_positions = reread
+                    broker_total = total3 or broker_total
+        except Exception as e:
+            print(f"  [rx3-live] rotation pass failed: {e} — book untouched, "
+                  "protective rails unaffected.")
+
+    # 3) Bookkeeping off the authoritative snapshot (adoption records new buys at
+    #    the broker's real average cost; closes fire the learning pipeline).
+    process_cycle_state(log, actions, broker_positions, exit_info)
+
+    still = {p["symbol"] for p in broker_positions} & set(must_sell)
+    if still:
+        print(f"[{stamp}] WARNING: forced exit NOT completed for {sorted(still)} — "
+              "still held at broker. Will retry next cycle; MANUAL SELL may be required.")
+        notify_operator(
+            "Trading bot: forced exit NOT completed",
+            f"{sorted(still)} still held at the broker after the dedicated "
+            "force-sell. The bot will retry next cycle, but a MANUAL SELL may be "
+            "required now.")
+    write_cycle_status("idle", task)
+    print(f"[{stamp}] task={task} done.")
 
 
 def _format_stop_loss_block(alerts):
@@ -3291,7 +3826,7 @@ def run_agent():
         stamp = datetime.now(ET).strftime("%Y-%m-%d_%H%M")
         exit_info = {}
         if is_market_open():
-            broker_positions, sell_orders_today, broker_total = read_broker_state(
+            broker_positions, sell_orders_today, broker_total, _bp = read_broker_state(
                 TIER_PROTECTIVE if must_sell else TIER_EXECUTION)
             if broker_total:
                 sync_account_equity(log, broker_total)
@@ -3330,7 +3865,7 @@ def run_agent():
                 # (or one already flat) triggered a full extra broker call every
                 # 15 minutes for nothing.
                 if sold_any:
-                    reread, _, _ = read_broker_state(TIER_PROTECTIVE)
+                    reread, _, _, _ = read_broker_state(TIER_PROTECTIVE)
                     if reread is not None:
                         broker_positions = reread
                 process_cycle_state(log, [], broker_positions, exit_info)
@@ -3340,6 +3875,15 @@ def run_agent():
         print(f"[{stamp}] task={task} PAUSED by operator — protective exits + "
               "bookkeeping only, no model call.")
         write_cycle_status("idle", task, "paused")
+        return
+
+    # RX-3 LIVE: the deterministic rotation engine owns the real book. Placed
+    # after every rail above (heartbeat, HALT, manual cash flows, stop/trailing
+    # computation, operator PAUSE) so it inherits all of them, and before the
+    # smart-skip/model-turn machinery, which is exactly what it replaces.
+    if task == "rx3_live":
+        run_rotation_cycle(log, strategy, must_sell, task)
+        _run_shadow_passes(raw_sigs, log)
         return
 
     # SMART SKIP: if every signal is NEUTRAL/HOLD and no stop-loss → no model call needed.
@@ -3576,8 +4120,10 @@ EXECUTION RULES:
     else:
         # When a forced exit is pending this read IS the protective path (it
         # decides what force_sell fires on), so it rides the tier that a spent
-        # usage window can never block.
-        broker_positions, sell_orders_today, broker_total = read_broker_state(
+        # usage window can never block. (Buying power is read too, but only the
+        # RX-3 live path sizes off it — the discretionary turn asks the broker
+        # for settled cash itself.)
+        broker_positions, sell_orders_today, broker_total, _bp = read_broker_state(
             TIER_PROTECTIVE if must_sell else TIER_EXECUTION)
     # Account-level guard off the REAL broker total: deposit-aware equity sync +
     # the monthly-drawdown kill-switch. A fresh halt turns every held name into
@@ -3629,7 +4175,7 @@ EXECUTION RULES:
             # presence of an alert burned an extra broker call every 15 minutes
             # while a sell order was already working.
             if sold_any:
-                reread, _, _ = read_broker_state(TIER_PROTECTIVE)
+                reread, _, _, _ = read_broker_state(TIER_PROTECTIVE)
                 if reread is not None:
                     broker_positions = reread
 
@@ -3945,7 +4491,11 @@ def main():
                 events.append((maint_t, "maintenance"))
             if now < anchor_t:
                 events.append((anchor_t, "anchor"))
-            if now < research_t:
+            # Pre-market research only exists to feed the discretionary skills.
+            # With RX-3 live they are retired and its picks would be read by
+            # nobody, so the daily Opus web-search run is dropped entirely —
+            # the largest single line of the bot's usage budget.
+            if now < research_t and not rotation_live_config()[0]:
                 events.append((research_t, "research"))
 
             if not events:

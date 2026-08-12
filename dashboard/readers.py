@@ -515,7 +515,32 @@ def momentum_last_scan():
 
 
 def rx3_paper():
+    """The pre-live RX-3 paper record. Frozen once the engine goes live — the
+    real book becomes the track record from that point (see rx3_live)."""
     return load_json("shadow/rx3_paper.json", {})
+
+
+def rx3_live():
+    """RX-3 LIVE state: today's cached target book, the order trail, and the
+    per-day decision history. Empty dict until the engine is armed."""
+    return load_json("logs/rx3_live.json", {})
+
+
+def rx4_paper():
+    """RX-4 paper record — the 'turn up the volume' variant (full_deploy, no
+    RISKX carve-out, no vol throttle). Hypothetical: never real money."""
+    return load_json("shadow/rx4_paper.json", {})
+
+
+def rotation_mode():
+    """('live'|'paper', live_cfg) straight from strategy.json → rotation. The
+    dashboard reads the same switch the bot arms itself from, so the badge can
+    never disagree with what is actually trading."""
+    rot = strategy().get("rotation") or {}
+    live_cfg = rot.get("live") or {}
+    mode = "live" if (str(rot.get("mode", "paper")).lower() == "live"
+                      and live_cfg.get("enabled")) else "paper"
+    return mode, {k: v for k, v in live_cfg.items() if not str(k).startswith("_")}
 
 
 def go_live_checklist(broker_total=None):

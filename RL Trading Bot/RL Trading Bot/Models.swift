@@ -765,6 +765,13 @@ struct RX3Meta: Codable {
     var cash: Double?
     var lastRun: String?
     var returnPct: Double?
+    // live-only fields (absent while the sleeve is on paper)
+    var buyingPower: Double?
+    var capitalPct: Double?
+    var updated: String?
+    var ordersToday: Int?
+    var maxOrdersPerDay: Int?
+    var investedPct: Double?
 }
 
 struct RX3Day: Codable, Identifiable, Hashable {
@@ -788,7 +795,50 @@ struct RX3Position: Codable, Identifiable, Hashable {
     var id: String { symbol }
 }
 
+/// One row of the live desk: what the engine wants vs what the account holds.
+/// The gap between `targetPct` and `currentPct` IS the next order.
+struct RX3BookRow: Codable, Identifiable, Hashable {
+    var symbol: String
+    var shares: Double?
+    var price: Double?
+    var value: Double?
+    var entryPrice: Double?
+    var changePct: Double?
+    var targetPct: Double?
+    var currentPct: Double?
+    var driftUsd: Double?
+    var inBook: Bool?
+    var unrealizedPct: Double?
+    var id: String { symbol }
+}
+
+/// A real order the rotation engine placed (or a planned one it has not yet).
+struct RX3Order: Codable, Identifiable, Hashable {
+    var ts: String?
+    var date: String?
+    var side: String?
+    var symbol: String?
+    var shares: Double?
+    var dollarAmount: Double?
+    var reason: String?
+    var placed: Bool?
+    var fillPrice: Double?
+    var orderId: String?
+    var targetPct: Double?
+    var currentPct: Double?
+    var driftUsd: Double?
+    var id: String { (orderId ?? "") + (ts ?? "") + (symbol ?? "") }
+}
+
+/// The frozen pre-live paper record — the evidence the promotion rested on.
+struct RX3PaperRecord: Codable {
+    var meta: RX3Meta?
+    var days: Int?
+    var curve: [RX3Point]?
+}
+
 struct RX3Payload: Codable {
+    var mode: String?                  // "live" | "paper"
     var meta: RX3Meta?
     var latest: RX3Day?
     var leaders: [String]?
@@ -798,6 +848,39 @@ struct RX3Payload: Codable {
     var paperDays: Int?
     var promotionGateDays: Int?
     var config: JSONValue?
+    var spySinceStart: [DailyClose]?
+    // live-only
+    var book: [RX3BookRow]?
+    var targets: [String: Double]?
+    var plan: [RX3Order]?
+    var orders: [RX3Order]?
+    var liveConfig: JSONValue?
+    var paperRecord: RX3PaperRecord?
+
+    var isLive: Bool { mode == "live" }
+}
+
+// MARK: /api/rx4
+
+/// RX-4 — same engine, full-deploy variant, PAPER only. Shares the paper shape
+/// with RX-3's pre-live tracker plus a rebased comparison against the RX-3 book.
+struct RX4Comparison: Codable {
+    var source: String?                // which RX-3 curve: "live" or "paper"
+    var curve: [RX3Point]?
+}
+
+struct RX4Payload: Codable {
+    var mode: String?
+    var note: String?
+    var meta: RX3Meta?
+    var latest: RX3Day?
+    var leaders: [String]?
+    var positions: [RX3Position]?
+    var curve: [RX3Point]?
+    var history: [RX3Day]?
+    var days: Int?
+    var config: JSONValue?
+    var rx3Comparison: RX4Comparison?
     var spySinceStart: [DailyClose]?
 }
 

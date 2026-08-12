@@ -2155,8 +2155,9 @@ class TestBrokerReconciliation(unittest.TestCase):
         than phantom-closing everything."""
         with patch.object(agent_module, "run_model",
                           return_value=("(claude -p error rc=1: session limit)", {})):
-            positions, sells, total = agent_module.read_broker_state()
+            positions, sells, total, bp = agent_module.read_broker_state()
         self.assertIsNone(positions)
+        self.assertIsNone(bp)
         self.assertIsNone(total)
         self.assertEqual(sells, set())
 
@@ -2164,11 +2165,13 @@ class TestBrokerReconciliation(unittest.TestCase):
         payload = ('```json\n{"positions": [{"symbol": "CLOV", "shares": 4.18, '
                    '"avg_price": 4.89, "last_price": 4.59}, '
                    '{"symbol": "DEAD", "shares": 0, "avg_price": 1.0}], '
-                   '"sell_orders_today": ["clov"], "account_total": 395.54}\n```')
+                   '"sell_orders_today": ["clov"], "account_total": 395.54, '
+                   '"buying_power": 120.25}\n```')
         with patch.object(agent_module, "run_model", return_value=(payload, {})):
-            positions, sells, total = agent_module.read_broker_state()
+            positions, sells, total, bp = agent_module.read_broker_state()
         self.assertEqual([p["symbol"] for p in positions], ["CLOV"])
         self.assertEqual(total, 395.54)  # zero-share dropped
+        self.assertEqual(bp, 120.25)
         self.assertEqual(sells, {"CLOV"})                              # upper-cased
 
     def test_force_sell_advisory_mode_is_noop(self):
@@ -2583,7 +2586,7 @@ class TestOffHoursBrokerGating(TmpDirMixin):
         return msig
 
     def test_market_closed_skips_broker_read(self):
-        rbs = MagicMock(return_value=([], set(), None))
+        rbs = MagicMock(return_value=([], set(), None, None))
         with patch.object(agent_module, "signals", self._mock_signals()), \
              patch.object(agent_module, "is_market_open", return_value=False), \
              patch.object(agent_module, "read_broker_state", rbs), \
@@ -2601,7 +2604,7 @@ class TestOffHoursBrokerGating(TmpDirMixin):
             "dollar_amount": 500.0}]
         self._flush_log()
         rbs = MagicMock(return_value=([{"symbol": "SPY", "shares": 1.0,
-                        "avg_price": 500.0, "last_price": 505.0}], set(), None))
+                        "avg_price": 500.0, "last_price": 505.0}], set(), None, None))
         with patch.object(agent_module, "signals", self._mock_signals()), \
              patch.object(agent_module, "is_market_open", return_value=True), \
              patch.object(agent_module, "read_broker_state", rbs), \
@@ -2802,6 +2805,492 @@ def run_token_report():
         print(f"  {name:<40} {chars:>7,} chars  ≈ {toks:>6,} tokens")
 
     print(f"{'═'*78}\n")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 16e — RX-3 LIVE: the deterministic rotation engine on real money
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class RX3LiveMixin(TmpDirMixin):
+    """Shared fixture: an armed RX-3 live config and a NEUTRAL signal mock."""
+
+    def _arm(self, **live):
+        cfg = {"enabled": True, "capital_pct": 1.0, "rebalance_band_pct": 0.05,
+               "min_order_usd": 5.0, "max_orders_per_day": 8}
+        cfg.update(live)
+        self.strategy["rotation"] = {"mode": "live", "live": cfg,
+                                     "universe": ["AAA", "BBB", "CCC"]}
+        self._flush_strategy()
+        return cfg
+
+    def _mock_signals(self):
+        sig = {"ok": True, "state": "NEUTRAL", "transition": "NO_ACTION",
+               "last_close": 100.0,
+               "lines": {"red": 1, "blue": 2, "green": 3, "yellow": 4}}
+        msig = MagicMock()
+        msig.signals_with_raw.return_value = ({"SPY": sig}, "SPY: NEUTRAL")
+        msig.signal_for.return_value = sig
+        return msig
+
+
+class TestRotationLiveConfig(RX3LiveMixin):
+    """Arming real-money trading must require BOTH switches, and every failure
+    mode of reading the config must resolve to 'not live'."""
+
+    def test_paper_mode_is_not_live(self):
+        self.strategy["rotation"] = {"mode": "paper", "live": {"enabled": True}}
+        self._flush_strategy()
+        self.assertFalse(agent_module.rotation_live_config()[0])
+
+    def test_live_mode_without_enabled_flag_is_not_live(self):
+        self.strategy["rotation"] = {"mode": "live"}
+        self._flush_strategy()
+        self.assertFalse(agent_module.rotation_live_config()[0])
+
+    def test_both_switches_arm_it(self):
+        self._arm()
+        live, cfg = agent_module.rotation_live_config()
+        self.assertTrue(live)
+        self.assertEqual(cfg["capital_pct"], 1.0)
+
+    def test_missing_engine_is_not_live(self):
+        self._arm()
+        with patch.object(agent_module, "rotation_engine", None):
+            self.assertFalse(agent_module.rotation_live_config()[0])
+
+    def test_defaults_fill_in_unspecified_keys(self):
+        self._arm(capital_pct=0.5)
+        _live, cfg = agent_module.rotation_live_config()
+        self.assertEqual(cfg["capital_pct"], 0.5)
+        self.assertEqual(cfg["max_orders_per_day"],
+                         agent_module.ROTATION_LIVE_DEFAULTS["max_orders_per_day"])
+
+    def test_unreadable_strategy_fails_closed(self):
+        with patch.object(agent_module, "load_strategy",
+                          side_effect=RuntimeError("boom")):
+            self.assertFalse(agent_module.rotation_live_config()[0])
+
+
+class TestRX3OrderPlan(unittest.TestCase):
+    """The planner is the whole safety surface of live rotation: it decides what
+    real orders get placed, so every rail is asserted here rather than trusted to
+    a prompt."""
+
+    CFG = {"capital_pct": 1.0, "rebalance_band_pct": 0.05, "min_order_usd": 5.0,
+           "min_exit_usd": 1.0, "max_orders_per_day": 8, "cash_buffer_pct": 0.0}
+
+    def _pos(self, sym, shares, price):
+        return {"symbol": sym, "shares": shares, "last_price": price}
+
+    def test_flat_account_buys_the_target_book(self):
+        plan = agent_module.rx3_order_plan(
+            {"AAA": 0.5, "BBB": 0.5}, [], 1000.0, 1000.0, self.CFG)
+        self.assertEqual({o["symbol"] for o in plan}, {"AAA", "BBB"})
+        self.assertTrue(all(o["side"] == "buy" for o in plan))
+        self.assertEqual(sum(o["dollar_amount"] for o in plan), 1000.0)
+
+    def test_name_dropped_by_the_engine_is_fully_exited(self):
+        plan = agent_module.rx3_order_plan(
+            {"AAA": 1.0}, [self._pos("OLD", 2.0, 50.0)], 1000.0, 0.0, self.CFG)
+        exits = [o for o in plan if o["symbol"] == "OLD"]
+        self.assertEqual(len(exits), 1)
+        self.assertEqual(exits[0]["side"], "sell")
+        self.assertEqual(exits[0]["shares"], 2.0)      # ALL shares, not a dollar trim
+        self.assertEqual(exits[0]["reason"], "rotation_exit")
+
+    def test_tiny_stale_position_is_still_exited_below_the_band(self):
+        """A full exit deliberately bypasses the rebalance band — otherwise dust
+        from a previous strategy lingers in the book forever."""
+        plan = agent_module.rx3_order_plan(
+            {"AAA": 1.0}, [self._pos("DUST", 1.0, 3.0)], 1000.0, 0.0, self.CFG)
+        self.assertIn("DUST", [o["symbol"] for o in plan])
+
+    def test_drift_inside_the_band_is_ignored(self):
+        # target 50% of 1000 = 500; holding 480 => 20 drift < 5% band (50)
+        plan = agent_module.rx3_order_plan(
+            {"AAA": 0.5}, [self._pos("AAA", 48.0, 10.0)], 1000.0, 1000.0, self.CFG)
+        self.assertEqual(plan, [])
+
+    def test_overweight_position_is_trimmed_not_closed(self):
+        plan = agent_module.rx3_order_plan(
+            {"AAA": 0.5}, [self._pos("AAA", 80.0, 10.0)], 1000.0, 0.0, self.CFG)
+        self.assertEqual(len(plan), 1)
+        self.assertEqual(plan[0]["reason"], "rotation_trim")
+        self.assertEqual(plan[0]["dollar_amount"], 300.0)
+        self.assertNotIn("shares", plan[0])
+
+    def test_buys_never_exceed_buying_power(self):
+        """T+1: only settled cash can be spent. A rebalance that sells $600 and
+        wants to buy $600 the same cycle must buy only what has settled."""
+        plan = agent_module.rx3_order_plan(
+            {"AAA": 1.0}, [], 1000.0, 120.0, self.CFG)
+        self.assertEqual(len(plan), 1)
+        self.assertEqual(plan[0]["dollar_amount"], 120.0)
+
+    def test_cash_buffer_is_withheld(self):
+        cfg = {**self.CFG, "cash_buffer_pct": 0.10}
+        plan = agent_module.rx3_order_plan({"AAA": 1.0}, [], 1000.0, 1000.0, cfg)
+        self.assertEqual(plan[0]["dollar_amount"], 900.0)
+
+    def test_zero_buying_power_still_allows_sells(self):
+        plan = agent_module.rx3_order_plan(
+            {"AAA": 1.0}, [self._pos("OLD", 10.0, 20.0)], 1000.0, 0.0, self.CFG)
+        self.assertEqual([o["side"] for o in plan], ["sell"])
+
+    def test_sells_are_ordered_before_buys(self):
+        plan = agent_module.rx3_order_plan(
+            {"AAA": 1.0}, [self._pos("OLD", 10.0, 50.0)], 1000.0, 1000.0, self.CFG)
+        self.assertEqual(plan[0]["side"], "sell")
+        self.assertEqual(plan[-1]["side"], "buy")
+
+    def test_do_not_trade_blocks_the_buy_but_never_the_exit(self):
+        plan = agent_module.rx3_order_plan(
+            {"AAA": 0.5, "BAD": 0.5}, [self._pos("GONE", 10.0, 20.0)],
+            1000.0, 1000.0, self.CFG, do_not_trade=["BAD", "GONE"])
+        self.assertNotIn("BAD", [o["symbol"] for o in plan])
+        gone = [o for o in plan if o["symbol"] == "GONE"]
+        self.assertEqual(gone[0]["side"], "sell")
+
+    def test_manual_lock_skips_the_symbol_entirely(self):
+        plan = agent_module.rx3_order_plan(
+            {"AAA": 1.0}, [self._pos("AAA", 1.0, 10.0)], 1000.0, 1000.0,
+            self.CFG, locked=["AAA"])
+        self.assertEqual(plan, [])
+
+    def test_symbol_with_a_working_sell_order_is_not_sold_again(self):
+        plan = agent_module.rx3_order_plan(
+            {"AAA": 1.0}, [self._pos("OLD", 10.0, 20.0)], 1000.0, 0.0,
+            self.CFG, sells_today=["OLD"])
+        self.assertEqual(plan, [])
+
+    def test_daily_order_cap_truncates_the_plan(self):
+        plan = agent_module.rx3_order_plan(
+            {"AAA": 0.34, "BBB": 0.33, "CCC": 0.33}, [], 1000.0, 1000.0,
+            self.CFG, orders_left=2)
+        self.assertEqual(len(plan), 2)
+
+    def test_exhausted_cap_places_nothing(self):
+        plan = agent_module.rx3_order_plan(
+            {"AAA": 1.0}, [], 1000.0, 1000.0, self.CFG, orders_left=0)
+        self.assertEqual(plan, [])
+
+    def test_capital_pct_scales_the_whole_book(self):
+        """Half-size mode: the engine's weights are applied to half the account,
+        so the rest of the money is simply never deployed."""
+        cfg = {**self.CFG, "capital_pct": 0.5}
+        plan = agent_module.rx3_order_plan({"AAA": 1.0}, [], 1000.0, 1000.0, cfg)
+        self.assertEqual(plan[0]["dollar_amount"], 500.0)
+
+    def test_zero_equity_places_nothing(self):
+        self.assertEqual(
+            agent_module.rx3_order_plan({"AAA": 1.0}, [], 0.0, 0.0, self.CFG), [])
+
+    def test_missing_buying_power_reads_as_no_cash(self):
+        """A broker read that couldn't report buying power must not be treated as
+        unlimited — no buy is placed on unknown cash."""
+        plan = agent_module.rx3_order_plan({"AAA": 1.0}, [], 1000.0, None, self.CFG)
+        self.assertEqual(plan, [])
+
+
+class TestPlaceRotationOrder(TmpDirMixin):
+    def test_advisory_mode_places_nothing(self):
+        with patch.object(agent_module, "EXECUTION_MODE", "advisory"):
+            placed, fill, oid = agent_module.place_rotation_order(
+                "buy", "AAA", dollar_amount=100)
+        self.assertFalse(placed)
+        self.assertIsNone(fill)
+        self.assertIsNone(oid)
+
+    def test_live_mode_reports_placement(self):
+        payload = ('```json\n{"placed": true, "symbol": "AAA", '
+                   '"order_id": "abc", "fill_price": 12.5}\n```')
+        with patch.object(agent_module, "EXECUTION_MODE", "live"), \
+             patch.object(agent_module, "run_model", return_value=(payload, {})):
+            placed, fill, oid = agent_module.place_rotation_order(
+                "buy", "AAA", dollar_amount=100)
+        self.assertTrue(placed)
+        self.assertEqual(fill, 12.5)
+        self.assertEqual(oid, "abc")
+
+    def test_garbled_response_is_not_a_placement(self):
+        with patch.object(agent_module, "EXECUTION_MODE", "live"), \
+             patch.object(agent_module, "run_model",
+                          return_value=("(claude -p error rc=1)", {})):
+            placed, _fill, _oid = agent_module.place_rotation_order(
+                "sell", "AAA", shares=1.0)
+        self.assertFalse(placed)
+
+
+class TestProcessRX3Live(RX3LiveMixin):
+    """The live pass end-to-end, with the engine decision stubbed so the test is
+    about execution behavior, not momentum math (that lives in test_rx3.py)."""
+
+    def _run(self, targets, positions, total, bp, sells_today=(), **cfgkw):
+        cfg = dict(agent_module.ROTATION_LIVE_DEFAULTS)
+        cfg.update(cfgkw)
+        log = agent_module.load_trade_log()
+        orders = MagicMock(return_value=(True, 10.0, "oid"))
+        with patch.object(agent_module, "rx3_decide_targets",
+                          return_value=(targets, {"date": "2026-08-13",
+                                                  "leaders": list(targets),
+                                                  "defensive": [], "riskx": 1.0,
+                                                  "vol_scale": 1.0, "cash_w": 0.0})), \
+             patch.object(agent_module, "place_rotation_order", orders):
+            actions, exit_info, placed = agent_module.process_rx3_live(
+                log, self.strategy, cfg, positions, total, bp, set(sells_today))
+        return orders, actions, exit_info, placed
+
+    def test_places_the_planned_orders(self):
+        self._arm()
+        orders, _a, _e, placed = self._run({"AAA": 1.0}, [], 1000.0, 1000.0)
+        self.assertEqual(placed, 1)
+        self.assertEqual(orders.call_args[0][:2], ("buy", "AAA"))
+
+    def test_full_exit_reports_a_close_reason_but_a_trim_does_not(self):
+        """process_cycle_state closes a position off exit_info — a trim leaves the
+        position open, so tagging it as an exit would fabricate a closed trade."""
+        self._arm()
+        _o, actions, exit_info, _p = self._run(
+            {"AAA": 0.5}, [{"symbol": "AAA", "shares": 100.0, "last_price": 10.0},
+                           {"symbol": "OLD", "shares": 10.0, "last_price": 20.0}],
+            1000.0, 0.0)
+        self.assertIn("OLD", exit_info)
+        self.assertNotIn("AAA", exit_info)
+        self.assertEqual({a["symbol"] for a in actions}, {"AAA", "OLD"})
+
+    def test_buys_are_not_reported_as_actions(self):
+        """Buys are adopted from the broker at real average cost instead of being
+        recorded at a price this function guessed."""
+        self._arm()
+        _o, actions, _e, _p = self._run({"AAA": 1.0}, [], 1000.0, 1000.0)
+        self.assertEqual(actions, [])
+
+    def test_daily_cap_is_enforced_across_cycles(self):
+        self._arm()
+        self._run({"AAA": 0.5, "BBB": 0.5}, [], 1000.0, 1000.0,
+                  max_orders_per_day=1)
+        orders, _a, _e, placed = self._run({"AAA": 0.5, "BBB": 0.5}, [],
+                                           1000.0, 1000.0, max_orders_per_day=1)
+        self.assertEqual(placed, 0)
+        self.assertEqual(orders.call_count, 0)
+
+    def test_a_name_stopped_out_today_is_not_bought_back(self):
+        """A stop closes a position the engine still ranks #1. Without this rail
+        the very next reconciliation sees a flat slot against a 50% target and
+        buys straight back into the trade the stop just exited."""
+        self._arm()
+        cfg = dict(agent_module.ROTATION_LIVE_DEFAULTS)
+        log = agent_module.load_trade_log()
+        orders = MagicMock(return_value=(True, 10.0, "oid"))
+        with patch.object(agent_module, "rx3_decide_targets",
+                          return_value=({"MU": 1.0}, {"date": "2026-08-13",
+                                                      "leaders": ["MU"]})), \
+             patch.object(agent_module, "place_rotation_order", orders):
+            agent_module.process_rx3_live(log, self.strategy, cfg, [], 1000.0,
+                                          1000.0, {"MU"}, blocked_buys=["MU"])
+            self.assertEqual(orders.call_count, 0)
+            # ...and the block persists into later cycles the same day, when the
+            # sell order is no longer "working" and cash has settled.
+            agent_module.process_rx3_live(log, self.strategy, cfg, [], 1000.0,
+                                          1000.0, set())
+        self.assertEqual(orders.call_count, 0)
+        self.assertEqual(agent_module.load_rx3_live_state()["blocked_buys"]["symbols"],
+                         ["MU"])
+
+    def test_no_decision_means_no_orders(self):
+        self._arm()
+        log = agent_module.load_trade_log()
+        orders = MagicMock()
+        with patch.object(agent_module, "rx3_decide_targets",
+                          return_value=(None, {"error": "data fetch too thin"})), \
+             patch.object(agent_module, "place_rotation_order", orders):
+            actions, exit_info, placed = agent_module.process_rx3_live(
+                log, self.strategy, agent_module.ROTATION_LIVE_DEFAULTS,
+                [{"symbol": "OLD", "shares": 1.0, "last_price": 10.0}],
+                1000.0, 1000.0, set())
+        self.assertEqual((actions, exit_info, placed), ([], {}, 0))
+        self.assertEqual(orders.call_count, 0)
+
+    def test_state_file_records_the_order_trail(self):
+        self._arm()
+        self._run({"AAA": 1.0}, [], 1000.0, 1000.0)
+        st = agent_module.load_rx3_live_state()
+        self.assertEqual(st["mode"], "live")
+        self.assertEqual(len(st["orders"]), 1)
+        self.assertTrue(st["orders"][0]["placed"])
+        self.assertEqual(st["history"][-1]["placed"], 1)
+
+
+class TestRotationCycleIntegration(RX3LiveMixin):
+    """run_agent() under RX-3 live: no analytical turn, protective exits first."""
+
+    def _read(self, positions, total=1000.0, bp=1000.0, sells=()):
+        return MagicMock(return_value=(positions, set(sells), total, bp))
+
+    def test_live_routes_to_the_rotation_cycle_and_skips_the_model_turn(self):
+        self._arm()
+        rot = MagicMock()
+        run_model = MagicMock(return_value=("x", agent_module._EMPTY_USAGE))
+        with patch.object(agent_module, "signals", self._mock_signals()), \
+             patch.object(agent_module, "is_market_open", return_value=True), \
+             patch.object(agent_module, "run_rotation_cycle", rot), \
+             patch.object(agent_module, "run_model", run_model), \
+             patch.object(agent_module, "_run_shadow_passes", MagicMock()):
+            agent_module.run_agent()
+        self.assertEqual(rot.call_count, 1)
+        self.assertEqual(run_model.call_count, 0,
+                         "the discretionary execution turn must not run")
+
+    def test_paper_mode_still_routes_to_the_legacy_loop(self):
+        self.strategy["rotation"] = {"mode": "paper", "live": {"enabled": True}}
+        self._flush_strategy()
+        rot = MagicMock()
+        with patch.object(agent_module, "signals", self._mock_signals()), \
+             patch.object(agent_module, "is_market_open", return_value=True), \
+             patch.object(agent_module, "run_rotation_cycle", rot), \
+             patch.object(agent_module, "read_broker_state",
+                          self._read([], None, None)), \
+             patch.object(agent_module, "run_model",
+                          return_value=('```json\n{"cash":0,"positions":[],'
+                                        '"actions_taken":[]}\n```',
+                                        agent_module._EMPTY_USAGE)), \
+             patch.object(agent_module, "_run_shadow_passes", MagicMock()):
+            agent_module.run_agent()
+        self.assertEqual(rot.call_count, 0)
+
+    def test_a_stop_loss_is_sold_before_any_rotation_order(self):
+        self._arm()
+        self.tradelog["open_positions"] = [{
+            "id": "T0100", "symbol": "MU", "entry_price": 100.0, "shares": 1.0,
+            "peak_price": 100.0, "entry_date": "2026-08-01T10:00:00-04:00",
+            "dollar_amount": 100.0}]
+        self._flush_log()
+        sig = {"ok": True, "state": "NEUTRAL", "transition": "NO_ACTION",
+               "last_close": 80.0, "lines": {"red": 1, "blue": 2, "green": 3, "yellow": 4}}
+        msig = MagicMock()
+        msig.signals_with_raw.return_value = ({"MU": sig}, "MU: NEUTRAL")
+        msig.signal_for.return_value = sig
+        calls = []
+        fs = MagicMock(side_effect=lambda *a, **k: (calls.append("force_sell"),
+                                                    (True, 80.0))[1])
+        rot = MagicMock(side_effect=lambda *a, **k: (calls.append("rotation"),
+                                                     ([], {}, 0))[1])
+        with patch.object(agent_module, "signals", msig), \
+             patch.object(agent_module, "is_market_open", return_value=True), \
+             patch.object(agent_module, "read_broker_state",
+                          self._read([{"symbol": "MU", "shares": 1.0,
+                                       "avg_price": 100.0, "last_price": 80.0}])), \
+             patch.object(agent_module, "force_sell", fs), \
+             patch.object(agent_module, "process_rx3_live", rot), \
+             patch.object(agent_module, "_run_shadow_passes", MagicMock()):
+            agent_module.run_agent()
+        self.assertEqual(calls[0], "force_sell",
+                         "the protective exit must be placed before the engine trades")
+        self.assertEqual(fs.call_args[0][0], "MU")
+
+    def test_failed_broker_read_places_no_orders(self):
+        self._arm()
+        rot = MagicMock()
+        with patch.object(agent_module, "signals", self._mock_signals()), \
+             patch.object(agent_module, "is_market_open", return_value=True), \
+             patch.object(agent_module, "read_broker_state",
+                          MagicMock(return_value=(None, set(), None, None))), \
+             patch.object(agent_module, "process_rx3_live", rot), \
+             patch.object(agent_module, "_run_shadow_passes", MagicMock()):
+            agent_module.run_agent()
+        self.assertEqual(rot.call_count, 0)
+
+    def test_paused_operator_stops_the_engine(self):
+        self._arm()
+        os.makedirs(os.path.join(self.tmpdir, "control"), exist_ok=True)
+        open(os.path.join(self.tmpdir, "control", "PAUSE"), "w").write("paused")
+        rot = MagicMock()
+        with patch.object(agent_module, "signals", self._mock_signals()), \
+             patch.object(agent_module, "is_market_open", return_value=True), \
+             patch.object(agent_module, "read_broker_state", self._read([])), \
+             patch.object(agent_module, "process_rx3_live", rot), \
+             patch.object(agent_module, "_run_shadow_passes", MagicMock()):
+            agent_module.run_agent()
+        self.assertEqual(rot.call_count, 0)
+
+    def test_off_hours_does_not_read_the_broker(self):
+        self._arm()
+        rbs = self._read([])
+        with patch.object(agent_module, "signals", self._mock_signals()), \
+             patch.object(agent_module, "is_market_open", return_value=False), \
+             patch.object(agent_module, "read_broker_state", rbs), \
+             patch.object(agent_module, "process_strategy_rewrite_queue",
+                          MagicMock(return_value=False)), \
+             patch.object(agent_module, "_run_shadow_passes", MagicMock()):
+            agent_module.run_agent()
+        self.assertEqual(rbs.call_count, 0)
+
+
+class TestRX3LiveSideEffects(RX3LiveMixin):
+    """Things that must change ONCE the engine is live, and not before."""
+
+    def test_paper_twin_stops_when_live(self):
+        self._arm()
+        fetch = MagicMock(return_value={})
+        with patch.object(agent_module, "is_market_open", return_value=True), \
+             patch.object(agent_module, "_rx3_fetch_closes", fetch):
+            agent_module.process_rx3_paper(agent_module.load_trade_log())
+        self.assertEqual(fetch.call_count, 0)
+
+    def test_paper_twin_still_runs_in_paper_mode(self):
+        self.strategy["rotation"] = {"mode": "paper", "paper_enabled": True,
+                                     "universe": ["AAA"]}
+        self._flush_strategy()
+        fetch = MagicMock(return_value={})
+        with patch.object(agent_module, "is_market_open", return_value=True), \
+             patch.object(agent_module, "_rx3_fetch_closes", fetch):
+            agent_module.process_rx3_paper(agent_module.load_trade_log())
+        self.assertEqual(fetch.call_count, 1)
+
+    def test_stale_research_picks_leave_the_watchlist_when_live(self):
+        with open(os.path.join(self.tmpdir, "research",
+                               "weekend_picks_2026-08-01.md"), "w") as f:
+            f.write("### #1 — STALE | Confidence: 90/100\n")
+        log = {"open_positions": [{"symbol": "HELD"}]}
+        self.assertIn("STALE", agent_module.watchlist_symbols(log))
+        self._arm()
+        self.assertNotIn("STALE", agent_module.watchlist_symbols(log))
+        self.assertIn("HELD", agent_module.watchlist_symbols(log))
+
+    def test_rotation_exit_skips_the_learning_pipeline(self):
+        """A mechanical rotation is not a thesis failure: no postmortem, no
+        skill_5 rewrite. A stop-loss on the same name still gets both."""
+        self.tradelog["open_positions"] = [
+            {"id": "T0201", "symbol": "AAA", "entry_price": 10.0, "shares": 1.0,
+             "entry_date": "2026-08-01T10:00:00-04:00", "dollar_amount": 10.0},
+            {"id": "T0202", "symbol": "BBB", "entry_price": 10.0, "shares": 1.0,
+             "entry_date": "2026-08-01T10:00:00-04:00", "dollar_amount": 10.0}]
+        self._flush_log()
+        log = agent_module.load_trade_log()
+        pipeline = MagicMock()
+        with patch.object(agent_module, "run_post_trade_pipeline", pipeline):
+            agent_module.process_cycle_state(
+                log, [], [],
+                {"AAA": {"reason": "rotation_exit", "price": 12.0},
+                 "BBB": {"reason": "stop_loss", "price": 8.0}})
+        analysed = [c[0][1]["symbol"] for c in pipeline.call_args_list]
+        self.assertEqual(analysed, ["BBB"])
+
+    def test_skill5_cannot_edit_the_rotation_config(self):
+        """skill_5 echoes strategy.json back from a prompt. A dropped or edited
+        rotation block would silently change live sizing — or disarm the book."""
+        self._arm(capital_pct=1.0)
+        rewritten = {"version": 99, "rotation": {"mode": "paper"},
+                     "rotation_rx4": {"mode": "live"}}
+        before = agent_module.load_strategy()
+        with patch.object(agent_module, "extract_last_json_block",
+                          return_value=rewritten):
+            block = agent_module.extract_last_json_block("")
+            for protected in ("rotation", "rotation_rx4"):
+                if protected in before:
+                    block[protected] = before[protected]
+        self.assertEqual(block["rotation"], before["rotation"])
+        self.assertTrue(agent_module.rotation_live_config(block)[0])
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3286,7 +3775,7 @@ class TestRewriteQueueNotDuringMarketHours(TmpDirMixin):
              patch.object(agent_module, "is_market_open", return_value=market_open), \
              patch.object(agent_module, "read_broker_state",
                           MagicMock(return_value=([{"symbol": "SPY", "shares": 1.0,
-                              "avg_price": 500.0, "last_price": 505.0}], set(), None))), \
+                              "avg_price": 500.0, "last_price": 505.0}], set(), None, None))), \
              patch.object(agent_module, "run_model",
                           return_value=(footer, agent_module._EMPTY_USAGE)), \
              patch.object(agent_module, "process_strategy_rewrite_queue", rewrite):
@@ -3326,7 +3815,7 @@ class TestForcedExitSurvivesGovernor(TmpDirMixin):
              patch.object(agent_module, "is_market_open", return_value=True), \
              patch.object(agent_module, "read_broker_state",
                           MagicMock(return_value=([{"symbol": "MU", "shares": 1.0,
-                              "avg_price": 100.0, "last_price": 80.0}], set(), None))), \
+                              "avg_price": 100.0, "last_price": 80.0}], set(), None, None))), \
              patch.object(agent_module, "run_model",
                           return_value=(deferred, agent_module._EMPTY_USAGE)), \
              patch.object(agent_module, "force_sell", fs), \
@@ -3359,7 +3848,7 @@ class TestBrokerRereadOnlyAfterASell(TmpDirMixin):
         self._flush_log()
         # broker says: MU still held, but a SELL order already exists today
         rbs = MagicMock(return_value=([{"symbol": "MU", "shares": 1.0,
-            "avg_price": 100.0, "last_price": 80.0}], {"MU"}, None))
+            "avg_price": 100.0, "last_price": 80.0}], {"MU"}, None, None))
         fs = MagicMock(return_value=(True, 80.0))
         footer = ('ok\n```json\n{"cash":0,"positions":[{"symbol":"MU",'
                   '"shares":1.0,"avg_price":100.0,"last_price":80.0}],'
@@ -3474,8 +3963,7 @@ class TestApplyPythonPatchesRejections(TmpDirMixin):
         self._enable()
         content = "\n".join(
             f"def {sym}():\n    pass\n"
-            for sym in ("check_stop_loss_alerts", "check_trailing_stop_alerts",
-                       "force_sell", "read_broker_state", "notify_operator"))
+            for sym in agent_module._DEFAULT_CODE_PATCH_PROTECTED["agent.py"])
         # No git repo in this tmpdir, so it fails at the worktree step instead —
         # proves the protected-symbol gate itself let it through.
         applied, detail = agent_module.apply_python_patches([("agent.py", content)])

@@ -14,7 +14,7 @@ GET  /api/overview /api/thinking /api/performance /api/trades /api/strategy
      /api/risk /api/news /api/market /api/shadow /api/actions /api/alerts
      /api/postmortem?file= /api/research_file?file= /api/meta
      /api/symbol?sym=&interval= /api/screen?symbols=&fresh= /api/logs
-     /api/library /api/signals /api/orders?days= /api/rx3 /api/health
+     /api/library /api/signals /api/orders?days= /api/rx3 /api/rx4 /api/health
      /api/learning /api/calendar
 POST /api/arm /api/disarm /api/broker/refresh /api/broker/retry_direct
      /api/order/preview /api/order/place /api/order/cancel
@@ -564,15 +564,12 @@ def orders_view(handler):
     return out
 
 
-def rx3_view():
-    """RX-3 rotation engine — paper phase tracker: equity curve, current book,
-    per-day decisions (leaders/defensive/RISKX/vol), promotion-ladder progress,
-    and the live rotation config."""
-    d = readers.rx3_paper()
+def _paper_track(d):
+    """Shared shape for a rotation PAPER record (rx3 pre-live, rx4). Returns the
+    equity curve, the marked book, and the per-day decision trail."""
     if not isinstance(d, dict):
         d = {}
     hist = [h for h in (d.get("history") or []) if isinstance(h, dict)]
-    curve = [{"ts": h.get("date"), "value": h.get("equity")} for h in hist]
     positions = []
     for sym, p in sorted((d.get("positions") or {}).items()):
         if not isinstance(p, dict):
@@ -588,21 +585,150 @@ def rx3_view():
     start_eq = d.get("start_equity")
     ret_pct = ((float(d["equity"]) / float(start_eq) - 1) * 100
                if (d.get("equity") and start_eq) else None)
-    start_day = str(d.get("start_date") or "")[:10]
-    spy = [p for p in quotes.daily_series("SPY", "6mo")
-           if not start_day or p["ts"] >= start_day]
-    cfg = readers.strategy().get("rotation") or {}
-    paper_days = len({h.get("date") for h in hist})
     return {"meta": {"note": d.get("_note"), "start_date": d.get("start_date"),
                      "start_equity": start_eq, "equity": d.get("equity"),
                      "cash": d.get("cash"), "last_run": d.get("last_run"),
                      "return_pct": round(ret_pct, 2) if ret_pct is not None else None},
             "latest": hist[-1] if hist else None,
             "leaders": d.get("leaders") or [],
-            "positions": positions, "curve": curve, "history": hist[-60:][::-1],
-            "paper_days": paper_days, "promotion_gate_days": 10,
-            "config": {k: v for k, v in cfg.items() if k != "_note"},
-            "spy_since_start": spy}
+            "positions": positions,
+            "curve": [{"ts": h.get("date"), "value": h.get("equity")} for h in hist],
+            "history": hist[-60:][::-1],
+            "days": len({h.get("date") for h in hist})}
+
+
+def rx3_view():
+    """RX-3 rotation desk.
+
+    Two shapes behind one endpoint, keyed by `mode`:
+      • live  — the REAL book: target weights vs actual weights, the drift the
+                engine will trade next, the order trail it has already placed,
+                the account equity curve, and the frozen pre-live paper record
+                the promotion decision was made on.
+      • paper — the original paper tracker (what this tab was before go-live).
+    The badge comes from strategy.json itself, so the dashboard can never claim
+    'live' while the bot is actually on paper, or the reverse."""
+    mode, live_cfg = readers.rotation_mode()
+    paper = _paper_track(readers.rx3_paper())
+    cfg = {k: v for k, v in (readers.strategy().get("rotation") or {}).items()
+           if k != "_note"}
+    out = {"mode": mode, "config": cfg, "live_config": live_cfg,
+           "paper_record": {"meta": paper["meta"], "days": paper["days"],
+                            "curve": paper["curve"]},
+           "promotion_gate_days": 10}
+
+    if mode != "live":
+        out.update({k: paper[k] for k in
+                    ("meta", "latest", "leaders", "positions", "curve", "history")})
+        out["paper_days"] = paper["days"]
+        start_day = str(paper["meta"].get("start_date") or "")[:10]
+        out["spy_since_start"] = [p for p in quotes.daily_series("SPY", "6mo")
+                                  if not start_day or p["ts"] >= start_day]
+        return out
+
+    d = readers.rx3_live() or {}
+    hist = [h for h in (d.get("history") or []) if isinstance(h, dict)]
+    log = readers.trade_log()
+    brk = broker.cached()
+    broker_by_sym = {p["symbol"]: p for p in (brk.get("positions") or [])}
+    equity = (d.get("equity")
+              or (brk.get("portfolio") or {}).get("total_value"))
+    targets = d.get("targets") or {}
+    capital_pct = float(live_cfg.get("capital_pct") or 1.0)
+    deployable = float(equity or 0) * capital_pct
+
+    # One row per name the engine cares about OR the account actually holds —
+    # the gap between those two sets is exactly what it is about to trade.
+    rows, held_value = [], 0.0
+    syms = sorted(set(list(targets)
+                      + [p["symbol"] for p in log.get("open_positions", [])]
+                      + list(broker_by_sym)))
+    for sym in syms:
+        pos = next((p for p in log.get("open_positions", [])
+                    if p["symbol"] == sym), {})
+        shares = float(broker_by_sym.get(sym, {}).get("shares")
+                       or pos.get("shares") or 0)
+        q = quotes.quote(sym)
+        price = (q or {}).get("price") or pos.get("entry_price")
+        value = round(float(price) * shares, 2) if price else None
+        if value:
+            held_value += value
+        tgt = float(targets.get(sym, 0.0))
+        rows.append({
+            "symbol": sym, "shares": shares, "price": price, "value": value,
+            "entry_price": pos.get("entry_price"),
+            "change_pct": (q or {}).get("change_pct"),
+            "target_pct": round(tgt * 100, 2),
+            "current_pct": round(value / deployable * 100, 2)
+                           if (value and deployable) else 0.0,
+            "drift_usd": round(tgt * deployable - (value or 0), 2)
+                         if deployable else None,
+            "in_book": sym in targets,
+            "unrealized_pct": round((price / float(pos["entry_price"]) - 1) * 100, 2)
+                              if (price and pos.get("entry_price")) else None,
+        })
+
+    orders = [o for o in (d.get("orders") or []) if isinstance(o, dict)][-40:][::-1]
+    start_day = str((d.get("history") or [{}])[0].get("date") or "")[:10]
+    curve = [{"ts": p["ts"], "value": p["total"]} for p in readers.equity_curve()
+             if not start_day or str(p.get("ts", ""))[:10] >= start_day]
+    out.update({
+        "meta": {"note": d.get("_note"), "equity": equity,
+                 "buying_power": d.get("buying_power"),
+                 "capital_pct": capital_pct, "updated": d.get("updated"),
+                 "start_date": start_day,
+                 "orders_today": (d.get("orders_today") or {}).get("count", 0),
+                 "max_orders_per_day": live_cfg.get("max_orders_per_day"),
+                 "invested_pct": round(held_value / deployable * 100, 2)
+                                 if deployable else None},
+        "latest": hist[-1] if hist else None,
+        "leaders": (hist[-1].get("leaders") if hist else []) or [],
+        "targets": targets,
+        "book": rows,
+        "positions": [r for r in rows if r["shares"]],
+        "plan": d.get("plan") or [],
+        "orders": orders,
+        "curve": curve,
+        "history": hist[-60:][::-1],
+        "spy_since_start": [p for p in quotes.daily_series("SPY", "6mo")
+                            if not start_day or p["ts"] >= start_day],
+    })
+    return out
+
+
+def rx4_view():
+    """RX-4 tracker — the 'turn up the volume' variant of the same engine
+    (full_deploy: always 100% invested, no RISKX carve-out, no vol throttle),
+    run as PAPER alongside the live book so the tradeoff it makes is observable
+    against real RX-3 results. Never trades real money, and deliberately not on
+    any promotion ladder."""
+    track = _paper_track(readers.rx4_paper())
+    cfg = {k: v for k, v in (readers.strategy().get("rotation_rx4") or {}).items()
+           if k != "_note"}
+    start_day = str(track["meta"].get("start_date") or "")[:10]
+
+    # The comparison is the whole point of this tab: RX-4 vs the live RX-3 book
+    # (or its paper record pre-go-live), both rebased to 100 at RX-4's start.
+    mode, _live_cfg = readers.rotation_mode()
+    if mode == "live":
+        rx3_pts = [{"ts": str(p["ts"])[:10], "value": p["total"]}
+                   for p in readers.equity_curve()]
+    else:
+        rx3_pts = [{"ts": h.get("date"), "value": h.get("equity")}
+                   for h in (readers.rx3_paper().get("history") or [])
+                   if isinstance(h, dict)]
+    rx3_pts = [p for p in rx3_pts if p["value"] and
+               (not start_day or str(p["ts"]) >= start_day)]
+    base = rx3_pts[0]["value"] if rx3_pts else None
+    return {**track, "mode": "paper", "config": cfg,
+            "note": ("Hypothetical variant — paper only, zero real dollars. "
+                     "Same rotation_engine.py brain as RX-3, run full-deploy."),
+            "rx3_comparison": {"source": mode,
+                               "curve": [{"ts": p["ts"],
+                                          "value": round(p["value"] / base * 100, 4)}
+                                         for p in rx3_pts] if base else []},
+            "spy_since_start": [p for p in quotes.daily_series("SPY", "6mo")
+                                if not start_day or p["ts"] >= start_day]}
 
 
 def health_view():
@@ -616,7 +742,9 @@ def health_view():
         ("Equity curve", "logs/equity_curve.jsonl"),
         ("Stops snapshot", "logs/stops.json"),
         ("Risk state", "logs/risk_state.json"),
-        ("RX-3 paper", "shadow/rx3_paper.json"),
+        ("RX-3 live", "logs/rx3_live.json"),
+        ("RX-3 paper (pre-live)", "shadow/rx3_paper.json"),
+        ("RX-4 paper", "shadow/rx4_paper.json"),
         ("Options shadow", "shadow/options_shadow_log.json"),
         ("Momentum scan", "shadow/momentum_last_scan.json"),
         ("Watchdog log", "logs/watchdog.log"),
@@ -1057,6 +1185,7 @@ Handler.GETS = {
     "/api/signals": lambda h: signals_view(),
     "/api/orders": orders_view,
     "/api/rx3": lambda h: rx3_view(),
+    "/api/rx4": lambda h: rx4_view(),
     "/api/health": lambda h: health_view(),
     "/api/learning": lambda h: learning_view(),
     "/api/calendar": lambda h: calendar_view(),
