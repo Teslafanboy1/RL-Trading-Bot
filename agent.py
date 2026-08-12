@@ -4447,18 +4447,26 @@ def main():
         anchor_t = preflight_anchor_time(opens, cfg)
         research_t = premarket_research_time(opens, cfg)
         hours_away = (opens - now).total_seconds() / 3600
+        rx3_live, _rx3_cfg = rotation_live_config()
         print(f"\nMarket is currently closed. ({now:%A %Y-%m-%d %H:%M} ET)")
         print(f"Next market open: {opens:%A %Y-%m-%d at %H:%M} ET ({hours_away:.1f} hours away)")
+        if rx3_live:
+            print("\nRX-3 is LIVE — the deterministic rotation engine owns the book; "
+                  "the discretionary research/execution loop is retired.")
         print("\nDaily usage schedule (each phase gets its own 5h Claude window):")
         print(f"  {anchor_t:%H:%M} ET  preflight system check — anchors the window")
-        print(f"  {research_t:%H:%M} ET  pre-market research (inside that window)")
+        if rx3_live:
+            print(f"  {research_t:%H:%M} ET  pre-market research — SKIPPED (RX-3 live)")
+        else:
+            print(f"  {research_t:%H:%M} ET  pre-market research (inside that window)")
         print(f"  {opens:%H:%M} ET  market open — trading starts on a FRESH window")
         print(f"  {cfg.get('maintenance_hour_et', 19):02d}:"
               f"{cfg.get('maintenance_minute_et', 35):02d} ET  maintenance — "
               "postmortems + strategy rewrites\n")
 
         print("What would you like to do?")
-        print("  r — run research now and exit")
+        print("  r — run research now and exit"
+              + ("  (no-op: RX-3 live, research is retired)" if rx3_live else ""))
         print(f"  m — run the maintenance drain now and exit (postmortems + rewrites)")
         print(f"  w — enter the 24/7 schedule above (default)")
         choice = input("\nYour choice (r/m/w): ").strip().lower()
