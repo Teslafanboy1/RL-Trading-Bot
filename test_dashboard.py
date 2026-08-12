@@ -897,6 +897,17 @@ class TestCommandCenterEndpoints(TmpRootMixin):
         self.assertTrue(all(not r["in_book"] and r["target_pct"] == 0.0
                             for r in out["book"]))
 
+    def test_rx3_live_equity_falls_back_before_the_first_pass(self):
+        """Weights are meaningless without a denominator, so equity falls back
+        to the broker snapshot, and to the last recorded equity point when even
+        that is empty (the dashboard's claude-cli broker path never polls)."""
+        self._arm_live()
+        self._write("logs/equity_curve.jsonl",
+                    '{"ts": "2026-08-12T15:00:00-04:00", "total": 367.72}\n')
+        self.assertEqual(server_mod.rx3_view()["meta"]["equity"], 322.49)  # broker
+        self.stub.state["portfolio"] = {}
+        self.assertEqual(server_mod.rx3_view()["meta"]["equity"], 367.72)  # curve
+
     def test_rx4_view_parses_the_paper_track(self):
         self._write("shadow/rx4_paper.json", json.dumps({
             "_note": "rx4", "start_date": "2026-08-05T09:33:00-04:00",

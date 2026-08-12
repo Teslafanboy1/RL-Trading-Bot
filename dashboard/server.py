@@ -631,8 +631,13 @@ def rx3_view():
     log = readers.trade_log()
     brk = broker.cached()
     broker_by_sym = {p["symbol"]: p for p in (brk.get("positions") or [])}
+    eq_curve = readers.equity_curve()
+    # Before the first live pass writes state there is no engine-reported equity
+    # yet, so fall back to the broker snapshot and then to the last recorded
+    # equity point — the weights below are meaningless without a denominator.
     equity = (d.get("equity")
-              or (brk.get("portfolio") or {}).get("total_value"))
+              or (brk.get("portfolio") or {}).get("total")
+              or (eq_curve[-1]["total"] if eq_curve else None))
     targets = d.get("targets") or {}
     capital_pct = float(live_cfg.get("capital_pct") or 1.0)
     deployable = float(equity or 0) * capital_pct
@@ -670,7 +675,7 @@ def rx3_view():
 
     orders = [o for o in (d.get("orders") or []) if isinstance(o, dict)][-40:][::-1]
     start_day = str((d.get("history") or [{}])[0].get("date") or "")[:10]
-    curve = [{"ts": p["ts"], "value": p["total"]} for p in readers.equity_curve()
+    curve = [{"ts": p["ts"], "value": p["total"]} for p in eq_curve
              if not start_day or str(p.get("ts", ""))[:10] >= start_day]
     out.update({
         "meta": {"note": d.get("_note"), "equity": equity,
