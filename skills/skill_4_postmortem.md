@@ -95,5 +95,4 @@ wrong, `"accurate"` if it warned against it (or correctly flagged the risk), and
 ## Hard rules
 - Do NOT change a core buy/sell rule on one loss. Propose it; skill_5 needs 3+
   similar losses to act.
-- T+1 settlement still applies to everything downstream — never assume unsettled
-  cash is deployable.
+- Buying power is whatever `get_portfolio` reports in `buying_power.buying_power` — never assume more than that is deployable. (Limited margin since 2026-08-14: unsettled sale proceeds ARE spendable immediately, so there is no settlement wait to plan around.)

@@ -8,7 +8,7 @@ same rigor as weekend research — not a qualitative gut-check.
 ## Step 1 — Pull live state
 Read from the Robinhood MCP:
 - `get_equity_positions` — current shares, avg cost per position
-- `get_portfolio` — total portfolio value and settled buying power
+- `get_portfolio` — total portfolio value and buying power
 - `get_equity_quotes` — live prices for all held symbols
 
 Compute for each position:
@@ -53,13 +53,13 @@ For each position, compare **current weight** to its new **band maximum**:
 - `band_maximum` dropped due to confidence decay → recommend trim to new band maximum
 - `TRIM_TO_ZERO` or `SELL_SIGNAL` → full exit
 - `current_weight ≤ band_maximum` and confidence ≥ 60 → HOLD; **and if the name is in BUY/HOLD
-  ribbon state, is in the green, and sits BELOW its band ceiling while settled cash exceeds the
+  ribbon state, is in the green, and sits BELOW its band ceiling while buying power exceeds the
   reserve → flag `SCALE_UP $X`** to top it up toward the ceiling (`scale_into_winners`). Topping up a
   confirmed winner is preferred to leaving cash idle. Never scale up a SELL-state or losing name.
 
 ## Step 4 — Free capital and rank
 
-Sum all trim/exit proceeds. Add to settled buying power.
+Sum all trim/exit proceeds. On limited margin they are tradable as soon as the sell fills, so add them to buying power for THIS cycle.
 
 Build a **combined ranked list** (same as weekend research Step D):
 - Existing positions tagged `[HOLD]`, `[TRIM]`, or `[EXIT]` with re-scored confidence
@@ -76,12 +76,12 @@ Execute all decisions in this order:
 1. **EMA EXITs and TRIM_TO_ZERO positions first** — sell via `place_equity_order` at market
 2. **Over-weighted trims** — sell the excess shares to bring position to band maximum
 3. **`SCALE_UP` top-ups** — for each held BUY/HOLD-state winner flagged `SCALE_UP` in Step 3, buy the
-   dollar difference toward its band ceiling via `place_equity_order` (settled cash, all caps apply).
+   dollar difference toward its band ceiling via `place_equity_order` (within buying power, all caps apply).
    Deploy idle cash into confirmed winners BEFORE concluding "hold dry powder."
 4. **Redeploy freed capital** into the top-ranked unowned candidate if:
    - EMA signal is BUY/HOLD
    - Confidence ≥ 75 (no weak redeployments)
-   - Cash will be settled before the buy (T+1 check)
+   - The buy fits inside `buying_power` right now (proceeds settle instantly on limited margin)
    - No earnings within 5 days, no Fed within 3 days
    - The buy keeps the **≤5-name concentration limit**, the **40%/2-name sector caps**, AND the
      **≤25% leveraged-sleeve notional cap** (`factor_exposure_limits.leveraged_sleeve_max_pct`) — a 3x
@@ -89,21 +89,22 @@ Execute all decisions in this order:
 
 Report all actions in `actions_taken` so the learning loop fires.
 
-## Step 6 — Settlement schedule
+## Step 6 — Buying power
 
 State explicitly:
-- What cash is settled **right now**
-- What cash settles **tomorrow** (from any sells executed today)
-- What cash settles **later this week**
+- `buying_power` **right now**, straight from `get_portfolio`
+- How much of it came from sells executed today (tradable immediately — this is a
+  limited-margin account, so there is no T+1 hold on proceeds)
 
-This prevents the execution skill from planning buys against unsettled funds.
+This keeps the execution skill sizing against the broker's real number rather than
+against total account value.
 
 ## Output
 
 Write `research/midweek_review_YYYY-MM-DD.md`:
 
 ### Header
-- Total portfolio value, settled cash, date
+- Total portfolio value, buying power, date
 - Weekly progress: current return vs. 100% monthly goal, weeks left
 
 ### Position verdicts table

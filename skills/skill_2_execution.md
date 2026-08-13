@@ -14,7 +14,8 @@ week during market hours.
 - When a stop-loss triggers: sell ALL shares of that position at market price
   immediately via the Robinhood MCP. In `actions_taken` set `type="sell"` and
   `reason="stop_loss"` so the learning loop records it as a forced exit.
-- After the forced sell, note that cash will be unsettled for T+1.
+- After the forced sell, the proceeds are spendable immediately (limited margin) —
+  they show up in `buying_power` as soon as the sell fills.
 
 ## Pre-trade entry gate (HARD — reject before any other buy logic)
 Before evaluating any candidate for a BUY, every one of these must be true or the
@@ -58,12 +59,12 @@ intraweek redeploy alike.
   override those upward.
 
 ## Before every BUY
-- **Scale into winners FIRST — do not let settled cash sit idle above the reserve.**
-  When `scale_into_winners` is true (strategy.json → risk_management) and settled cash exceeds the
+- **Scale into winners FIRST — do not let buying power sit idle above the reserve.**
+  When `scale_into_winners` is true (strategy.json → risk_management) and buying power exceeds the
   cash reserve, before you ever conclude "hold cash" you MUST check every held position: any name
   in confirmed **BUY/HOLD** ribbon state whose current portfolio weight is **below its band ceiling**
   should be **topped up toward that ceiling** — buy the dollar difference between its current weight
-  and the ceiling, subject to settled cash (T+1), the per-name risk cap, the sector/factor caps, and
+  and the ceiling, subject to available buying power, the per-name risk cap, the sector/factor caps, and
   the leveraged-sleeve cap. Averaging UP into a confirmed winner is preferred to idle cash. This is a
   directive, not an option: idle cash above the reserve while a held winner sits below its ceiling is
   a miss. **NEVER average DOWN into a SELL-state or losing position** — that is knife-catching (the
@@ -78,8 +79,10 @@ intraweek redeploy alike.
 - Confirm the candidate passes the **Pre-trade entry gate** above (confidence ≥ 60,
   non-empty thesis, non-empty sources_used) **and the quant-firm entry gates** (overextension,
   valuation-gap, insider-distribution, hard Fed blackout, leveraged-ETF rules).
-- Check the Robinhood MCP for the SETTLED cash balance. Never buy with unsettled
-  funds (T+1).
+- Check the Robinhood MCP for `get_portfolio` → `buying_power.buying_power` and
+  never place a buy larger than it. Use the broker's number as-is: this is a
+  limited-margin account, so unsettled sale proceeds are already included and
+  already spendable.
 - Confirm the EMA signal is still valid: the 55 (red) has crossed below ALL of
   8/13/21 and is the LOWEST line. Confirm it's a fresh crossover, not stale.
 - Confirm no breaking news has invalidated the thesis from the weekend research
@@ -159,7 +162,8 @@ Your only discretionary sell is a **broken thesis**:
   confidence decay below 60 → `reason="thesis_break"`.
 - A ribbon **SELL state** alone is **advisory** (see thesis check step 3) — do not sell on
   it unless the thesis is actually broken; the trailing stop handles the mechanical exit.
-- After a sell, cash is unsettled for T+1 — note when it frees up.
+- After a sell, the proceeds are immediately tradable (limited margin) — you may
+  redeploy them in the same cycle once the sell fills.
 
 ## After every executed trade
 - Append the trade to `trade_log.json` (symbol, side, qty, price, timestamp,

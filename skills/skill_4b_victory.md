@@ -92,5 +92,4 @@ source's `wins` count for every `"accurate"`.
 ## Hard rules
 - Don't over-credit a source on a single win — nudge, don't lurch. Big changes go
   through skill_5 with the 3+ confirmation bar.
-- T+1 settlement still applies downstream — never assume unsettled cash is
-  deployable.
+- Buying power is whatever `get_portfolio` reports in `buying_power.buying_power` — never assume more than that is deployable. (Limited margin since 2026-08-14: unsettled sale proceeds ARE spendable immediately, so there is no settlement wait to plan around.)

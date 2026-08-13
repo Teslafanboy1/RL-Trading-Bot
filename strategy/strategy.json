@@ -3,10 +3,11 @@
   "goal": "100% monthly portfolio return",
   "last_updated": "2026-08-11",
   "account": {
-    "type": "true_cash",
-    "settlement": "T+1",
+    "type": "limited_margin",
+    "settlement": "instant",
     "starting_capital": 91,
-    "rule": "never_buy_with_unsettled_funds",
+    "rule": "size_every_buy_against_the_broker_buying_power_field",
+    "_settlement_note": "2026-08-14 (operator): account 696283985 was upgraded from a true cash account to LIMITED MARGIN, which grants the right to trade unsettled funds — sale proceeds are spendable immediately, so the T+1 wait is gone. It grants NO borrowing and NO leverage (get_portfolio reports buying_power == unleveraged_buying_power), so nothing about position sizing or the risk caps changes; the account still cannot spend more than it has. The operative rule is now simply: size every buy against get_portfolio's buying_power field, taken from the broker verbatim, never recomputed. Separately, FINRA retired the pattern-day-trader regime on 2026-06-04 and Robinhood removed day-trade restrictions with it, so there is no day-trade counter to ration either — the constraint on trading faster is transaction cost and edge, not regulation. See CLAUDE.md 'Settlement and account type'.",
     "cash_reserve": 0.1
   },
   "ema_strategy": {

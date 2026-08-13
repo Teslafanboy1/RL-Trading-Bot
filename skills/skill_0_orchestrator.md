@@ -39,8 +39,12 @@ which skills and rules need rewriting and how urgently.
 - **Stop-loss**: if any open position is down ≥ 10% from entry price, sell it
   immediately — overrides EMA signal and all other rules. Report the sell with
   `reason="stop_loss"` in `actions_taken` so the learning loop fires a postmortem.
-- T+1 settlement: never buy with unsettled funds. Always confirm SETTLED cash
-  via the Robinhood MCP before any buy.
+- Buying power: never buy more than `get_portfolio` → `buying_power.buying_power`
+  says is spendable. Read it from the Robinhood MCP before any buy and use that
+  number verbatim — do not recompute it, and do not size against total account
+  value. This is a LIMITED MARGIN account (2026-08-14), so sale proceeds are
+  spendable immediately and there is no T+1 wait; the broker's figure already
+  reflects that.
 - Always keep the 10% cash reserve; never exceed 30% in one position.
 - 100% monthly return is the north star — measure every decision against it and
   update `progress_tracking` each cycle.

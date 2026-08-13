@@ -70,7 +70,7 @@ Compare current weight to the band maximum from Step A:
 - If flagged `TRIM_TO_ZERO` or `SELL_SIGNAL` → recommend full exit.
 
 ### Step C — Free up capital
-Sum the trim/exit proceeds from Step B. Add this to the available settled cash when sizing new picks. Clearly label it: "freeing $X from [SYMBOL] trim" in the output.
+Sum the trim/exit proceeds from Step B. Add this to available buying power when sizing new picks (limited margin — proceeds are tradable as soon as the sell fills). Clearly label it: "freeing $X from [SYMBOL] trim" in the output.
 
 ### Step D — Rank everything together
 Before allocating, build **one combined ranked list** of:
@@ -215,7 +215,7 @@ Confidence formula (combine):
 
 ### Step 5 — Portfolio-wide capital allocation (risk-based + factor-capped)
 Allocate across the **combined ranked list** from the open position review (Step D above).
-Capital pool = settled cash + any proceeds freed from trims/exits in Step C.
+Capital pool = buying power + any proceeds freed from trims/exits in Step C.
 
 **Size by RISK, not flat bands** (`position_sizing` in strategy.json):
 - Target size (% of total equity) = min(confidence-band ceiling, risk_per_trade ÷ stop) ÷ leverage.
@@ -261,7 +261,7 @@ you haven't checked yet. Do not stop at 1–2 unless the market truly has no qua
 Write `research/weekend_picks_YYYY-MM-DD.md` with:
 
 ### Header
-- Current portfolio value, settled cash, open positions
+- Current portfolio value, buying power, open positions
 - Goal-pace context: `current_return` vs the 100% ceiling, weeks left — **informational only**
 - Risk budget in force: per-trade risk %, the resulting max non-leveraged size, and the sector cap
 

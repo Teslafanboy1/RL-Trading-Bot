@@ -41,8 +41,17 @@ CHECK_MODEL = os.environ.get("CHECK_MODEL", "claude-haiku-4-5-20251001")  # rout
 ROOT = os.path.dirname(os.path.abspath(__file__))
 ET = ZoneInfo("America/New_York")     # market clock — correct regardless of machine TZ
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
-ACCOUNT_NUMBER = os.environ.get("RH_ACCOUNT", "696283985")  # Agentic cash acct
-POLL_MINUTES = int(os.environ.get("POLL_MINUTES", "15"))
+ACCOUNT_NUMBER = os.environ.get("RH_ACCOUNT", "696283985")  # "Agentic" acct
+# (limited margin since 2026-08-14 — unsettled proceeds are tradable; still no
+# borrowing or leverage. NOT the default account 795166016.)
+# 5 min (was 15) since 2026-08-14. Under RX-3 live a cycle is a cheap Haiku
+# broker read plus any orders the plan calls for, not a chatty Opus turn, so the
+# cost of looking more often is small — and the thing it buys is the only part of
+# this loop that is genuinely time-critical: how long a stop-loss or trailing-stop
+# breach can sit undetected. It does NOT make the strategy trade more often; the
+# rotation decides once a day by design (research/edge_lab4_speed.py measured
+# faster decision cadences and they lose money, see RX-3 notes in CLAUDE.md).
+POLL_MINUTES = int(os.environ.get("POLL_MINUTES", "5"))
 # Force a thesis/news check at least every N hours even when EMA signals are flat.
 # Catches news-driven thesis breaks before the lagging 55-bar EMA can reflect them.
 NEWS_CHECK_HOURS = int(os.environ.get("NEWS_CHECK_HOURS", "4"))
@@ -2132,7 +2141,7 @@ Your job:
 FOOTER_INSTRUCTION = (
     "\n\nAFTER you finish, END YOUR RESPONSE WITH ONE fenced ```json block "
     "reporting machine-readable state (no prose after it), schema:\n"
-    '{"cash": <settled cash float>, '
+    '{"cash": <buying power float, exactly as get_portfolio reports it>, '
     '"positions": [{"symbol": "X", "shares": <float>, "avg_price": <float>, "last_price": <float>}], '
     '"actions_taken": [{"type": "buy"|"sell", "symbol": "X", "shares": <float>, "price": <float>, '
     '"confidence": <int|null>, "sources": ["news","social",...], "thesis": "<short>"}]}\n'
@@ -2198,12 +2207,28 @@ def read_broker_state(tier=TIER_EXECUTION):
                            or None. Feeds the monthly-drawdown kill-switch and the
                            deposit-aware equity rebase (the $255-vs-$395 sizing
                            drift found in the 2026-07-06 audit).
-      buying_power       — cash actually available to buy with RIGHT NOW, i.e.
-                           net of unsettled proceeds (get_portfolio), or None.
-                           RX-3 live sizes its buy leg off this and nothing else:
-                           total_value minus positions would silently include
-                           T+1 proceeds from the same cycle's sells, which is how
-                           a cash account earns a good-faith violation."""
+      buying_power       — what the broker says is spendable RIGHT NOW
+                           (get_portfolio -> buying_power.buying_power), or None.
+                           RX-3 live sizes its buy leg off this and nothing else;
+                           total_value minus positions is NOT a substitute, since
+                           it silently counts money the broker will not let us
+                           spend.
+
+                           This field is deliberately taken from the broker
+                           VERBATIM rather than reconstructed. The broker already
+                           applies whatever settlement regime the account is
+                           under, so one prompt stays correct across both: on a
+                           cash account it excludes unsettled proceeds (T+1), and
+                           on the LIMITED MARGIN account the operator upgraded to
+                           on 2026-08-14 it includes them, because that upgrade is
+                           precisely the right to trade unsettled funds.
+
+                           Until that date this prompt asked for "the settled cash
+                           figure, NOT including unsettled sale proceeds", which
+                           the upgrade turned into a live defect: with $75.66
+                           spendable of which $72.00 was unsettled, an obedient
+                           model would have reported ~$3.66 and starved every
+                           rotation buy for a day, for no reason at all."""
     system = ("You are a read-only Robinhood query tool. Use only the MCP read "
               "tools. Do not place, modify, or cancel any order.")
     today = datetime.now(ET).strftime("%Y-%m-%d")
@@ -2213,8 +2238,12 @@ def read_broker_state(tier=TIER_EXECUTION):
         f"2. Call get_equity_orders (created_at_gte={today}) and note which symbols "
         "have a SELL-side order placed today (any state).\n"
         "3. Call get_portfolio and read total_value (the account's total value) "
-        "AND the buying power available to buy stocks right now (the settled "
-        "cash figure, NOT including unsettled sale proceeds).\n"
+        "AND buying_power.buying_power, the broker's own real-time spendable "
+        "figure. Report buying_power EXACTLY as get_portfolio returns it — do "
+        "NOT subtract unsettled funds, do not substitute the cash field, and do "
+        "not compute it yourself. This is a limited-margin account: unsettled "
+        "sale proceeds ARE spendable immediately and the broker's number already "
+        "reflects that.\n"
         "Output ONLY one fenced ```json block, no prose:\n"
         '{"positions": [{"symbol": "X", "shares": <float>, "avg_price": <float>, '
         '"last_price": <float|null>}], "sell_orders_today": ["SYM", ...], '
@@ -3107,13 +3136,21 @@ def process_rx4_paper(log):
 # 10y backtest run; nothing about the MATH changes when it goes live, only who
 # pays for the fills. Two things are deliberately different from the paper pass:
 #
-# 1. T+1 settlement is real. The paper book rebalances instantly against its own
-#    equity; a cash account cannot buy with proceeds from a sale that has not
-#    settled. So the DECISION is made once per market day (leaders come from
-#    closes through yesterday — the engine's lag discipline) and cached, while
-#    the RECONCILIATION toward that standing target runs every cycle: a buy leg
-#    starved of settled cash today simply executes on a later cycle, and the
-#    plan is idempotent so re-running it never double-buys.
+# 1. The DECISION is made once per market day (leaders come from closes through
+#    yesterday — the engine's lag discipline) and cached, while the
+#    RECONCILIATION toward that standing target runs every cycle. The plan is
+#    idempotent, so re-running it never double-buys; a buy leg the broker can't
+#    fund right now simply executes on a later cycle.
+#
+#    Settlement used to be the reason that mattered: under T+1 a cash account
+#    could not buy with proceeds from a sale that had not settled, so a rotation
+#    took two days — sell today, buy tomorrow — and spent the night half in cash.
+#    The operator upgraded to LIMITED MARGIN on 2026-08-14, which is exactly the
+#    right to trade unsettled funds, so `recycle_proceeds_same_cycle` now runs a
+#    second funding pass after the sells fill and the rotation completes in one
+#    cycle. The pass is authoritative, not optimistic: it re-reads the broker
+#    rather than assuming a sell filled, so on an account that is still T+1 it
+#    simply finds no new buying power and places nothing.
 # 2. Every rail the legacy loop had still gates it: HALT (kill-switch), PAUSE,
 #    control/do_not_trade.json (buys only), control/locks/SYM.manual.lock, the
 #    hard + trailing stops (which run BEFORE the rotation pass and can force an
@@ -3129,6 +3166,21 @@ ROTATION_LIVE_DEFAULTS = {
     "max_orders_per_day": 8,     # hard circuit breaker on churn/runaway loops
     "cash_buffer_pct": 0.01,     # never spend the last 1% of buying power
     "retire_llm_loop": True,     # skill_1/2/3 stop running: RX-3 owns the book
+    # Limited margin (2026-08-14): after the sell leg fills, re-read the broker
+    # and spend the freed proceeds in the SAME cycle instead of waiting a day for
+    # settlement. Costs one extra read-only broker call, and only on cycles that
+    # actually sold something. Safe on a cash account too — it would just find no
+    # new buying power. Set false to go back to one-leg-per-cycle rotations.
+    "recycle_proceeds_same_cycle": True,
+    # Sizing. Both default to plain RX-3, so the shipped code cannot start
+    # deploying more of the account than it did yesterday — arming the fuller
+    # book is an explicit strategy.json edit (scripts/apply_rx4_sizing.py).
+    #   full_deploy — skip the RISKX carve-out and the vol throttle and stay 100%
+    #                 invested in the leaders (the per-name leverage haircut on 3x
+    #                 ETFs still applies; that is a safety rule, not a throttle).
+    #   top_n       — how many leaders to hold; None = the engine default (2).
+    "full_deploy": False,
+    "top_n": None,
 }
 
 
@@ -3172,7 +3224,7 @@ def save_rx3_live_state(st):
     save_json("logs/rx3_live.json", st)
 
 
-def rx3_decide_targets(strategy, st, held):
+def rx3_decide_targets(strategy, st, held, cfg=None):
     """Today's target book from the engine, cached once per market day.
 
     Returns (targets, meta) where targets is {SYMBOL: weight} summing to <= 1.0,
@@ -3182,10 +3234,20 @@ def rx3_decide_targets(strategy, st, held):
     Lag discipline: the last Yahoo daily bar during market hours is today's
     PARTIAL bar, so decisions drop it (`[:-1]`) exactly like the paper pass and
     the backtest. Mixing today's partial into the decision series is the
-    look-ahead bug that was caught three times in research."""
+    look-ahead bug that was caught three times in research.
+
+    cfg supplies the sizing knobs (`full_deploy`, `top_n`). They are part of the
+    cache key, not just the call: a decision made under the old sizing is not a
+    valid answer to the new one, so re-arming mid-session re-decides on the spot
+    instead of leaving the book pointed at a target nobody asked for any more."""
+    cfg = cfg or {}
+    full_deploy = bool(cfg.get("full_deploy", False))
+    top_n = cfg.get("top_n") or None
     today = datetime.now(ET).strftime("%Y-%m-%d")
     cached = st.get("decision") or {}
-    if cached.get("date") == today and isinstance(cached.get("targets"), dict):
+    if (cached.get("date") == today and isinstance(cached.get("targets"), dict)
+            and bool(cached.get("full_deploy", False)) == full_deploy
+            and (cached.get("top_n") or None) == top_n):
         return cached["targets"], cached
 
     universe = _rx3_universe(strategy)
@@ -3211,12 +3273,14 @@ def rx3_decide_targets(strategy, st, held):
         st.get("sleeve_rets", []),
         held=list(held or []),
         sector_of=lambda s: sector_for(s, strategy),
-        leverage_factor=lambda s: leverage_factor(s, strategy))
+        leverage_factor=lambda s: leverage_factor(s, strategy),
+        full_deploy=full_deploy, top_n=top_n)
     targets = {**tb["weights"], **tb["defensive"]}
     meta = {"date": today, "targets": targets, "leaders": tb["leaders"],
             "defensive": list(tb["defensive"]), "riskx": tb["riskx"],
             "vol_scale": tb["vol_scale"], "cash_w": tb["cash"],
-            "scale": tb["scale"], "decided_at": now_iso()}
+            "scale": tb["scale"], "decided_at": now_iso(),
+            "full_deploy": full_deploy, "top_n": top_n}
     st["decision"] = meta
     return targets, meta
 
@@ -3234,8 +3298,9 @@ def rx3_order_plan(targets, positions, equity, buying_power, cfg, *,
     Rules encoded here rather than in a prompt, so they are testable and cannot
     be talked out of: a name the engine no longer wants is fully exited; drift
     inside the rebalance band is ignored (churn costs real spread); buys are
-    capped by actual buying power minus a cash buffer, so a rebalance can never
-    depend on unsettled proceeds; do-not-trade blocks BUYS only (never an exit);
+    capped by the broker's own buying power minus a cash buffer, so a rebalance
+    can never depend on money the broker will not release (whatever the account's
+    settlement regime); do-not-trade blocks BUYS only (never an exit);
     a symbol with the operator's own dashboard order in flight is skipped
     entirely this cycle; and a symbol that already has a sell order working
     today is never sold twice."""
@@ -3295,8 +3360,10 @@ def rx3_order_plan(targets, positions, equity, buying_power, cfg, *,
     buys.sort(key=lambda o: -o["drift_usd"])          # most under-weight first
 
     # Buys spend only what the broker says is actually available RIGHT NOW.
-    # Anything the settled balance can't cover is simply dropped: the plan is
-    # recomputed every cycle, so it re-appears once the proceeds settle.
+    # Anything that balance can't cover is simply dropped rather than queued: the
+    # plan is recomputed from scratch every cycle, so an unfunded leg re-appears
+    # by itself the moment the money is there (which, on limited margin, is as
+    # soon as the sell fills — see the recycle pass in process_rx3_live).
     spendable = max(0.0, float(buying_power or 0) - buffer_usd)
     funded = []
     for o in buys:
@@ -3380,7 +3447,7 @@ def process_rx3_live(log, strategy, cfg, broker_positions, broker_total,
     st = load_rx3_live_state()
     held_syms = [p["symbol"] for p in (broker_positions or [])
                  if float(p.get("shares") or 0) > 0]
-    targets, meta = rx3_decide_targets(strategy, st, held_syms)
+    targets, meta = rx3_decide_targets(strategy, st, held_syms, cfg)
     if targets is None:
         save_rx3_live_state(st)
         print(f"  [rx3-live] no decision this cycle ({meta.get('error')}) — "
@@ -3414,7 +3481,9 @@ def process_rx3_live(log, strategy, cfg, broker_positions, broker_total,
                           locked=locked,
                           sells_today=sells_today, orders_left=orders_left)
 
-    print(f"  [rx3-live] leaders={meta.get('leaders')} "
+    sizing = ("FULL-DEPLOY" if meta.get("full_deploy") else "throttled")
+    print(f"  [rx3-live] sizing={sizing} top_n={meta.get('top_n') or 'default'} "
+          f"leaders={meta.get('leaders')} "
           f"defensive={meta.get('defensive')} riskx={meta.get('riskx')} "
           f"vol_scale={meta.get('vol_scale')} target_cash={meta.get('cash_w')} "
           f"equity={broker_total} bp={buying_power}")
@@ -3425,30 +3494,75 @@ def process_rx3_live(log, strategy, cfg, broker_positions, broker_total,
         print("  [rx3-live] book already inside the rebalance band — no orders.")
 
     actions, exit_info, placed_n = [], {}, 0
-    for o in plan:
-        sym = o["symbol"]
-        print(f"  [rx3-live] {o['side'].upper()} {sym} "
-              f"{o.get('dollar_amount') or o.get('shares')} "
-              f"(cur {o['current_pct']*100:.1f}% -> tgt {o['target_pct']*100:.1f}%) "
-              f"reason={o['reason']}")
-        placed, fill, order_id = place_rotation_order(
-            o["side"], sym, dollar_amount=o.get("dollar_amount"),
-            shares=o.get("shares"), reason=o["reason"])
-        print(f"  [rx3-live] {sym} placed={placed} fill={fill} id={order_id}")
-        st.setdefault("orders", []).append(
-            {"ts": now_iso(), "date": today, **o, "placed": placed,
-             "fill_price": fill, "order_id": order_id})
-        if not placed:
-            continue
-        placed_n += 1
-        counter["count"] = int(counter.get("count") or 0) + 1
-        if o["side"] == "sell":
-            actions.append({"type": "sell", "symbol": sym, "reason": o["reason"],
-                            "price": fill, "shares": o.get("shares")})
-            # Only a FULL exit closes the position; a trim leaves it open, so it
-            # must not be handed to close detection as an exit reason.
-            if o["reason"] == "rotation_exit":
-                exit_info[sym] = {"reason": "rotation_exit", "price": fill}
+
+    def _execute(orders):
+        """Place one plan's worth of orders, recording every attempt. Mutates the
+        enclosing actions/exit_info/placed_n and the daily order counter, so the
+        cap and the audit trail cover both funding passes identically."""
+        nonlocal placed_n
+        n = 0
+        for o in orders:
+            sym = o["symbol"]
+            print(f"  [rx3-live] {o['side'].upper()} {sym} "
+                  f"{o.get('dollar_amount') or o.get('shares')} "
+                  f"(cur {o['current_pct']*100:.1f}% -> tgt {o['target_pct']*100:.1f}%) "
+                  f"reason={o['reason']}")
+            placed, fill, order_id = place_rotation_order(
+                o["side"], sym, dollar_amount=o.get("dollar_amount"),
+                shares=o.get("shares"), reason=o["reason"])
+            print(f"  [rx3-live] {sym} placed={placed} fill={fill} id={order_id}")
+            st.setdefault("orders", []).append(
+                {"ts": now_iso(), "date": today, **o, "placed": placed,
+                 "fill_price": fill, "order_id": order_id})
+            if not placed:
+                continue
+            placed_n += 1
+            n += 1
+            counter["count"] = int(counter.get("count") or 0) + 1
+            if o["side"] == "sell":
+                actions.append({"type": "sell", "symbol": sym, "reason": o["reason"],
+                                "price": fill, "shares": o.get("shares")})
+                # Only a FULL exit closes the position; a trim leaves it open, so
+                # it must not be handed to close detection as an exit reason.
+                if o["reason"] == "rotation_exit":
+                    exit_info[sym] = {"reason": "rotation_exit", "price": fill}
+        return n
+
+    _execute(plan)
+
+    # Second funding pass — the limited-margin payoff. The first plan could only
+    # spend the buying power that existed BEFORE the sells went out; now that
+    # they have, the proceeds are immediately tradable and the rotation can
+    # finish in this cycle instead of leaving the book half in cash overnight.
+    #
+    # Deliberately authoritative rather than optimistic: it re-reads the broker
+    # instead of assuming the sells filled, so an unfilled sell simply yields no
+    # new buying power and places nothing. Sells are filtered out of the second
+    # plan — the sell leg already went out, and re-selling on a fresh snapshot
+    # would be churn, not reconciliation.
+    if (placed_n and cfg.get("recycle_proceeds_same_cycle", True)
+            and any(o["side"] == "sell" for o in plan)):
+        left = max_orders - int(counter.get("count") or 0)
+        if left <= 0:
+            print("  [rx3-live] recycle skipped — daily order cap reached.")
+        else:
+            reread, sells2, total2, bp2 = read_broker_state(TIER_EXECUTION)
+            if reread is None or bp2 is None:
+                print("  [rx3-live] recycle skipped — could not re-read the "
+                      "broker (nothing is assumed filled).")
+            else:
+                plan2 = [o for o in rx3_order_plan(
+                    targets, reread, total2 or broker_total, bp2, cfg,
+                    do_not_trade=list(_do_not_trade()) + blocked["symbols"],
+                    locked=locked, sells_today=sells_today | sells2,
+                    orders_left=left) if o["side"] == "buy"]
+                if plan2:
+                    print(f"  [rx3-live] recycling freed proceeds same-cycle "
+                          f"(bp now {bp2}) — {len(plan2)} buy leg(s).")
+                    _execute(plan2)
+                    plan = plan + plan2
+                else:
+                    print(f"  [rx3-live] nothing to recycle (bp {bp2}).")
 
     st["orders"] = st.get("orders", [])[-200:]
     st["orders_today"] = counter
@@ -3541,8 +3655,10 @@ def run_rotation_cycle(log, strategy, must_sell, task):
 
     # 2) The rotation pass itself. A name just force-sold is gone from the
     #    broker snapshot, so the planner sees a flat slot; it will not be
-    #    re-bought until settled cash exists, and the stop that fired stays
-    #    respected because tomorrow's decision re-derives eligibility.
+    #    re-bought this cycle regardless of buying power, because a protective
+    #    exit adds the name to blocked_buys for the rest of the day — the stop
+    #    that fired stays respected until tomorrow's decision re-derives
+    #    eligibility from scratch.
     actions = []
     if not _control_paused():          # belt-and-braces: the caller already checked
         try:
@@ -3953,7 +4069,11 @@ EXECUTION RULES:
   orders via robinhood-cli.
 - Trade ONLY in Robinhood account {ACCOUNT_NUMBER} (the Agentic cash account).
   Never use the default margin account.
-- T+1 settlement: read SETTLED cash before any buy; never deploy unsettled funds.
+- Before any buy, read get_portfolio's buying_power and size against THAT figure
+  — never against total account value, and never recompute it yourself. This is a
+  LIMITED MARGIN account (upgraded 2026-08-14): unsettled sale proceeds are
+  spendable immediately, so there is no T+1 wait to plan around, but the broker's
+  buying_power is still the only number you may spend.
 - Ribbon signal (plain EMA 8/13/21/55 — matches the operator's chart):
   red(55) lowest = BUY, red(55) highest = SELL. ENTER_LONG transition triggers
   buys; {_exit_rule}
@@ -3979,15 +4099,16 @@ EXECUTION RULES:
         "configured bar interval; use these as the BUY/SELL gate, do NOT eyeball. "
         "'INSUFFICIENT_DATA' = unknown, do not trade that name):\n"
         f"{sig_block}\n\n"
-        "1. Read settled cash + positions from the Robinhood MCP (account "
-        f"{ACCOUNT_NUMBER}).\n"
+        "1. Read buying power (get_portfolio -> buying_power.buying_power) + "
+        f"positions from the Robinhood MCP (account {ACCOUNT_NUMBER}).\n"
         "2. If any STOP-LOSS or SELL SIGNAL alerts appear above, execute those "
         "sells FIRST before any other action.\n"
-        "3. Run the active skill. If a valid EMA signal + confidence + settled "
-        "cash align, execute the buy/sell via the MCP.\n"
+        "3. Run the active skill. If a valid EMA signal + confidence + buying "
+        "power align, execute the buy/sell via the MCP.\n"
         "4. When you SELL (close a position), report it in actions_taken so the "
         "learning loop fires.\n"
-        "5. Note progress vs. the goal and the settlement schedule."
+        "5. Note progress vs. the goal. Sale proceeds are tradable immediately "
+        "(limited margin) — there is no settlement wait to schedule around."
         + FOOTER_INSTRUCTION
     )
 
@@ -4121,8 +4242,8 @@ EXECUTION RULES:
         # When a forced exit is pending this read IS the protective path (it
         # decides what force_sell fires on), so it rides the tier that a spent
         # usage window can never block. (Buying power is read too, but only the
-        # RX-3 live path sizes off it — the discretionary turn asks the broker
-        # for settled cash itself.)
+        # RX-3 live path sizes off it — the discretionary turn reads the broker's
+        # buying power itself.)
         broker_positions, sell_orders_today, broker_total, _bp = read_broker_state(
             TIER_PROTECTIVE if must_sell else TIER_EXECUTION)
     # Account-level guard off the REAL broker total: deposit-aware equity sync +

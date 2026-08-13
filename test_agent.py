@@ -2174,6 +2174,29 @@ class TestBrokerReconciliation(unittest.TestCase):
         self.assertEqual(bp, 120.25)
         self.assertEqual(sells, {"CLOV"})                              # upper-cased
 
+    def test_read_broker_state_asks_for_buying_power_verbatim(self):
+        """Regression guard for the 2026-08-14 limited-margin upgrade. This
+        prompt used to demand 'the settled cash figure, NOT including unsettled
+        sale proceeds'. On a limited-margin account that instruction is a live
+        defect: an obedient model would have reported ~$3.66 of the $75.66 the
+        broker actually let us spend, starving every rotation buy for a day. The
+        broker already applies the account's settlement regime, so the only safe
+        instruction is 'report buying_power exactly as returned'."""
+        seen = {}
+
+        def capture(system, user, **kw):
+            seen["user"] = user
+            return ('```json\n{"positions": [], "sell_orders_today": [], '
+                    '"account_total": 367.92, "buying_power": 75.66}\n```'), {}
+
+        with patch.object(agent_module, "run_model", side_effect=capture):
+            _p, _s, _t, bp = agent_module.read_broker_state()
+        self.assertEqual(bp, 75.66)
+        prompt = seen["user"]
+        self.assertIn("buying_power.buying_power", prompt)
+        self.assertNotIn("NOT including unsettled sale proceeds", prompt)
+        self.assertRegex(prompt, r"do\s+NOT\s+subtract\s+unsettled")
+
     def test_force_sell_advisory_mode_is_noop(self):
         with patch.object(agent_module, "EXECUTION_MODE", "advisory"):
             placed, fill = agent_module.force_sell("CLOV", 4.18, "ema_exit")
@@ -2832,6 +2855,33 @@ class RX3LiveMixin(TmpDirMixin):
         msig.signal_for.return_value = sig
         return msig
 
+    def _run(self, targets, positions, total, bp, sells_today=(), recycle=None,
+             **cfgkw):
+        """One process_rx3_live pass with the engine decision stubbed, so these
+        tests are about execution behavior rather than momentum math (that lives
+        in test_rx3.py)."""
+        cfg = dict(agent_module.ROTATION_LIVE_DEFAULTS)
+        cfg.update(cfgkw)
+        log = agent_module.load_trade_log()
+        orders = MagicMock(return_value=(True, 10.0, "oid"))
+        # Any cycle that sells runs the same-cycle recycle pass, which re-reads
+        # the broker. Default that read to "nothing changed" so a test which is
+        # not about recycling stays hermetic (no `claude -p` subprocess) and
+        # places nothing extra.
+        reread = recycle if recycle is not None else (positions, set(), total, bp)
+        with patch.object(agent_module, "rx3_decide_targets",
+                          return_value=(targets, {"date": "2026-08-13",
+                                                  "leaders": list(targets),
+                                                  "defensive": [], "riskx": 1.0,
+                                                  "vol_scale": 1.0, "cash_w": 0.0})), \
+             patch.object(agent_module, "read_broker_state",
+                          return_value=reread) as reader, \
+             patch.object(agent_module, "place_rotation_order", orders):
+            actions, exit_info, placed = agent_module.process_rx3_live(
+                log, self.strategy, cfg, positions, total, bp, set(sells_today))
+        self._reader = reader
+        return orders, actions, exit_info, placed
+
 
 class TestRotationLiveConfig(RX3LiveMixin):
     """Arming real-money trading must require BOTH switches, and every failure
@@ -3025,21 +3075,6 @@ class TestProcessRX3Live(RX3LiveMixin):
     """The live pass end-to-end, with the engine decision stubbed so the test is
     about execution behavior, not momentum math (that lives in test_rx3.py)."""
 
-    def _run(self, targets, positions, total, bp, sells_today=(), **cfgkw):
-        cfg = dict(agent_module.ROTATION_LIVE_DEFAULTS)
-        cfg.update(cfgkw)
-        log = agent_module.load_trade_log()
-        orders = MagicMock(return_value=(True, 10.0, "oid"))
-        with patch.object(agent_module, "rx3_decide_targets",
-                          return_value=(targets, {"date": "2026-08-13",
-                                                  "leaders": list(targets),
-                                                  "defensive": [], "riskx": 1.0,
-                                                  "vol_scale": 1.0, "cash_w": 0.0})), \
-             patch.object(agent_module, "place_rotation_order", orders):
-            actions, exit_info, placed = agent_module.process_rx3_live(
-                log, self.strategy, cfg, positions, total, bp, set(sells_today))
-        return orders, actions, exit_info, placed
-
     def test_places_the_planned_orders(self):
         self._arm()
         orders, _a, _e, placed = self._run({"AAA": 1.0}, [], 1000.0, 1000.0)
@@ -3119,6 +3154,157 @@ class TestProcessRX3Live(RX3LiveMixin):
         self.assertEqual(len(st["orders"]), 1)
         self.assertTrue(st["orders"][0]["placed"])
         self.assertEqual(st["history"][-1]["placed"], 1)
+
+
+class TestRX3SizingConfig(RX3LiveMixin):
+    """`full_deploy`/`top_n` reach the engine from strategy.json, and DEFAULT to
+    plain RX-3 — shipping this code must not, on its own, put more of the account
+    into the market than yesterday. Arming the fuller book is an explicit config
+    edit (scripts/apply_rx4_sizing.py)."""
+
+    def _decide(self, **cfgkw):
+        cfg = dict(agent_module.ROTATION_LIVE_DEFAULTS)
+        cfg.update(cfgkw)
+        book = MagicMock(return_value={
+            "weights": {"AAA": 0.5}, "defensive": {}, "cash": 0.5, "scale": 0.5,
+            "riskx": 0.5, "vol_scale": 1.0, "leaders": ["AAA"], "scored": []})
+        closes = {s: [1.0] * 300 for s in ("AAA", "BBB", "CCC", "DDD", "EEE", "FFF")}
+        with patch.object(agent_module, "_rx3_fetch_closes", return_value=closes), \
+             patch.object(agent_module.rotation_engine, "target_book", book):
+            targets, meta = agent_module.rx3_decide_targets(
+                self.strategy, {}, [], cfg)
+        return book, targets, meta
+
+    def test_defaults_are_plain_rx3(self):
+        self._arm()
+        self.strategy["rotation"]["universe"] = ["AAA", "BBB", "CCC", "DDD", "EEE"]
+        self._flush_strategy()
+        book, _t, meta = self._decide()
+        self.assertIs(book.call_args.kwargs["full_deploy"], False)
+        self.assertIsNone(book.call_args.kwargs["top_n"])
+        self.assertFalse(meta["full_deploy"])
+
+    def test_full_deploy_and_top_n_reach_the_engine(self):
+        self._arm()
+        self.strategy["rotation"]["universe"] = ["AAA", "BBB", "CCC", "DDD", "EEE"]
+        self._flush_strategy()
+        book, _t, meta = self._decide(full_deploy=True, top_n=2)
+        self.assertIs(book.call_args.kwargs["full_deploy"], True)
+        self.assertEqual(book.call_args.kwargs["top_n"], 2)
+        self.assertTrue(meta["full_deploy"])
+        self.assertEqual(meta["top_n"], 2)
+
+    def test_rearming_midday_invalidates_the_cached_decision(self):
+        """The day's decision is cached, but a decision made under the OLD sizing
+        is not a valid answer to the new one — otherwise flipping to full-deploy
+        would leave the book pointed at a half-invested target until tomorrow."""
+        today = datetime.now(agent_module.ET).strftime("%Y-%m-%d")
+        stale = {"decision": {"date": today, "targets": {"OLD": 0.5},
+                              "full_deploy": False, "top_n": None}}
+        cfg = dict(agent_module.ROTATION_LIVE_DEFAULTS)
+
+        # same sizing -> the cache is still authoritative, no refetch
+        with patch.object(agent_module, "_rx3_fetch_closes") as fetch:
+            targets, _m = agent_module.rx3_decide_targets(
+                self.strategy, dict(stale), [], cfg)
+        self.assertEqual(targets, {"OLD": 0.5})
+        self.assertEqual(fetch.call_count, 0)
+
+        # sizing changed -> re-decide now
+        cfg.update(full_deploy=True, top_n=2)
+        with patch.object(agent_module, "_rx3_fetch_closes",
+                          return_value={}) as fetch:
+            targets, meta = agent_module.rx3_decide_targets(
+                self.strategy, dict(stale), [], cfg)
+        self.assertEqual(fetch.call_count, 1)
+        self.assertIsNone(targets)            # thin data -> refuses to trade
+        self.assertIn("error", meta)
+
+
+class TestRX3SameCycleRecycle(RX3LiveMixin):
+    """Limited margin (2026-08-14): proceeds from a sell are spendable as soon as
+    it fills, so a rotation must finish in ONE cycle instead of selling today and
+    buying tomorrow. The pass re-reads the broker rather than assuming the sell
+    filled, so it stays correct on an account that is still T+1."""
+
+    OLD = [{"symbol": "OLD", "shares": 100.0, "last_price": 10.0}]
+
+    def test_proceeds_are_redeployed_in_the_same_cycle(self):
+        """OLD is dropped by the engine and NEW is wanted, but buying power is $0
+        until the sell fills. The re-read finds the freed cash and the buy goes
+        out on this cycle."""
+        self._arm()
+        orders, _a, exit_info, placed = self._run(
+            {"NEW": 1.0}, self.OLD, 1000.0, 0.0,
+            recycle=([], set(), 1000.0, 1000.0))
+        sides = [(c[0][0], c[0][1]) for c in orders.call_args_list]
+        self.assertEqual(sides, [("sell", "OLD"), ("buy", "NEW")])
+        self.assertEqual(placed, 2)
+        self.assertIn("OLD", exit_info)
+
+    def test_no_recycle_when_nothing_was_sold(self):
+        """A buy-only plan frees no capital, so the extra broker read is waste."""
+        self._arm()
+        self._run({"AAA": 1.0}, [], 1000.0, 1000.0)
+        self.assertEqual(self._reader.call_count, 0)
+
+    def test_failed_reread_places_nothing_extra(self):
+        """A failed read is 'unknown', never 'the sell filled' — the same contract
+        the rest of the loop uses. The buy simply waits for the next cycle."""
+        self._arm()
+        orders, _a, _e, placed = self._run(
+            {"NEW": 1.0}, self.OLD, 1000.0, 0.0,
+            recycle=(None, set(), None, None))
+        self.assertEqual([c[0][0] for c in orders.call_args_list], ["sell"])
+        self.assertEqual(placed, 1)
+
+    def test_unfilled_sell_yields_no_buying_power_and_no_buy(self):
+        """Authoritative, not optimistic: if the sell has not filled, the broker
+        still reports the old position and $0 spendable, so nothing is bought
+        against money that does not exist yet."""
+        self._arm()
+        orders, _a, _e, _p = self._run(
+            {"NEW": 1.0}, self.OLD, 1000.0, 0.0,
+            recycle=(self.OLD, {"OLD"}, 1000.0, 0.0))
+        self.assertEqual([c[0][0] for c in orders.call_args_list], ["sell"])
+
+    def test_config_switch_restores_one_leg_per_cycle(self):
+        self._arm()
+        orders, _a, _e, _p = self._run(
+            {"NEW": 1.0}, self.OLD, 1000.0, 0.0,
+            recycle=([], set(), 1000.0, 1000.0),
+            recycle_proceeds_same_cycle=False)
+        self.assertEqual([c[0][0] for c in orders.call_args_list], ["sell"])
+        self.assertEqual(self._reader.call_count, 0)
+
+    def test_recycled_buys_still_obey_the_daily_order_cap(self):
+        """The cap is a circuit breaker on runaway loops; a second funding pass
+        must count against it, not run outside it."""
+        self._arm()
+        orders, _a, _e, placed = self._run(
+            {"NEW": 1.0}, self.OLD, 1000.0, 0.0,
+            recycle=([], set(), 1000.0, 1000.0), max_orders_per_day=1)
+        self.assertEqual(placed, 1)
+        self.assertEqual([c[0][0] for c in orders.call_args_list], ["sell"])
+
+    def test_recycled_buy_still_respects_blocked_and_do_not_trade(self):
+        """A name a stop just exited must not be re-bought by the recycle pass —
+        that would undo the protective exit seconds after it fired."""
+        self._arm()
+        cfg = dict(agent_module.ROTATION_LIVE_DEFAULTS)
+        log = agent_module.load_trade_log()
+        orders = MagicMock(return_value=(True, 10.0, "oid"))
+        with patch.object(agent_module, "rx3_decide_targets",
+                          return_value=({"NEW": 0.5, "MU": 0.5},
+                                        {"date": "2026-08-13",
+                                         "leaders": ["NEW", "MU"]})), \
+             patch.object(agent_module, "read_broker_state",
+                          return_value=([], set(), 1000.0, 1000.0)), \
+             patch.object(agent_module, "place_rotation_order", orders):
+            agent_module.process_rx3_live(log, self.strategy, cfg, self.OLD,
+                                          1000.0, 0.0, set(), blocked_buys=["MU"])
+        bought = {c[0][1] for c in orders.call_args_list if c[0][0] == "buy"}
+        self.assertEqual(bought, {"NEW"})
 
 
 class TestRotationCycleIntegration(RX3LiveMixin):

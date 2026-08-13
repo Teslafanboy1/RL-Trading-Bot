@@ -929,7 +929,9 @@ def order_preview(params, ip):
     if side == "buy" and est_cost and pf.get("buying_power") is not None \
             and est_cost > pf["buying_power"]:
         warnings.append(f"Estimated cost ${est_cost:,.2f} EXCEEDS buying power "
-                        f"${pf['buying_power']:,.2f} (T+1 settled cash).")
+                        f"${pf['buying_power']:,.2f} (the broker's real-time "
+                        "spendable figure; limited margin, so unsettled proceeds "
+                        "are already counted).")
     if side == "sell":
         held = {p["symbol"]: p for p in (broker.cached().get("positions") or [])}
         h = held.get(symbol)

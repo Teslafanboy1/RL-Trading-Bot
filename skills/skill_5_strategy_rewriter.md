@@ -30,7 +30,10 @@ be conservative.
 ## Guardrails
 - Do not change the goal away from 100% monthly, but do not chase it by sizing up
   risk beyond the allocation bands either.
-- Never loosen the T+1 / settled-funds rule.
+- Never loosen the buying-power rule: every buy is sized against the broker's own
+  `buying_power` figure and never exceeds it. (The account moved from T+1 cash to
+  LIMITED MARGIN on 2026-08-14, so unsettled proceeds are spendable — that changed
+  WHEN money is available, not the rule that the broker's number is the ceiling.)
 
 ## Severity tag (always emit one)
 Start your response with a single line tagging the change set:

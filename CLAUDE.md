@@ -18,7 +18,7 @@ Key env vars:
 | `EXECUTION_MODE` | `advisory` | `live` arms real orders |
 | `SIGNAL_INTERVAL` | `1h` | Bar width for EMA (e.g. `30m`, `1d`) |
 | `WATCHLIST` | `SPY` | Comma-separated symbols to scan |
-| `POLL_MINUTES` | `15` | Cycle frequency during market hours |
+| `POLL_MINUTES` | `5` | Cycle frequency during market hours. Was 15 until 2026-08-14; under RX-3 live a cycle is a cheap Haiku broker read plus any orders, so looking more often mainly buys **stop-breach detection latency**. It does *not* make the strategy trade more often — the rotation decides once a day by design. |
 | `MODEL` | `claude-opus-4-8` | Used for research/postmortem calls |
 | `CHECK_MODEL` | `claude-haiku-4-5-20251001` | Used for routine market-hours checks (most cycles skip the model entirely) |
 | `RH_ACCOUNT` | `696283985` | Robinhood Agentic cash account number |
@@ -266,12 +266,78 @@ Per-cycle model transcripts and skill_5 outputs append to a **single monthly rol
 ## Key constraints (enforced at every level)
 
 - **Stop-loss**: if any open position falls ≥ 10% below entry price, sell all shares immediately — overrides EMA signal, blackout windows, and all other rules. The model is instructed to sell first before evaluating anything else. Sells are tagged `reason='stop_loss'` in `actions_taken` and `stop_loss: true` in the trade record. Threshold lives in `strategy/strategy.json` → `risk_management.stop_loss_pct`.
-- **T+1 settlement**: only buy with settled cash. Always read from the Robinhood MCP before any buy; never infer settled cash from the trade log.
+- **Buying power** (see [Settlement and account type](#settlement-and-account-type-limited-margin-since-2026-08-14)): size every buy against `get_portfolio` → `buying_power.buying_power`, read from the Robinhood MCP before the buy and used **verbatim**. Never infer it from the trade log, never reconstruct it from total-minus-positions, and never adjust it for settlement — the broker already did.
 - **Capital bands**: 90-100 confidence → 30%, 75-89 → 20%, 60-74 → 15%, below 60 → skip. 10% cash reserve always held; max 30% per position.
 - **Ribbon signal gate** (plain EMA 8/13/21/55): the red(55) `ENTER_LONG` transition triggers buys. `HOLD` = stay in position (already in BUY zone); `NO_ACTION` on an unheld symbol = do nothing. Weekend picks in `HOLD` state are still valid buy targets during execution. **Exits are now trailing-stop-primary, not ribbon-state-primary** — see the trailing-stop constraint below.
 - **Trailing stop ("let winners run")** (`risk_management.trailing_stop_pct`, default `0.25`): a held position that gives back ≥ 25% from its post-entry high-water mark (`peak_price`, tracked every cycle by `update_position_peaks()`) is force-sold (`reason='trailing_stop'`, **not** tagged `stop_loss`) via the same deterministic `force_sell` path as the hard stop. This is the **primary momentum exit**. The old ribbon `SELL`-state forced exit is gated behind `risk_management.exit_on_ribbon_sell` (now **`false`**): a `SELL` state on a held name is **advisory** — `skill_2` may still exit a *broken thesis* (`reason='thesis_break'`), but the ribbon flip no longer auto-sells and no longer wakes the model (`_format_ema_sell_block` degrades to an advisory note; the `ema_sell_held`/`exit` skip-wakes are gated off). Set `exit_on_ribbon_sell: true` to restore the prior always-sell-on-`SELL`-state behavior. Rationale: a 10y/29-name backtest (`backtest.py` + `research/trail_probe.py`) showed the ribbon-state exit cut winners early (lost to buy-and-hold on 23/29 names); the trailing stop lifts portfolio ann. return ~18→20%, per-trade expectancy ~14→27–46%, PF ~4.2→5–7, at modestly higher drawdown. **A 15-min poller cannot beat an overnight gap — position sizing (esp. the leveraged-sleeve cap) is the real gap defense.**
-- **Account**: always use account `696283985` (Agentic cash, not the margin account).
+- **Account**: always use account `696283985` (the Agentic account — nickname "Agentic", `type: limited_margin`), never the default `795166016`.
 - **Core rule changes** require 3+ similar outcomes before applying; minor tweaks (weights, targets, sizing) auto-apply.
+
+## Settlement and account type (limited margin since 2026-08-14)
+
+The operator upgraded account `696283985` from a true cash account to **limited
+margin**. That grants exactly one thing: **the right to trade unsettled funds**.
+Sale proceeds are spendable the moment the sell fills, so **T+1 is gone**.
+
+What it does *not* grant is just as important: **no borrowing and no leverage**.
+The broker reports `buying_power == unleveraged_buying_power`, so the account
+still cannot spend more than it has, and **no sizing rule, risk cap, or stop
+changes because of this** — only the *timing* of when money is available did.
+
+The single operative rule, everywhere: **size every buy against `get_portfolio` →
+`buying_power.buying_power`, taken from the broker verbatim.** Do not recompute
+it, do not substitute the `cash` field, do not subtract unsettled funds, and do
+not size against `total_value`. The broker already applies whatever settlement
+regime the account is under, which is what keeps one instruction correct across
+both regimes — and is why `read_broker_state()` now forbids the model from
+adjusting the number.
+
+> **The bug this fixed.** Until 2026-08-14 `read_broker_state()` asked for "the
+> settled cash figure, NOT including unsettled sale proceeds". After the upgrade
+> that instruction was a live defect: with $75.66 spendable of which $72.00 was
+> unsettled, an obedient model would report ~$3.66 and starve every rotation buy
+> for a day. Guarded by
+> `test_read_broker_state_asks_for_buying_power_verbatim`.
+
+**Day-trading rules no longer bind either.** FINRA retired the pattern-day-trader
+regime (SEC approval 2026-04-14, effective **2026-06-04**), and Robinhood removed
+day-trade restrictions and PDT flags with it. There is no 3-day-trades-per-5-days
+counter to ration and no $25k minimum. The $2,000 margin minimum still applies to
+*borrowing*, which this account does not do. **So the limit on trading faster is
+transaction cost and edge — not regulation.** See below, where that was measured.
+
+## Does trading FASTER earn more? No — measured 2026-08-14
+
+`research/edge_lab4_speed.py` exists to answer the recurring "can it day-trade /
+use a shorter timeframe for more returns?" question with numbers instead of
+intuition. It drives **`rotation_engine.target_book()` itself** — the same
+function the live desk calls — one day at a time over 10y with strict lag
+discipline, swapping only the lookback config. 10y, 39 symbols, 5bps/side:
+
+| variant | CAGR | Sharpe | maxDD | turnover |
+|---|---|---|---|---|
+| RX-3 live (throttled, top2) | 22.1% | 0.87 | 52% | 73x/yr |
+| **RX-4 full-deploy (top2)** | **28.5%** | 0.90 | 63% | 38x/yr |
+| **RX-4 full-deploy (top4)** | 26.9% | **1.04** | **50%** | 29x/yr |
+| RX-4 full-deploy, 2x faster | 20.5% | 0.71 | 80% | 61x/yr |
+| RX-4 full-deploy, 3x faster | 21.4% | 0.75 | 77% | 65x/yr |
+| RX-4 full-deploy, 4x faster | 25.0% | 0.85 | 58% | 86x/yr |
+| RX-3 throttled, 2x faster | 14.1% | 0.63 | 67% | 88x/yr |
+
+**Every faster variant loses to its own baseline**, and the "2x/3x faster" ones
+lose badly while nearly *doubling* drawdown. Re-run at **zero** transaction cost
+the fastest variant only ties its baseline (30.5% vs 31.0%) — so this is not a
+cost artifact that a better fill could rescue: **the edge lives in multi-week
+momentum persistence, and shortening the lookback destroys the signal itself.**
+Shorter lookbacks then pay ~2.3x the turnover for a signal that is no better.
+
+Rebalancing *less* often (weekly) was the best risk-adjusted variant tested
+(25.4% CAGR at the **lowest** drawdown, 45%, on a third the turnover).
+
+**Conclusion, and the thing to re-read before proposing intraday trading again:**
+the lever that actually moves returns here is **how much capital is deployed**
+(the RISKX + vol throttle), not **how often it trades**. Faster polling is still
+worth having — but for stop-breach latency, which is why `POLL_MINUTES` is 5.
 
 ## RX-3 — LIVE since 2026-08-13 (deterministic rotation owns the book)
 
@@ -300,17 +366,40 @@ the legacy discretionary loop comes back unchanged on the next cycle.
 - **`process_rx3_live()`** decides the target book **once per market day**
   (`rx3_decide_targets`, cached in `logs/rx3_live.json`, decisions from closes
   **through yesterday** — same lag discipline as the paper pass and backtest),
-  then **reconciles every cycle** toward that standing target. This split exists
-  because T+1 settlement is real: a buy leg starved of settled cash today simply
-  fills on a later cycle, and the plan is idempotent so re-running never
-  double-buys.
+  then **reconciles every cycle** toward that standing target. The split keeps
+  the decision honest (it can only use closes through yesterday) while letting
+  execution catch up whenever the broker can fund it; the plan is idempotent, so
+  re-running never double-buys.
+  **Same-cycle recycling** (`recycle_proceeds_same_cycle`, default on since the
+  2026-08-14 limited-margin upgrade): the first plan can only spend the buying
+  power that existed *before* the sells went out, so after they do, the pass
+  re-reads the broker and runs a second **buy-only** funding pass. A rotation now
+  completes in one cycle instead of selling today and buying tomorrow. It is
+  authoritative, not optimistic — it re-reads rather than assuming a fill, so an
+  unfilled sell (or a still-T+1 account) simply yields no new buying power and
+  places nothing. Recycled buys count against the same daily order cap and honor
+  the same `blocked_buys`/`do_not_trade` rails, so the pass can never re-buy a
+  name a stop just exited.
 - **`rx3_order_plan()`** is a **pure function** and the entire safety surface —
   full exit for a name the engine dropped (deliberately bypassing the rebalance
   band so old dust can't linger), trims for over-weights, buys capped by the
   broker's **buying power** (not total-minus-positions, which would silently
-  spend unsettled proceeds), `do_not_trade` blocking buys but never exits,
-  manual-lock and already-working-sell skips, and a daily order cap. 20 unit
-  tests cover it; nothing here lives in a prompt.
+  spend money the broker won't release), `do_not_trade` blocking buys but never
+  exits, manual-lock and already-working-sell skips, and a daily order cap. 20
+  unit tests cover it; nothing here lives in a prompt.
+- **Sizing is config, and defaults to plain RX-3.** `rotation.live.full_deploy`
+  (default `false`) and `rotation.live.top_n` (default = engine's 2) are threaded
+  into `rotation_engine.target_book()` by `rx3_decide_targets()`. `full_deploy`
+  drops the RISKX defensive carve-out and the vol throttle so the book stays 100%
+  invested in the leaders — the 3x-ETF leverage haircut still applies (safety
+  rule, not a throttle), as do every stop, the daily order cap, PAUSE,
+  `do_not_trade`, and the kill-switch. The sizing is part of the **daily decision
+  cache key**, so re-arming mid-session re-decides on the spot instead of leaving
+  the book pointed at a target nobody asked for any more.
+  Change it with **`scripts/apply_rx4_sizing.py`** (run on the VM — `strategy.json`
+  is deploy-protected, so this cannot ship as a commit; the script does the
+  version bump, history snapshot, and change-event that a hand-edit over SSH
+  would skip, and refuses outright if RX-3 live is not armed).
 - **`place_rotation_order()`** places exactly one order per call and self-confirms
   via `get_equity_orders` — the `force_sell` contract, for the same 2026-06-12
   reason (a chatty turn narrating an order it never placed). Buys use
