@@ -185,6 +185,11 @@ try:
 except Exception:
     usage_governor = None
 
+try:
+    from desk import engine_b as desk_engine_b, scorecard as desk_scorecard  # Claude Desk (paper)
+except Exception:
+    desk_engine_b = desk_scorecard = None
+
 # Priority tiers for every `claude -p` call. Kept as module constants (rather
 # than reaching into usage_governor at each call site) so the agent still runs
 # with the governor absent — see run_model().
@@ -2653,6 +2658,107 @@ def _run_shadow_passes(raw_sigs, log):
         process_rx4_paper(log)
     except Exception as e:
         print(f"  [rx4] paper pass failed: {e}")
+    try:
+        process_desk_paper(log)
+    except Exception as e:
+        print(f"  [desk] paper pass failed: {e}")
+
+
+DESK_B_VARIANTS = {
+    # Operator plan 2026-09-23 wanted a short side. The 10y check said inverse
+    # ETFs made Engine B WORSE (maxDD 79% vs 61% long-only: decay + whipsaw on
+    # V-shaped recoveries). Both run on paper so the live record decides.
+    "B": {"inverse": False},
+    "B_short": {"inverse": True},
+}
+
+
+def desk_paper_step(paper, closes, variant_inverse, today, rebalance_every=None):
+    """One daily step of an Engine B paper book. Pure (no I/O): returns
+    (paper, new_calls). Decisions use closes through YESTERDAY; marks use the
+    latest close. Rebalances every REBALANCE_EVERY runs; 5bps/side."""
+    every = rebalance_every or desk_engine_b.REBALANCE_EVERY
+    universe = [s for s in desk_engine_b.UNIVERSE
+                if variant_inverse or s not in desk_engine_b.INVERSE]
+    marks = {s: c[-1] for s, c in closes.items() if c}
+    positions = paper.setdefault("positions", {})
+    cash = float(paper.get("cash", paper.get("start_equity", 100.0)))
+    equity = cash + sum(p["shares"] * marks.get(s, p["last_px"]) for s, p in positions.items())
+    runs = int(paper.get("runs", 0))
+    new_calls = []
+    if runs % every == 0:
+        hist = {s: closes[s][:-1] for s in universe if s in closes and len(closes[s]) > 1}
+        targets = desk_engine_b.target_book(hist)["weights"]
+        for sym in sorted(set(positions) | set(targets)):
+            px = marks.get(sym)
+            if not px:
+                continue
+            cur = positions.get(sym, {}).get("shares", 0.0) * px
+            tgt = targets.get(sym, 0.0) * equity
+            delta = tgt - cur
+            if abs(delta) < 0.005 * equity:
+                continue
+            cash -= delta + abs(delta) * 0.0005
+            if tgt <= 0:
+                positions.pop(sym, None)
+            else:
+                if sym not in positions:
+                    new_calls.append((sym, px))
+                positions[sym] = {"shares": round(tgt / px, 6), "last_px": px}
+        paper["leaders"] = list(targets)
+    for s, p in positions.items():
+        p["last_px"] = marks.get(s, p["last_px"])
+    equity = cash + sum(p["shares"] * p["last_px"] for p in positions.values())
+    paper.update(cash=round(cash, 4), equity=round(equity, 4), runs=runs + 1)
+    paper.setdefault("history", []).append({"date": today, "equity": round(equity, 4),
+                                            "holdings": sorted(positions)})
+    paper["history"] = paper["history"][-400:]
+    return paper, new_calls
+
+
+def process_desk_paper(log):
+    """Claude Desk Engine B, both variants, PAPER ONLY (operator plan
+    2026-09-23). Once per market day, zero model tokens (Yahoo closes), and
+    every new entry is pre-registered on the Brain's scorecard, which is also
+    graded here. Never raises into the loop; places no orders."""
+    if not (desk_engine_b and desk_scorecard and signals):
+        return
+    if not is_market_open():
+        return
+    st = log.setdefault("_state", {})
+    h = _hours_since(st.get("last_desk_ts"))
+    if h is not None and h < 20:
+        return
+    st["last_desk_ts"] = now_iso()
+    save_trade_log(log)
+
+    closes = _rx3_fetch_closes(desk_engine_b.UNIVERSE)
+    if len(closes) < 10:
+        print("  [desk] data fetch too thin — skipping today's paper pass")
+        return
+    today = datetime.now(ET).date()
+    calls = desk_scorecard.load()
+    for name, cfg in DESK_B_VARIANTS.items():
+        path = f"shadow/desk_{name.lower()}_paper.json"
+        paper = load_json(path, None) or {
+            "_note": f"Claude Desk Engine {name} paper book (operator plan "
+                     "2026-09-23). Zero real money.",
+            "start_date": now_iso(), "start_equity": 100.0, "cash": 100.0}
+        paper, new = desk_paper_step(paper, closes, cfg["inverse"], today.isoformat())
+        save_json(path, paper)
+        for sym, px in new:
+            side = desk_engine_b.side_of(sym)
+            calls.append(desk_scorecard.make_call(
+                f"engine_{name}", sym, "long", px, today=today,
+                thesis=f"trend-momentum top-{desk_engine_b.TOP_N} entry"
+                       + (" (inverse ETF = bearish bet)" if side == "short" else "")))
+        ret = (paper["equity"] / paper["start_equity"] - 1) * 100
+        print(f"  [desk] {name}: equity {paper['equity']:.2f} ({ret:+.2f}%) "
+              f"holding {sorted(paper.get('positions', {}))}")
+    calls = [desk_scorecard.grade(c, (closes.get(c["symbol"]) or [None])[-1], today)
+             for c in calls]
+    desk_scorecard.save(calls)
+    print(f"  [desk] scorecard: {json.dumps(desk_scorecard.summary(calls))}")
 
 
 def process_cycle_state(log, actions, broker_positions, exit_info=None):
