@@ -189,6 +189,10 @@ try:
     from desk import engine_b as desk_engine_b, scorecard as desk_scorecard  # Claude Desk (paper)
 except Exception:
     desk_engine_b = desk_scorecard = None
+try:
+    from desk import engine_a as desk_engine_a  # Claude Desk Crowd Hunter (paper options)
+except Exception:
+    desk_engine_a = None
 
 # Priority tiers for every `claude -p` call. Kept as module constants (rather
 # than reaching into usage_governor at each call site) so the agent still runs
@@ -2662,6 +2666,10 @@ def _run_shadow_passes(raw_sigs, log):
         process_desk_paper(log)
     except Exception as e:
         print(f"  [desk] paper pass failed: {e}")
+    try:
+        process_desk_engine_a(log)
+    except Exception as e:
+        print(f"  [desk-A] crowd hunter pass failed: {e}")
 
 
 DESK_B_VARIANTS = {
@@ -2759,6 +2767,188 @@ def process_desk_paper(log):
              for c in calls]
     desk_scorecard.save(calls)
     print(f"  [desk] scorecard: {json.dumps(desk_scorecard.summary(calls))}")
+
+
+DESK_A_PATH = os.path.join(ROOT, "shadow", "desk_a_paper.json")
+YAHOO_SCREENS = ("day_gainers", "day_losers", "most_actives")
+
+
+def fetch_crowd_movers():
+    """Today's crowd: Yahoo's free top-movers screens (zero model tokens).
+    Returns [{symbol, price, change_pct, volume, avg_volume}]; [] on failure."""
+    out = []
+    for scr in YAHOO_SCREENS:
+        url = ("https://query1.finance.yahoo.com/v1/finance/screener/predefined/"
+               f"saved?scrIds={scr}&count=25")
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=20,
+                                        context=signals._ssl_context()) as r:
+                quotes = json.load(r)["finance"]["result"][0]["quotes"]
+        except Exception:
+            continue
+        for q in quotes:
+            out.append({"symbol": q.get("symbol"),
+                        "price": q.get("regularMarketPrice"),
+                        "change_pct": q.get("regularMarketChangePercent"),
+                        "volume": q.get("regularMarketVolume"),
+                        "avg_volume": q.get("averageDailyVolume3Month")})
+    return out
+
+
+def desk_a_catalyst_check(cands):
+    """The Brain's one call a day: is there a REAL reason behind each move?
+    Web search on, read-only, TIER_SHADOW (paper work drains first). Returns
+    {SYMBOL: {"real": bool, "confidence": int, "catalyst": str,
+    "invalidation": str}}; {} on any failure (no catalyst -> no trade)."""
+    playbook = load_file("desk/playbook.md") or ""
+    lines = "\n".join(
+        f"- {c['symbol']}: {c['side'].upper()} setup, {c['change_pct']:+.1f}% today "
+        f"on {c['rvol']:.1f}x normal volume ({c['reason']})" for c in cands)
+    system = ("You are the analyst for a paper options desk. Read-only: never place "
+              "orders. Be skeptical: most big moves have no durable reason.\n\n"
+              "Desk playbook (lessons so far):\n" + playbook[:4000])
+    user = (
+        "Today's crowd setups:\n" + lines + "\n\n"
+        "For EACH symbol, search the news from the last 48 hours and decide:\n"
+        "- CALL setups: is there a real, durable catalyst (earnings beat, guidance "
+        "raise, contract, approval, deal) likely to keep buyers coming for 1-3 weeks? "
+        "A squeeze, meme chatter, or 'no news' is NOT real.\n"
+        "- PUT setups: is the run-up breaking for a real reason (dilution, missed "
+        "numbers, failed trial, fraud claim), or just a dip buyers will buy?\n"
+        "confidence = your probability (0-100) the trade direction is right over "
+        "the next 2 weeks.\n"
+        "Output ONLY one fenced ```json block:\n"
+        '{"SYMBOL": {"real": true|false, "confidence": <int>, "catalyst": "<one line>", '
+        '"invalidation": "<what would prove this wrong>"}, ...}')
+    text, _ = run_model(system, user, web=True, model=MODEL, timeout=600,
+                        tier=TIER_SHADOW)
+    block = extract_last_json_block(text)
+    return block if isinstance(block, dict) else {}
+
+
+def select_desk_contract(underlying, price, side):
+    """Read-only MCP call: the ~ATM call or put in Engine A's DTE window, with
+    its live bid/ask. Returns a contract dict or None. Can never place an order."""
+    today = datetime.now(ET).strftime("%Y-%m-%d")
+    system = ("You are a READ-ONLY options data tool. Use only the MCP option/equity "
+              "read tools. Never place, modify, or cancel any order.")
+    user = (
+        f"For underlying {underlying} (spot ~{price}) in account {ACCOUNT_NUMBER}:\n"
+        f"Find the {side.upper()} with strike closest to spot expiring "
+        f"{desk_engine_a.DTE_MIN}-{desk_engine_a.DTE_MAX} calendar days from today "
+        f"({today}). Use get_option_chains / get_option_quotes.\n"
+        "Output ONLY one fenced ```json block, no prose:\n"
+        f'{{"type":"{side}","strike":<float>,"expiry":"YYYY-MM-DD","bid":<float>,'
+        '"ask":<float>,"underlying_price":<float>}\n'
+        'If no such contract exists, output {"type":null}.')
+    text, _ = run_model(system, user, mcp=True, read_only=True,
+                        extra_tools=RH_OPTION_READ, model=CHECK_MODEL, timeout=240,
+                        tier=TIER_SHADOW)
+    block = extract_last_json_block(text)
+    if not (block and isinstance(block, dict) and block.get("type")):
+        return None
+    return block
+
+
+def process_desk_engine_a(log):
+    """Claude Desk Engine A — Crowd Hunter, PAPER options (operator plan
+    2026-09-23). Replaces the momentum shadow's catalyst source, which died when
+    RX-3 live retired the morning research (no MOMENTUM OPTIONS WATCH block ->
+    the options record sat empty since Aug 13).
+
+    Mark/close pass at most hourly (one Haiku quote per open position); open
+    pass once per market day after 10:00 ET (let the opening noise settle):
+    free Yahoo movers -> desk_engine_a.rank -> ONE Brain catalyst call on the
+    top 3 -> real-quote contract -> paper open + scorecard call. Never raises
+    into the loop; places no orders (every model call here is read-only)."""
+    if not (desk_engine_a and desk_scorecard and options_shadow and signals):
+        return
+    if not is_market_open():
+        return
+    st = log.setdefault("_state", {})
+    slog = options_shadow.load_shadow_log(DESK_A_PATH)
+    slog.setdefault("_note", "Claude Desk Engine A (Crowd Hunter) paper options. "
+                             "Entry at ask, exit at bid. Zero real money.")
+    now = now_iso()
+    today = datetime.now(ET).date()
+    changed = False
+
+    mark_h = _hours_since(st.get("last_desk_a_mark_ts"))
+    if options_shadow.open_shadows(slog) and (mark_h is None or mark_h >= 1):
+        st["last_desk_a_mark_ts"] = now
+        for pos in list(options_shadow.open_shadows(slog)):
+            bid = read_shadow_quote(pos)
+            if bid is None:
+                continue
+            pos["last_bid"] = bid
+            close, reason = desk_engine_a.should_exit(pos, bid, today)
+            if close:
+                options_shadow.close_shadow_record(slog, pos["id"], bid, reason, now_iso=now)
+                print(f"  [desk-A] closed {pos['id']} {pos['underlying']} {pos['type']} "
+                      f"({reason}) {pos.get('pnl_pct_on_premium')}% on premium")
+        changed = True
+
+    now_et = datetime.now(ET)
+    open_h = _hours_since(st.get("last_desk_a_scan_ts"))
+    if (now_et.hour, now_et.minute) >= (10, 0) and (open_h is None or open_h >= 20):
+        st["last_desk_a_scan_ts"] = now
+        save_trade_log(log)
+        if len(options_shadow.open_shadows(slog)) < desk_engine_a.MAX_OPEN:
+            movers = fetch_crowd_movers()
+            closes = {}
+            for m in movers:
+                sym = m.get("symbol")
+                if sym and sym not in closes:
+                    c = fetch_daily_closes(sym)
+                    closes[sym] = c[:-1] if len(c) > 1 else c   # through yesterday
+            cands = [c for c in desk_engine_a.rank(movers, closes)
+                     if not options_shadow.has_open_shadow(slog, c["symbol"])][:3]
+            print(f"  [desk-A] {len(movers)} movers -> {len(cands)} crowd setups: "
+                  f"{[(c['symbol'], c['side']) for c in cands]}")
+            verdicts = desk_a_catalyst_check(cands) if cands else {}
+            opened = 0
+            for c in cands:
+                if opened >= desk_engine_a.MAX_OPENS_PER_DAY:
+                    break
+                v = verdicts.get(c["symbol"]) or {}
+                conf = v.get("confidence") or 0
+                if not v.get("real") or conf < desk_engine_a.MIN_CATALYST_CONF:
+                    print(f"  [desk-A] pass {c['symbol']}: no real catalyst "
+                          f"(conf {conf}) {str(v.get('catalyst', ''))[:80]}")
+                    continue
+                contract = select_desk_contract(c["symbol"], c["price"], c["side"])
+                if not contract:
+                    continue
+                ok, why = options_shadow.validate_contract(
+                    contract, c["price"], desk_engine_a.contract_cfg())
+                cost = options_shadow.entry_premium(contract) * 100 if ok else 0
+                if not ok or cost > desk_engine_a.MAX_CONTRACT_USD:
+                    print(f"  [desk-A] skip {c['symbol']}: {why if not ok else f'contract ${cost:.0f} too big'}")
+                    continue
+                acct = float(log.get("summary", {}).get("current_value") or 0)
+                rec = options_shadow.open_shadow_record(
+                    slog, underlying=c["symbol"], contract=contract,
+                    underlying_price=c["price"], account_value=acct,
+                    cfg=desk_engine_a.contract_cfg(), confidence=conf,
+                    thesis=v.get("catalyst", ""), now_iso=now)
+                rec.update(structure=f"long_{c['side']}", signal_source="desk_engine_a",
+                           crowd=c, invalidation=v.get("invalidation", ""))
+                calls = desk_scorecard.load()
+                calls.append(desk_scorecard.make_call(
+                    "engine_A", c["symbol"], "long" if c["side"] == "call" else "short",
+                    c["price"], stop_pct=0.10, target_pct=0.15, horizon_days=10,
+                    confidence=conf, thesis=v.get("catalyst", ""), today=today))
+                desk_scorecard.save(calls)
+                opened += 1
+                changed = True
+                print(f"  [desk-A] OPENED {rec['id']} {c['symbol']} {c['side']} "
+                      f"{rec['strike']} exp {rec['expiry']} at ask {rec['entry_premium']} "
+                      f"(${cost:.0f}/contract, conf {conf}): {v.get('catalyst', '')[:100]}")
+    if changed:
+        slog["summary"] = options_shadow.shadow_summary(slog)
+        options_shadow.save_shadow_log(DESK_A_PATH, slog)
+        save_trade_log(log)
 
 
 def process_cycle_state(log, actions, broker_positions, exit_info=None):

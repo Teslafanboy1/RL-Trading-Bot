@@ -116,5 +116,52 @@ class TestDeskPaperStep(unittest.TestCase):
         self.assertEqual(set(paper["positions"]), set(held))
 
 
+from desk import engine_a as A
+
+
+def mover(sym="X", price=20, chg=8, vol=3e6, avg=1e6):
+    return {"symbol": sym, "price": price, "change_pct": chg, "volume": vol,
+            "avg_volume": avg}
+
+
+class TestEngineA(unittest.TestCase):
+    def test_call_on_crowd_buying_an_uptrend(self):
+        self.assertEqual(A.classify(mover(), ramp(80, step=0.005))[0], "call")
+
+    def test_no_call_on_a_pop_inside_a_downtrend(self):
+        self.assertEqual(A.classify(mover(), ramp(80, step=-0.005)),
+                         (None, "pop_without_trend"))
+
+    def test_no_trade_without_a_crowd(self):
+        self.assertEqual(A.classify(mover(vol=1e6), ramp(80))[1], "no_crowd")
+
+    def test_put_when_a_big_run_cracks(self):
+        closes = ramp(80, step=0.02)          # ~+50% over the last month
+        self.assertEqual(A.classify(mover(chg=-8), closes)[0], "put")
+
+    def test_no_put_on_a_drop_without_a_prior_run(self):
+        self.assertEqual(A.classify(mover(chg=-8), ramp(80, step=0.001))[0], None)
+
+    def test_price_band(self):
+        self.assertEqual(A.classify(mover(price=1.5), ramp(80))[1], "price_out_of_band")
+        self.assertEqual(A.classify(mover(price=900), ramp(80))[1], "price_out_of_band")
+
+    def test_rank_orders_by_crowd_strength_and_dedupes(self):
+        c = {"A": ramp(80, step=0.005), "B": ramp(80, step=0.005)}
+        r = A.rank([mover("A", chg=6, vol=2.5e6), mover("B", chg=12, vol=5e6),
+                    mover("A", chg=6)], c)
+        self.assertEqual([x["symbol"] for x in r], ["B", "A"])
+
+    def test_exit_rules(self):
+        pos = {"entry_premium": 1.0, "expiry": "2026-10-30", "entry_date": "2026-09-23"}
+        d = date(2026, 9, 25)
+        self.assertEqual(A.should_exit(pos, 2.05, d), (True, "take_profit"))
+        self.assertEqual(A.should_exit(pos, 0.49, d), (True, "premium_stop"))
+        self.assertEqual(A.should_exit(pos, 1.1, d), (False, ""))
+        self.assertEqual(A.should_exit(pos, 1.1, date(2026, 10, 7)), (True, "time_stop"))
+        self.assertEqual(A.should_exit(dict(pos, expiry="2026-09-30"), 1.1, d),
+                         (True, "dte_expiry"))
+
+
 if __name__ == "__main__":
     unittest.main()
