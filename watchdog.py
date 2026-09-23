@@ -12,6 +12,12 @@ Checks (market hours only, Mon-Fri 9:25-16:05 ET):
      the hard stop or trailing stop. Prices go stale only if BOTH the agent and
      this watchdog die — two independent processes.
   3. HALT — the risk_guard kill-switch file exists. Alert (once).
+  4. BLIND — the bot is alive (fresh heartbeat) but cannot see the account:
+     the preflight health check failed, or the cycle keeps ending in
+     `broker-read-failed`. Added 2026-09-23 after the VM's claude OAuth
+     session expired on 2026-08-31 and the bot ran BLIND for three weeks —
+     heartbeat fresh (so check 1 stayed quiet), every broker read failing,
+     no rotation orders, and no stop could fire. Nobody was told.
 
 Alerts go to ALERT_WEBHOOK_URL (env), or the contents of .alert_webhook_url in
 the repo root (so the launchd job needs no env setup). ntfy URLs get native
@@ -118,9 +124,54 @@ def latest_price(symbol):
         return None
 
 
+BLIND_STREAK = 3          # consecutive watchdog runs (~15 min) before alerting
+
+
+def _read_json(rel):
+    try:
+        with open(os.path.join(ROOT, rel)) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def blind_check():
+    """Alert when the bot is running but cannot read the broker. Returns the
+    current failure streak (for tests). Never raises."""
+    try:
+        pre = _read_json(os.path.join("logs", "preflight.json"))
+        if pre and pre.get("healthy") is False:
+            alert("preflight", "Trading bot: MORNING HEALTH CHECK FAILED",
+                  "claude -p is failing on the bot machine, so the bot cannot "
+                  "read the account, place orders, or fire stops. Detail: "
+                  f"{str(pre.get('detail'))[:300]}  Most common cause: the "
+                  "Claude login expired - SSH in and run `claude` then /login.")
+        cs = _read_json(os.path.join("logs", "cycle_status.json"))
+        failed = "broker-read-failed" in str(cs.get("detail", ""))
+        st = _read_json(STATE)
+        streak = (int(st.get("_blind_streak", 0)) + 1) if failed else 0
+        st["_blind_streak"] = streak
+        try:
+            with open(STATE, "w") as f:
+                json.dump(st, f, indent=2)
+        except Exception:
+            pass
+        if streak >= BLIND_STREAK:
+            alert("blind", "Trading bot: BLIND - broker reads failing",
+                  f"The last {streak} watchdog checks all saw "
+                  "`broker-read-failed`. The bot is alive but cannot see the "
+                  "account: no rotation orders and NO STOPS can fire. Check "
+                  "`claude -p` on the bot machine (expired login is the usual "
+                  "cause).")
+        return streak
+    except Exception:
+        return 0
+
+
 def main():
     if not market_hours():
         return
+    blind_check()
     # 1. dead-man: heartbeat freshness
     hb = os.path.join(ROOT, "logs", "heartbeat")
     if not os.path.exists(hb):

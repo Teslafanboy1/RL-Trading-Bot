@@ -8,7 +8,7 @@ Three jobs, all deliberately tiny and dependency-free:
    let MU fall 17% through a 10% stop (2026-06-27..07-02).
 
 2. MONTHLY HALT — `check_halt(equity)` tracks the month's peak equity in
-   logs/risk_state.json. If equity draws down >= HALT_DD_PCT (25%) from that
+   logs/risk_state.json. If equity draws down >= HALT_DD_PCT (10%) from that
    peak, it writes the HALT file and returns ("halt", ...). While the HALT
    file exists the trading loop must refuse to trade (agent.py gates on
    `halted()`); removing the file is a deliberate manual operator act.
@@ -32,7 +32,12 @@ from zoneinfo import ZoneInfo
 ROOT = os.path.dirname(os.path.abspath(__file__))
 ET = ZoneInfo("America/New_York")
 
-HALT_DD_PCT = 0.25
+# Lowered 25% -> 10% by the operator on 2026-09-23. At 25% the halt never
+# fired once in the 10y backtest (edge_lab4 halt count), so it protected
+# nothing. At 10% it would have tripped ~1.5x/yr (~1 month in 5) on the RX-3
+# book — each trip flattens everything and waits for the operator to delete
+# HALT. That trade-off was chosen knowingly over the 15% alternative.
+HALT_DD_PCT = 0.10
 HALT_FILE = os.path.join(ROOT, "HALT")
 STATE_FILE = os.path.join(ROOT, "logs", "risk_state.json")
 HEARTBEAT_FILE = os.path.join(ROOT, "logs", "heartbeat")

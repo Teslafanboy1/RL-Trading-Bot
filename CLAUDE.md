@@ -450,7 +450,7 @@ ladder: 2 weeks paper → half size → full; see
   the mark, live fills at the spread).
 - **`risk_guard.py`** — account-level kill-switch + heartbeat: every cycle writes
   `logs/heartbeat`; `check_halt(broker_total)` tracks the month-peak equity in
-  `logs/risk_state.json` and on a ≥25% monthly drawdown writes the **`HALT`**
+  `logs/risk_state.json` and on a ≥10% monthly drawdown (lowered from 25% on 2026-09-23) writes the **`HALT`**
   file, force-flattens the book (through the deterministic `force_sell` path) and
   refuses to trade until the operator deletes `HALT`. The broker read
   (`read_broker_state`) now also returns the account total, which feeds the halt

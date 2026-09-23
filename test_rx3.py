@@ -234,23 +234,23 @@ class TestRiskGuard:
     def test_ok_within_budget(self):
         st, _ = rg.check_halt(100.0)
         assert st == "ok"
-        st, _ = rg.check_halt(90.0)      # -10% from peak
+        st, _ = rg.check_halt(91.0)      # -9% from peak
         assert st == "ok"
 
-    def test_halt_on_25pct_drawdown(self):
+    def test_halt_on_10pct_drawdown(self):
         rg.check_halt(100.0)
-        st, detail = rg.check_halt(74.0)  # -26%
+        st, detail = rg.check_halt(89.0)  # -11%
         assert st == "halt"
         assert rg.halted()
-        st2, _ = rg.check_halt(74.0)
+        st2, _ = rg.check_halt(89.0)
         assert st2 == "halted"            # sticky until file removed
 
     def test_peak_ratchets_up(self):
         rg.check_halt(100.0)
         rg.check_halt(200.0)
-        st, _ = rg.check_halt(155.0)      # -22.5% from 200 peak
+        st, _ = rg.check_halt(182.0)      # -9% from 200 peak
         assert st == "ok"
-        st, _ = rg.check_halt(149.0)      # -25.5%
+        st, _ = rg.check_halt(178.0)      # -11%
         assert st == "halt"
 
     def test_month_rollover_resets_peak(self):
@@ -259,7 +259,7 @@ class TestRiskGuard:
         rg.check_halt(200.0, now=jan)
         st, _ = rg.check_halt(160.0, now=feb)   # new month: peak resets to 160
         assert st == "ok"
-        st, _ = rg.check_halt(118.0, now=feb)   # -26% from 160
+        st, _ = rg.check_halt(142.0, now=feb)   # -11.25% from 160
         assert st == "halt"
 
     def test_missing_equity_never_halts(self):
@@ -339,9 +339,9 @@ class TestRiskGuard:
     def test_rebase_peak_deposit_shifts_peak_up(self):
         rg.check_halt(100.0)
         rg.rebase_peak(50.0)         # deposit
-        st, _ = rg.check_halt(115.0)  # would be +15% from 100 but is -23% from 150
+        st, _ = rg.check_halt(140.0)  # would be +40% from 100 but is -6.7% from 150
         assert st == "ok"
-        st, _ = rg.check_halt(110.0)  # -26.7% from rebased 150 peak
+        st, _ = rg.check_halt(133.0)  # -11.3% from rebased 150 peak
         assert st == "halt"
 
     def test_rebase_peak_noop_without_existing_state(self):
