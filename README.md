@@ -1,115 +1,85 @@
-# Autonomous self-improving trading agent
+# Autonomous trading agent
 
-A fully autonomous trading agent. Claude drives everything — research, execution,
-learning, and strategy updates — using the Robinhood Agentic MCP to buy and sell
-stocks with real money, plus web search for news / Reddit / RSS.
+An autonomous trading bot for a small Robinhood account. It started in June 2026 as a
+fully LLM-driven trader (Claude doing research, execution and self-rewriting). After
+two months of live results and backtests, it now works like this:
 
-- Platform: Robinhood Agentic Account (true cash, account `696283985`)
-- Starting capital: $91
-- Settlement: T+1 — after a sell, cash takes 1 business day to settle before it
-  can be redeployed. Never buy with unsettled funds.
-- North star: 100% monthly portfolio return.
+- **A deterministic momentum rotation (RX-3) trades the real account.** It's plain
+  Python, and it's the same math the backtest ran.
+- **Claude is the transport and the watchdog.** It reads the broker and places one
+  named order at a time. It never decides what to buy or sell on the live book.
+- **New ideas run on paper first** (the Claude Desk engines), each graded on a
+  scorecard before any real money goes behind them.
 
-## The ribbon strategy (core buy/sell signal)
-
-Four **plain EMA** lines matching the TradingView chart the strategy is read from:
-blue = EMA(8), green = EMA(13), yellow = EMA(21), red = EMA(55). Lengths are measured in
-**bars** at the active chart interval (`SIGNAL_INTERVAL`): on a 30m chart, 55 bars = 55
-half-hours. (The chart's "Three Moving Averages [AdventTrading]" indicator is labeled
-"TEMA" but its Pine source computes plain `ema()` — do **not** use triple-EMA here; it
-overshoots in rallies and inverts the signal, which liquidated the book on 2026-06-15.)
-
-- **BUY**  — the 55 (red) crosses below ALL of 8/13/21 and becomes the LOWEST line.
-- **SELL** — the 55 (red) crosses above ALL of 8/13/21 and becomes the HIGHEST line.
-  For a held position, SELL **state** itself triggers the sell — no fresh cross required.
-- **HOLD** — while red stays the lowest line, hold the position.
-- **WAIT** — while red is above all 3 (downtrend), do nothing.
-
-## When the agent sells
-
-Three independent sell triggers — any one fires a sell:
-
-1. **Ribbon EXIT** — the 55 (red EMA) sits above all of 8/13/21: SELL state on a held
-   position sells immediately, whether the cross happened this bar or an earlier one.
-2. **Stop-loss** — position falls ≥10% below entry price. Hard rule, overrides everything.
-3. **Thesis break / confidence decay** — intraday news check finds a thesis-breaking event
-   (bad earnings, CEO departure, regulatory reversal, sector shock) or re-scores confidence
-   below 60. This fires every cycle and is the only mechanism that can sell before the
-   lagging EMA or stop-loss reacts.
-
-## The 4 phases
-
-**A — Pre-market research (8:55 AM ET, every trading day)** (`skill_1_research.md`)
-
-Runs automatically 35 minutes before market open. When you start the script while the
-market is closed, press `w` to enter the daily schedule — it wakes at **4:25 AM ET** for
-a tiny preflight system check (which deliberately *anchors* the rolling 5-hour Claude
-session window so it expires just before the bell), runs research at **8:55 AM ET**
-inside that window, then starts the trading loop at 9:30 AM on a **fresh** window.
-Uses `claude-opus-4-8`. See "Usage governor" in `CLAUDE.md` for why the timing matters.
-
-1. Goal-pace check: compute how much each position needs to move to matter.
-2. **Open-position review**: re-score every held position 0–100 from scratch. Compare each
-   position's weight to its confidence band maximum. Trim/exit over-weighted or
-   confidence-decayed positions; free that capital for redeployment.
-3. Scan 60+ candidates (static high-beta universe + live MCP movers/watchlists).
-4. Score each candidate 0–100 from EMA signal, momentum, and multi-source agreement.
-5. Rank all existing positions and new candidates together by confidence; allocate
-   top-down so capital always sits in the highest-conviction ideas.
-
-Output → `research/weekend_picks_YYYY-MM-DD.md` — automatically injected into every
-subsequent execution cycle so the trading loop acts on the picks immediately at open.
-Each pick must be written as a `### #N — SYMBOL | Confidence: XX/100` heading: the agent
-parses that exact format both to save the file and to extract the tickers execution
-watches. A research run that produces no parseable picks is never silently dropped — the
-agent logs a `WARNING` and preserves the raw text at `research/unsaved_*.md` so the plan
-is recoverable instead of execution quietly falling back to the prior day's picks.
-
-**B — Execution, Mon + intraweek** (`skill_2_execution.md`)
-- Every cycle: thesis integrity check on all held positions (web search for breaking news;
-  sell immediately if thesis broken or confidence decays below 60).
-- Smart skip: if all EMA signals are flat, no stop-loss is triggered, and the
-  last **execution** cycle was less than `NEWS_CHECK_HOURS` (default 4h) ago, skip the
-  model call entirely (0 tokens). Otherwise call the model to execute buys/sells.
-  (The gate keys off the last execution cycle, not the last model call of any kind,
-  so the pre-market research run at 9:23 AM can't suppress the 9:30 open.)
-- Buys require: EMA BUY/HOLD + settled cash + passing news check + no blackout window.
-
-**C — Midweek re-score (Wed, 12:00 PM ET)** (`skill_3_midweek.md`)
-
-Fires automatically once at noon on Wednesday during market hours. Uses `claude-opus-4-8`.
-
-- Re-scores every open position 0–100 from scratch (not qualitative — same full formula
-  as weekend research: EMA health, news search, momentum).
-- Compares current portfolio weights to confidence bands; trims/exits over-weighted or
-  decayed positions and redeploys freed capital via the Robinhood MCP in the same cycle.
-- Reports the explicit T+1 settlement schedule.
-
-Output → `research/midweek_review_YYYY-MM-DD.md` (existence of this file prevents the
-review from re-firing on subsequent 15-minute polls the same day).
-
-**D — Post-trade analysis (19:35 ET maintenance drain)** (`skill_4_postmortem.md` / `skill_4b_victory.md`)
-- Loss → postmortem (root cause, which source misled, preventive rule).
-- Win → victory (repeatable feature, guard against crediting luck, source weight nudge).
-- Followed by strategy + skill rewrite and confidence calibration.
-- A close during market hours **queues** the analysis (`logs/analysis_queue.jsonl`)
-  instead of running it inline: it is an Opus + web-search call, and firing it the
-  moment a position closes spent execution-window budget on retrospection. The drain
-  runs after the close, in a session window of its own, along with the skill_5
-  strategy rewrites. A close outside market hours is analysed immediately.
-
-## Capital allocation (of total portfolio value)
-
-Applied portfolio-wide, not just to new cash — so existing positions are always sized correctly:
-
-| Confidence | Max allocation |
+| | |
 |---|---|
-| 90–100 | 30% |
-| 75–89 | 20% |
-| 60–74 | 15% |
-| Below 60 | Exit if held / skip if new |
+| Broker | Robinhood Agentic account `696283985`, **limited margin** (unsettled funds spendable; no borrowing, no leverage) |
+| Runs on | Oracle VM (`trading-bot-deploy.service`); Mac app + dashboard as the operator console |
+| Live strategy | RX-3 rotation, full-deploy, **top 4** names |
+| Risk rails | −10% hard stop · 25% trailing stop · 10% monthly-drawdown kill-switch · independent watchdog |
+| Model access | `claude` CLI (Claude Code) with the `robinhood-cli` MCP. No API key needed. |
 
-Always keep a 10% cash reserve. Max 30% in any single position.
+`CLAUDE.md` is the full engineering reference, including the incident history behind
+each rule.
+
+## How the live book trades (RX-3)
+
+`rotation_engine.py` is a pure function. Once per market day it ranks a fixed universe
+on momentum (`0.5·r1m + 0.3·r1w + 0.2·r6m`, must be above its 200-day average) using
+closes **through yesterday only**, then picks a target book. The live config is
+`full_deploy=true, top_n=4`: 100% invested, split across the four strongest names.
+Leveraged 3x ETFs get a size haircut.
+
+Every 5 minutes during market hours, `agent.run_rotation_cycle()`:
+
+1. writes a heartbeat, checks the `HALT` kill-switch and the operator `PAUSE`
+2. reads the broker (authoritative; a failed read places **nothing**)
+3. fires **protective exits first**: hard stop (−10% from entry) and trailing stop
+   (−25% from the post-entry high)
+4. reconciles the book toward the day's target: sells, then re-reads buying power and
+   buys with the proceeds in the same cycle
+5. records fills from the broker, never from what the model says it did
+
+Buys are capped by the broker's `buying_power` taken verbatim, with a daily order cap
+and a `do_not_trade` list that blocks buys but never exits.
+
+**What the research says** (all in `research/`, 10y backtests):
+- Trading faster or on shorter timeframes makes it worse (`edge_lab4_speed.py`). The
+  edge is multi-week momentum persistence.
+- The lever that moves returns is how much capital is deployed, not how often it
+  trades.
+- 20%/month is not reachable. The best of 16 leveraged variants averaged ~2.8%/month
+  at a 93% drawdown (`edge_lab5_moonshot.py`). Unlevered top-4 full-deploy (~26%/yr,
+  ~50% max drawdown over 10y) is the best sane config.
+- Gaps beat stops: a stop can't sell while the market is closed, so stops have
+  filled around −14.5% on a −10% trigger. Position sizing is the gap defense.
+
+## Safety layers
+
+- **Kill-switch** (`risk_guard.py`): a ≥10% drawdown from the month's peak equity
+  writes `HALT`, flattens the book, and refuses to trade until the operator deletes it.
+- **Watchdog** (`watchdog.py`, every 5 min, independent of the bot): alerts on a stale
+  heartbeat, a symbol trading through its stop, a `HALT`, or **BLIND**. BLIND means a
+  failed morning health check or repeated failed broker reads; it was added after
+  the bot's Claude login expired on 2026-08-31 and it traded blind for three weeks.
+- **Alerts**: put an ntfy / Slack / Discord webhook URL in `.alert_webhook_url`
+  (gitignored). Without it, alerts only reach a log file.
+- **Operator controls** (`control/`): `PAUSE`, `do_not_trade.json`,
+  `stop_overrides.json`, per-symbol manual locks. All are honored every cycle.
+
+## Paper engines — Claude Desk
+
+These run alongside the live book with zero real orders. Every entry is pre-registered
+(entry / stop / target / expiry) on `shadow/desk_scorecard.jsonl` and graded daily.
+
+- **Engine B — both-ways trend** (`desk/engine_b.py`): momentum across stocks,
+  commodities, crypto ETFs and inverse ETFs, top 3, rebalanced weekly. Runs long-only
+  and with-inverse variants side by side.
+- **Engine A — Crowd Hunter** (`desk/engine_a.py`): paper options. It buys calls on
+  stocks surging on heavy volume in an up-trend and puts on crowd favourites that are
+  cracking. One Claude web-search call a day must confirm a real catalyst. Contracts
+  are priced at the real bid/ask.
+- **RX-4 paper tracker** (`shadow/rx4_paper.json`): a full-deploy top-2 comparison book.
 
 ## Run
 
@@ -117,58 +87,59 @@ Always keep a 10% cash reserve. Max 30% in any single position.
 pip install -r requirements.txt
 bash run.sh                        # advisory mode — read-only, no real orders
 EXECUTION_MODE=live bash run.sh    # live mode — places real orders
+bash run_dashboard.sh              # operator dashboard on 127.0.0.1:8787
 ```
 
-No `ANTHROPIC_API_KEY` needed — the `claude` CLI supplies the model and the authorized
-`robinhood-cli` MCP connection. Set `CLAUDE_BIN` if the CLI is not in PATH.
+RX-3 live is armed by `strategy.json → rotation.mode: "live"` **and**
+`rotation.live.enabled: true`. Set either to false and the legacy discretionary LLM loop
+returns on the next cycle.
+
+`strategy/strategy.json` is deploy-protected: the VM's copy wins. Change live settings
+on the VM with the scripts, which bump the version, snapshot history and log the change:
+
+```bash
+python3 scripts/apply_rx4_sizing.py --full-deploy --top-n 4
+```
+
+```bash
+python3 scripts/apply_stop_loss.py --show
+```
 
 Key env vars:
 
 | Variable | Default | Effect |
 |---|---|---|
 | `EXECUTION_MODE` | `advisory` | `live` arms real orders |
-| `SIGNAL_INTERVAL` | `1h` | Bar width for EMA |
-| `POLL_MINUTES` | `15` | Cycle frequency during market hours |
-| `NEWS_CHECK_HOURS` | `4` | Force a news/thesis check at least every N hours even on flat EMA days |
-| `MODEL` | `claude-opus-4-8` | Research / postmortem calls |
-| `CHECK_MODEL` | `claude-haiku-4-5-20251001` | Routine market-hours checks |
+| `POLL_MINUTES` | `5` | Cycle frequency during market hours (buys stop-breach latency, not more trades) |
+| `MODEL` | `claude-opus-4-8` | Research / postmortem / Engine A catalyst calls |
+| `CHECK_MODEL` | `claude-haiku-4-5-20251001` | Routine broker reads and order placement |
+| `ALERT_WEBHOOK_URL` | _(unset)_ | Out-of-band alerts (or use `.alert_webhook_url`) |
 
 ## File structure
 
 ```
-skills/
-  skill_0_orchestrator.md       coordinates every cycle
-  skill_1_research.md           weekend scanner + open-position reallocation
-  skill_2_execution.md          Mon + intraweek executor + thesis integrity check
-  skill_3_midweek.md            Wednesday full re-score + reallocation
-  skill_4_postmortem.md         loss analyst
-  skill_4b_victory.md           win analyst
-  skill_5_strategy_rewriter.md  rewrites strategy.json + skills after every trade
-  skill_6_pattern_detector.md   quarterly systemic review
-  history/                      versioned skill-file snapshots — rollback anytime
-strategy/
-  strategy.json                 config + learned state (versioned)
-  history/                      snapshot on every change — rollback anytime
-research/                       weekend_picks / midweek_review / agent runs / skill5_run logs
-                                + strategy_rewrite_queue.md (rewrite work queue)
-postmortems/                    postmortem_NNN.md / victory_NNN.md
-agent.py                        core loop, scheduling, skip logic, MCP wiring
-signals.py                      ribbon computation, plain EMA 8/13/21/55 (Yahoo or local CSV)
-trade_log.json                  open positions, closed trades, learning links
+agent.py              core loop: scheduling, broker reconciliation, RX-3 live, desk passes
+rotation_engine.py    RX-3 brain: pure, deterministic, identical to the backtest
+risk_guard.py         heartbeat + monthly-drawdown kill-switch
+watchdog.py           independent dead-man / stop / BLIND alerts
+usage_governor.py     keeps Claude usage inside the rolling 5-hour window
+desk/                 Claude Desk paper engines (A, B), scorecard, playbook
+options_shadow.py     paper-options quote + P&L engine
+signals.py            EMA ribbon (8/13/21/55, plain EMA) — used by the legacy loop
+strategy/             strategy.json (live config + learned state) + version history
+skills/               prompts for the legacy discretionary loop + learning loop
+scripts/              operator scripts for deploy-protected config changes
+research/             backtests and edge labs (every new idea must win here first)
+shadow/               paper books and the desk scorecard
+dashboard/            TradeCommand server (JSON API + PWA)
+RL Trading Bot/       native SwiftUI Mac/iPhone operator app
 ```
 
-## The learning loop
+## The legacy discretionary loop (retired while RX-3 is live)
 
-After every close: loss → skill_4, win → skill_4b. Each close also appends an entry to
-`research/strategy_rewrite_queue.md`. At the end of each cycle, `process_strategy_rewrite_queue()`
-pulls one un-done entry and runs **skill_5**, which updates `strategy.json` and any skill that
-needs improving. The model runs headless with no file-write tool, so `agent.py` parses skill_5's
-output text and applies the edits itself (the last fenced ```json block becomes the new
-`strategy.json`; `## SKILL FILE UPDATE` blocks rewrite skill files). One entry per cycle, and the
-whole step is isolated in try/except so a bad rewrite can never crash the trading loop.
-
-Source weights update after every trade; confidence scores are calibrated against real outcomes.
-A core rule changes only after 3+ similar outcomes. Every change is versioned for rollback —
-strategy snapshots in `strategy/history/`, skill-file snapshots in `skills/history/` (`version_skill_file()`
-snapshots a skill before each edit, a baseline `v001` of every skill is written on first run, and
-`rollback_skill()` restores any version). Rollback = swap a snapshot back. Quarterly, skill_6 reads all postmortems at once for the biggest strategic pivots.
+The original design is still in the code and comes back if RX-3 live is disarmed:
+pre-market Opus research (`skill_1`) picks stocks, an execution turn (`skill_2`) trades
+them on an EMA-ribbon signal, and every closed trade triggers a postmortem or victory
+analysis that feeds a strategy/skill rewriter (`skill_5`). Stop-loss and trailing-stop
+exits on the live book still go through that postmortem pipeline. Mechanical rotation
+exits don't.

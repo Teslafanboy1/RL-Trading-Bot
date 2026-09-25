@@ -21,7 +21,7 @@ Key env vars:
 | `POLL_MINUTES` | `5` | Cycle frequency during market hours. Was 15 until 2026-08-14; under RX-3 live a cycle is a cheap Haiku broker read plus any orders, so looking more often mainly buys **stop-breach detection latency**. It does *not* make the strategy trade more often — the rotation decides once a day by design. |
 | `MODEL` | `claude-opus-4-8` | Used for research/postmortem calls |
 | `CHECK_MODEL` | `claude-haiku-4-5-20251001` | Used for routine market-hours checks (most cycles skip the model entirely) |
-| `RH_ACCOUNT` | `696283985` | Robinhood Agentic cash account number |
+| `RH_ACCOUNT` | `696283985` | Robinhood Agentic account number (limited margin since 2026-08-14) |
 | `NEWS_CHECK_HOURS` | `4` | Force a thesis/news check at least every N hours even when EMA is flat — catches news-driven thesis breaks before the lagging EMA can reflect them |
 | `ALERT_WEBHOOK_URL` | _(unset)_ | If set, `notify_operator()` POSTs an out-of-band alert (`{title, message, text}` JSON — Slack/Discord/ntfy-compatible) when a hard forced exit can't complete or `claude -p` is unavailable while one is pending. Unset → stdout only. |
 | `USAGE_GOVERNOR` | `1` | `0`/`false` disables the 5-hour-window governor entirely (every call admitted). |
@@ -246,6 +246,12 @@ Skill-file edits get the same rollback safety that `snapshot_strategy()` gives `
 
 ### Options shadow (paper) mode — Phase B (`options_shadow.py`) + Phase B+ momentum (`momentum_screen.py`)
 
+> **Status 2026-09-25:** the Phase B+ momentum path has opened nothing since
+> RX-3 went live on 2026-08-13. It reads its catalysts from the daily `skill_1`
+> research run, and RX-3 live retired that run. Paper options now come from
+> [Claude Desk Engine A](#claude-desk-operator-plan-2026-09-23--paper-engines--the-brains-scorecard).
+> `options_shadow.py` is still the shared quote/P&L engine.
+
 The account (~$104) is far below the options activation threshold, so **no real option order is ever placed** — `strategy.json → options.enabled = false` is a hard gate, and `options.activation` records the per-structure account minimums (debit spreads ≥ $1,500; premium-selling ≥ $5,000). What *does* run is a **paper (shadow) track record**, gated independently by `options.shadow_mode = true`, so the options expression is validated with **real bid/ask quotes** (capturing the spread + IV-crush cost that make small-account options −EV) **before a dollar is at risk**. P&L is reported as **% return on premium** — account-size-independent, so the record stays meaningful now and after the account grows. The whole pass is **isolated, read-only, and never raises into the trading loop** (same try/except contract as the rewrite queue); off-hours it no-ops (real option quotes need a live market).
 
 Two signal sources feed the **same** `options_shadow.py` engine (selection → liquidity/ATM/DTE validation → spread-aware entry=ask/exit=bid → P&L → `shadow/options_shadow_log.json`), both opening at most a capped number of shadows per cycle:
@@ -357,6 +363,22 @@ true` — both required, `rotation_live_config()` fails closed on anything else
 (missing key, unreadable strategy, un-importable engine). Set either to false and
 the legacy discretionary loop comes back unchanged on the next cycle.
 
+**Live configuration on the VM as of 2026-09-25** (strategy v55 — read it there,
+`strategy.json` is deploy-protected so the git copy lags):
+
+| Knob | Value | Set by |
+|---|---|---|
+| `rotation.live.full_deploy` | `true` (100% invested, no RISKX/vol throttle) | `scripts/apply_rx4_sizing.py` |
+| `rotation.live.top_n` | `4` (was 2 until 2026-09-23) | `scripts/apply_rx4_sizing.py --full-deploy --top-n 4` |
+| `risk_management.stop_loss_pct` | `0.10` | `scripts/apply_stop_loss.py --pct …` |
+| `risk_management.trailing_stop_pct` | `0.25` | — |
+| `risk_guard.HALT_DD_PCT` | `0.10` monthly drawdown (was 25%) | code constant |
+| `.alert_webhook_url` | **unset** — every alert still goes only to a log | operator |
+
+top-4 unlevered full-deploy is the best *sane* config `edge_lab4`/`edge_lab5`
+found (~26%/yr, ~50% maxDD over 10y). See
+[the 20%/month question](#the-20month-question--measured-2026-09-23).
+
 - **`agent.run_rotation_cycle()`** replaces the model turn when live. Order of
   operations per cycle: heartbeat → HALT check → manual cash flows → stops and
   trailing stops computed → operator PAUSE → **authoritative broker read** →
@@ -400,6 +422,11 @@ the legacy discretionary loop comes back unchanged on the next cycle.
   is deploy-protected, so this cannot ship as a commit; the script does the
   version bump, history snapshot, and change-event that a hand-edit over SSH
   would skip, and refuses outright if RX-3 live is not armed).
+  **`scripts/apply_stop_loss.py`** is the same pattern for
+  `risk_management.stop_loss_pct` (`--show`, `--pct 0.07`). Tightening it does
+  **not** fix gap risk: nothing can sell while the market is closed, so the MU
+  (2026-07-06) and MRVL (2026-08-31) stops both filled at ~−14.5% on a −10% stop.
+  Sizing (`top_n`) is the gap defense; plan for a stop to slip ~5%.
 - **`place_rotation_order()`** places exactly one order per call and self-confirms
   via `get_equity_orders` — the `force_sell` contract, for the same 2026-06-12
   reason (a chatty turn narrating an order it never placed). Buys use
@@ -463,12 +490,68 @@ ladder: 2 weeks paper → half size → full; see
   Robinhood does not support GTC stop orders on fractional shares, so this
   watchdog + `stops.json` is the stop-defense that survives the bot dying (the
   2026-06-27..07-02 MU hole: −17% through a −10% stop with nobody watching).
+  **BLIND check** (`blind_check()`, added 2026-09-23): alerts when
+  `logs/preflight.json` reports a failed morning health check, or when 3
+  consecutive watchdog runs see `cycle_status = broker-read-failed`. It exists
+  because of the **2026-08-31 → 09-23 blind outage**: the VM's `claude` OAuth
+  session expired, every `read_broker_state()` failed within seconds, RX-3 placed
+  no orders and no stop could fire for three weeks — while the heartbeat stayed
+  fresh, so the dead-man check never tripped. **When the bot "isn't trading",
+  check `logs/cycle_status.json` and `logs/preflight.json` on the VM first**; the
+  fix for an expired login is `claude /login` on the VM, done by the operator.
 - **Alerts**: drop an ntfy/Slack/Discord webhook URL into `.alert_webhook_url`
   (gitignored); `run.sh` and `watchdog.py` both pick it up. ntfy URLs get native
   title/priority formatting in `notify_operator()`.
 - Research harnesses for all of the above: `research/edge_lab.py`,
   `edge_lab2.py`, `edge_lab3.py` (28 mechanisms tested; survivors documented in
   the proposal addendum). Every future strategy idea must win there first.
+  Later: `edge_lab4_speed.py` (speed — see above) and `edge_lab5_moonshot.py`
+  (leverage — see below).
+
+### The 20%/month question — measured 2026-09-23
+
+`research/edge_lab5_moonshot.py` drives the live `rotation_engine` at its most
+aggressive sizings with 1–3x synthetic leverage and counts months that clear
++20%. Best of 16 variants over 10y: **~2.8%/month at a 93% max drawdown**; all-in
+top-1 at 3x turned $100 into $7. Portfolio circuit-breaker stops (3–15%) were
+also tested: tight stops fired hundreds of times and **lowered** returns
+everywhere, and the "best" cell's neighbours were half as good (overfit, not an
+edge). **No configuration reaches 20%/month; stops cannot manufacture edge; do
+not arm leverage live.** Re-read this before proposing more aggression.
+
+## Claude Desk (operator plan 2026-09-23) — paper engines + the Brain's scorecard
+
+A second layer of strategies that run **alongside** the live RX-3 book, all
+**paper only**: no orders, every model call read-only, each pass wrapped so it
+never raises into the trading loop. Called from `run_rotation_cycle()` via
+`process_desk_paper()` and `process_desk_engine_a()`. Tests: `test_desk.py`.
+
+- **`desk/scorecard.py` — the ground truth.** Every entry is pre-registered as a
+  call (entry, stop, target, expiry) *before* its outcome is known, then graded
+  daily against real closes → `shadow/desk_scorecard.jsonl`. Engines are meant to
+  earn capital on these numbers, not on how convincing their reasoning sounded.
+  First review: **2026-10-13**.
+- **Engine B — both-ways trend** (`desk/engine_b.py`): one momentum ranking across
+  stocks, commodities (GLD/SLV/USO/CPER/UNG/DBA/URA), crypto ETFs and **inverse
+  ETFs** (the account cannot borrow to short, so inverse ETFs are the short side);
+  holds the top 3 in an up-trend, rebalances weekly. Two variants run
+  (`DESK_B_VARIANTS`): `shadow/desk_b_paper.json` (long-only) and
+  `shadow/desk_b_short_paper.json` (with inverse). A 10y check found the short
+  side **hurt** (maxDD 79% vs 61%) — the live record decides. Zero model tokens.
+- **Engine A — Crowd Hunter** (`desk/engine_a.py`, paper **options**): CALL a
+  stock the crowd is buying today (≥+5% on ≥2x relative volume, above SMA50, up
+  on the month); PUT a crowd favourite that ran +40% in a month and is now
+  breaking down ≥5% on heavy volume. Candidates come from Yahoo's free top-movers
+  screens; the Brain makes **one Opus + web call a day** on the top 3 and must find
+  a real catalyst (conf ≥ 60) or there is no trade. Contracts are quoted read-only
+  at live bid/ask (entry at ask, exit at bid), 14–45 DTE, spread ≤15% of mid,
+  ≤$150/contract, max 3 open / 1 new per day. Exits: +100% / −50% on premium,
+  14-day time stop, out before the last week. → `shadow/desk_a_paper.json`.
+  This **replaced the momentum-shadow catalyst source**, which silently died when
+  RX-3 live retired the morning research (no `## MOMENTUM OPTIONS WATCH` block
+  has been written since 2026-08-13, so `process_momentum_shadow` opens nothing).
+- **`desk/playbook.md`** — the Brain's lessons, read first every run. Mechanism
+  lessons get fixed the day they're found; strategy lessons need 3 repeats.
 
 ### RX-4 (operator-directed 2026-08-04) — "turn up the volume", paper-only hypothetical
 
