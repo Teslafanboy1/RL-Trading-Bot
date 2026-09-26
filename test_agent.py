@@ -3041,6 +3041,42 @@ class TestRX3OrderPlan(unittest.TestCase):
         plan = agent_module.rx3_order_plan({"AAA": 1.0}, [], 1000.0, None, self.CFG)
         self.assertEqual(plan, [])
 
+    def test_unpriced_holding_is_not_bought_again(self):
+        """2026-09-25 live: the morning cycle trimmed AMD 51%->25%, then the next
+        cycle's broker read returned AMD with last_price=null. Valued at $0 it
+        looked like an empty 25% slot and the freed cash bought it straight back.
+        Unknown value must mean 'no trade', never 'flat'."""
+        for price in (None, 0, "n/a"):
+            plan = agent_module.rx3_order_plan(
+                {"AMD": 0.25, "CRWD": 0.25},
+                [self._pos("AMD", 0.15, price), self._pos("CRWD", 0.6, 255.0)],
+                377.0, 124.76, self.CFG)
+            self.assertNotIn("AMD", [o["symbol"] for o in plan], price)
+            # the priced name alongside it is still reconciled normally
+            self.assertIn("CRWD", [o["symbol"] for o in plan], price)
+
+    def test_unpriced_overweight_is_not_trimmed_on_a_guess(self):
+        plan = agent_module.rx3_order_plan(
+            {"AAA": 0.25}, [self._pos("AAA", 80.0, None)], 1000.0, 0.0, self.CFG)
+        self.assertEqual(plan, [])
+
+    def test_unpriced_name_the_engine_dropped_is_still_fully_exited(self):
+        """An exit sells by share count, so it needs no price — a missing quote
+        must not keep a dropped name in the book."""
+        plan = agent_module.rx3_order_plan(
+            {"AAA": 1.0}, [self._pos("OLD", 3.0, None), self._pos("MID", 2.0, 50.0)],
+            1000.0, 0.0, {**self.CFG, "rebalance_band_pct": 0.0})
+        self.assertEqual(plan[0]["symbol"], "OLD")          # leads the sells
+        self.assertEqual(plan[0]["shares"], 3.0)
+        self.assertEqual(plan[0]["reason"], "rotation_exit")
+        self.assertIsNone(plan[0]["current_pct"])
+
+    def test_unpriced_exit_respects_a_working_sell(self):
+        plan = agent_module.rx3_order_plan(
+            {"AAA": 1.0}, [self._pos("OLD", 3.0, None)], 1000.0, 0.0, self.CFG,
+            sells_today=["OLD"])
+        self.assertEqual(plan, [])
+
 
 class TestPlaceRotationOrder(TmpDirMixin):
     def test_advisory_mode_places_nothing(self):

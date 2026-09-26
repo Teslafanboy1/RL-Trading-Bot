@@ -409,6 +409,12 @@ found (~26%/yr, ~50% maxDD over 10y). See
   spend money the broker won't release), `do_not_trade` blocking buys but never
   exits, manual-lock and already-working-sell skips, and a daily order cap. 20
   unit tests cover it; nothing here lives in a prompt.
+  **A held position the broker read returns without a price is UNKNOWN, not
+  $0**: no buy or trim on it that cycle (a full exit still goes, by share
+  count). Until 2026-09-26 `last_price: null` valued it at zero, so every
+  morning trim was bought straight back one cycle later (MRVL 08-27..31, then
+  AMD/CRWD 09-23..25; AMD ran ~51% of the book against a 25% target, and the
+  3x-haircut cash never materialised). Guarded by the `test_unpriced_*` tests.
 - **Sizing is config, and defaults to plain RX-3.** `rotation.live.full_deploy`
   (default `false`) and `rotation.live.top_n` (default = engine's 2) are threaded
   into `rotation_engine.target_book()` by `rx3_decide_targets()`. `full_deploy`
@@ -518,6 +524,19 @@ also tested: tight stops fired hundreds of times and **lowered** returns
 everywhere, and the "best" cell's neighbours were half as good (overfit, not an
 edge). **No configuration reaches 20%/month; stops cannot manufacture edge; do
 not arm leverage live.** Re-read this before proposing more aggression.
+
+### Polymarket / prediction markets — measured 2026-09-26
+
+Operator asked why nothing trades on weekends and pointed at Polymarket (24/7,
+CFTC-regulated for US residents via Polymarket US + KYC + API).
+`research/edge_lab6_polymarket.py` replays a year of resolved markets (23k,
+random sample of complete days) at real hourly prices, spread and taker fees.
+**Prices are well calibrated; every mechanical favourite-harvest variant loses
+after costs (−0.4% to −3% per bet)**, and the one positive cell vanishes once
+correlated same-event bets are counted once. Trap found on the way: filtering
+markets by *final* volume manufactures a fake "favourites lose" result, because
+upsets are what attract volume. What remains untested is an LLM forecaster;
+that can only be tested forward on the desk scorecard, not backtested.
 
 ## Claude Desk (operator plan 2026-09-23) — paper engines + the Brain's scorecard
 

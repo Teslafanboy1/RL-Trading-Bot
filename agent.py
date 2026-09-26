@@ -2257,7 +2257,10 @@ def read_broker_state(tier=TIER_EXECUTION):
         '{"positions": [{"symbol": "X", "shares": <float>, "avg_price": <float>, '
         '"last_price": <float|null>}], "sell_orders_today": ["SYM", ...], '
         '"account_total": <float|null>, "buying_power": <float|null>}\n'
-        "shares = quantity held (use 0 only if truly flat). If no positions, use []."
+        "shares = quantity held (use 0 only if truly flat). If no positions, use [].\n"
+        "last_price = the current price per share. If get_equity_positions does "
+        "not include one, call get_equity_quotes for the held symbols. Use null "
+        "only when no quote can be had — never 0."
     )
     text, _ = run_model(system, user, mcp=True, read_only=True, model=CHECK_MODEL,
                         timeout=240, tier=tier)
@@ -3615,15 +3618,32 @@ def rx3_order_plan(targets, positions, equity, buying_power, cfg, *,
     for p in positions or []:
         sym = str(p.get("symbol") or "").upper()
         sh = float(p.get("shares") or 0)
-        px = float(p.get("last_price") or 0)
+        try:
+            px = float(p.get("last_price") or 0)
+        except (TypeError, ValueError):
+            px = 0.0
         if sym and sh > 0:
-            held[sym] = {"shares": sh, "price": px, "value": sh * px}
+            held[sym] = {"shares": sh, "price": px,
+                         "value": sh * px if px > 0 else None}
 
     sells, buys = [], []
     for sym in sorted(set(list(held) + list(targets or {}))):
         if sym in locked:
             continue
         cur = held.get(sym, {})
+        if sym in held and cur["value"] is None:
+            # Held, but the broker read came back without a price. Its value is
+            # UNKNOWN, not zero. Valued at $0 it read as an empty slot, so the
+            # planner bought the full target again on top of the real position:
+            # 2026-08-27..09-25 every morning trim was bought straight back one
+            # cycle later (AMD sat at ~51% of the book against a 25% target).
+            # A full exit sells by share count and needs no price, so it still
+            # goes; anything that must be sized in dollars waits for a priced read.
+            if float((targets or {}).get(sym, 0.0)) <= 0 and sym not in sells_today:
+                sells.append({"symbol": sym, "target_pct": 0.0, "current_pct": None,
+                              "drift_usd": None, "side": "sell",
+                              "shares": cur["shares"], "reason": "rotation_exit"})
+            continue
         cur_val = float(cur.get("value") or 0)
         tgt_val = float((targets or {}).get(sym, 0.0)) * deployable
         drift = tgt_val - cur_val
@@ -3652,7 +3672,8 @@ def rx3_order_plan(targets, positions, equity, buying_power, cfg, *,
                 buys.append({**row, "side": "buy", "dollar_amount": round(drift, 2),
                              "reason": "rotation_entry" if sym not in held else "rotation_add"})
 
-    sells.sort(key=lambda o: o["drift_usd"])          # most over-weight first
+    # most over-weight first; an unpriced full exit (drift unknown) leads
+    sells.sort(key=lambda o: float("-inf") if o["drift_usd"] is None else o["drift_usd"])
     buys.sort(key=lambda o: -o["drift_usd"])          # most under-weight first
 
     # Buys spend only what the broker says is actually available RIGHT NOW.
@@ -3799,9 +3820,11 @@ def process_rx3_live(log, strategy, cfg, broker_positions, broker_total,
         n = 0
         for o in orders:
             sym = o["symbol"]
+            cur = ("?" if o["current_pct"] is None
+                   else f"{o['current_pct'] * 100:.1f}")
             print(f"  [rx3-live] {o['side'].upper()} {sym} "
                   f"{o.get('dollar_amount') or o.get('shares')} "
-                  f"(cur {o['current_pct']*100:.1f}% -> tgt {o['target_pct']*100:.1f}%) "
+                  f"(cur {cur}% -> tgt {o['target_pct']*100:.1f}%) "
                   f"reason={o['reason']}")
             placed, fill, order_id = place_rotation_order(
                 o["side"], sym, dollar_amount=o.get("dollar_amount"),
