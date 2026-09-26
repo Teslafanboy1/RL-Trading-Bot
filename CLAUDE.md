@@ -571,6 +571,19 @@ never raises into the trading loop. Called from `run_rotation_cycle()` via
   has been written since 2026-08-13, so `process_momentum_shadow` opens nothing).
 - **`desk/playbook.md`** — the Brain's lessons, read first every run. Mechanism
   lessons get fixed the day they're found; strategy lessons need 3 repeats.
+- **Engine P — Polymarket forecaster** (`desk/engine_p.py` + `polymarket_desk.py`,
+  operator 2026-09-26, PAPER): the one Polymarket idea edge_lab6 could not
+  backtest. Runs **outside the stock bot** on its own systemd timer
+  (`scripts/systemd/trading-bot-pm.{service,timer}`, every 30 min, 24/7,
+  pinned to `EXECUTION_MODE=advisory`). Once a day: ~10 eligible markets
+  (resolving in 0.5–30 days, liquid, 8–92c, no sports/crypto/weather/price
+  ladders, at most 2 per specific topic tag) → ONE Opus + web call that
+  forecasts them **blind (never shown the price)** → paper bet where the forecast
+  beats ask + taker fee by ≥7 points (quarter-Kelly, ≤5% per bet). Every
+  30 min: settle resolved markets for free. The verdict is **Brier(model) vs
+  Brier(market) over every forecast** — no edge unless the model beats the
+  crowd's own price. State `shadow/pm_desk_p.json`; lessons `desk/pm_playbook.md`;
+  `python3 polymarket_desk.py --status`. Tests: `test_pm_desk.py` (in the deploy gate).
 
 ### RX-4 (operator-directed 2026-08-04) — "turn up the volume", paper-only hypothetical
 

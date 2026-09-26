@@ -1,0 +1,10 @@
+[Unit]
+Description=Polymarket paper desk every 30 minutes, 24/7 (weekends included)
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

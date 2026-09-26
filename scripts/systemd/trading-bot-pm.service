@@ -1,0 +1,18 @@
+[Unit]
+Description=Polymarket paper desk (Claude Desk Engine P) — one pass
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=opc
+WorkingDirectory=/home/opc/trading-bot
+Environment=HOME=/home/opc
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+# PAPER ONLY. Pinned to advisory so no code path here can ever arm the
+# Robinhood order tools, whatever the stock bot's own unit sets.
+Environment=EXECUTION_MODE=advisory
+ExecStart=/usr/bin/python3 /home/opc/trading-bot/polymarket_desk.py
+TimeoutStartSec=2400
+StandardOutput=journal
+StandardError=journal

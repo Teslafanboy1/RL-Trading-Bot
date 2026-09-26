@@ -128,7 +128,7 @@ for p in "${PROTECTED_PATHS[@]}"; do
 done
 
 log "running test suite in staging"
-if (cd "$STAGING_DIR" && python3 -m unittest test_agent test_dashboard) >>"$LOG_FILE" 2>&1; then
+if (cd "$STAGING_DIR" && python3 -m unittest test_agent test_dashboard test_pm_desk) >>"$LOG_FILE" 2>&1; then
     log "tests passed"
 else
     alert "deploy tests FAILED for $NEW_SHA — leaving VM on $OLD_SHA, see $LOG_FILE"
