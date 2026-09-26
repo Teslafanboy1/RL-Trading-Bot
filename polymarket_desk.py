@@ -141,9 +141,17 @@ def brain_forecast(cands):
         'Use confidence "low" when you found no specific recent evidence.')
     text, _ = agent.run_model(system, user, web=True, model=agent.MODEL, timeout=1500,
                               tier=agent.TIER_SHADOW)
+    text = str(text or "")
+    # A failed call must be reported as one. Its error text carries the CLI's
+    # own JSON, which parses as a "forecast" with no market ids in it — the
+    # first smoke test (2026-09-26, CLI not logged in) failed silently that way.
+    if text.startswith("(claude -p error") or text.startswith("(error:"):
+        print(f"  [pm-P] brain call FAILED: {text[:300]}")
+        return {}
     block = agent.extract_last_json_block(text)
-    if not isinstance(block, dict):
-        print(f"  [pm-P] brain call returned nothing usable: {str(text)[:200]}")
+    ids = {c["market_id"] for c in cands}
+    if not isinstance(block, dict) or not ids & set(block):
+        print(f"  [pm-P] brain call returned no forecasts for these markets: {text[:300]}")
         return {}
     return block
 

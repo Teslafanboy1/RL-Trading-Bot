@@ -234,6 +234,24 @@ class TestRunner(unittest.TestCase):
             self.assertNotIn(leak, system + user)
         self.assertEqual(rm.call_args.kwargs["tier"], desk.agent.TIER_SHADOW)
 
+    def test_a_failed_brain_call_is_reported_not_parsed(self):
+        """2026-09-26 smoke test: the CLI's error text carries JSON, which used
+        to parse as an empty 'forecast' and fail with no message at all."""
+        cands = engine_p.select_candidates([event(markets=[market("1")])], NOW, desk.iso_ts)
+        err = '(claude -p error rc=1: {"is_error":true,"result":"Failed to authenticate"})'
+        for text in (err, "(error: usage-governor deferred this call)",
+                     '```json\n{"other": {"p_yes": 0.5}}\n```'):
+            with patch.object(desk.agent, "run_model", return_value=(text, {})), \
+                 patch("builtins.print") as out:
+                self.assertEqual(desk.brain_forecast(cands), {})
+            self.assertTrue(out.called, text)
+
+    def test_a_good_brain_reply_is_returned(self):
+        cands = engine_p.select_candidates([event(markets=[market("1")])], NOW, desk.iso_ts)
+        reply = '```json\n{"1": {"p_yes": 0.7, "confidence": "high", "reason": "x"}}\n```'
+        with patch.object(desk.agent, "run_model", return_value=(reply, {})):
+            self.assertEqual(desk.brain_forecast(cands)["1"]["p_yes"], 0.7)
+
     def test_book_write_is_atomic_json(self):
         desk.save_book({"x": 1})
         with open(self.book_path) as f:
