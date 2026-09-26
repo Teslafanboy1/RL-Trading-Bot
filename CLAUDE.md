@@ -538,6 +538,14 @@ markets by *final* volume manufactures a fake "favourites lose" result, because
 upsets are what attract volume. What remains untested is an LLM forecaster;
 that can only be tested forward on the desk scorecard, not backtested.
 
+**Weather ("highest temperature in X") markets — no edge either**
+(`research/edge_lab7_pm_weather.py`, 9,887 events, 53 cities, forecasts as
+issued from Open-Meteo Previous Runs, train/test split). The crowd beats a
+3-model GFS/ECMWF/ICON average at every lead (test log-loss 1.32 vs 1.63), a
+price+model blend scores worse than price alone, and all 36 strategy cells lose
+per bet out of sample (the headline rule: −46%/bet, $374 → $0.22 in two weeks).
+Traders there already use better forecasts and live airport observations.
+
 ## Claude Desk (operator plan 2026-09-23) — paper engines + the Brain's scorecard
 
 A second layer of strategies that run **alongside** the live RX-3 book, all

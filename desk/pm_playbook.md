@@ -12,6 +12,11 @@ after the same mistake shows up 3 times on resolved markets.
   spread. An edge smaller than ~5 points does not survive them.
 - **Upsets cluster in the busiest markets.** High volume often means news is
   moving the price right now — the crowd may know something you have not found.
+- **Where a public model disagrees with the crowd, the crowd is usually right.**
+  Temperature markets vs free weather models (edge_lab7, 2026-09-26): the
+  crowd won every month; betting the disagreements lost ~46% per bet. A huge
+  gap between your number and a liquid price is more often a misread
+  resolution source than a mispriced market — re-read the rules first.
 
 ## How to forecast
 - Read the resolution rules literally: the source, the deadline, the time zone,
