@@ -19,7 +19,17 @@ Pure: no I/O. agent.process_desk_engine_a owns the fetches and model calls.
 from datetime import date
 
 MIN_PRICE = 3.0            # below this, option chains are thin or absent
-MAX_PRICE = 150.0          # above this, one contract dwarfs the account
+MAX_PRICE = 500.0          # was 150 until 2026-09-26 — 0 crowd setups in the
+                           # first 3 live days (Sep 23-25) because $150
+                           # excluded exactly the market's real momentum
+                           # leaders (AMD/CRWD/MRVL, Engine B's own top-3).
+                           # research/edge_lab7_deska_cap.py (10y, 33 names,
+                           # driving classify() itself) found $500 is the best
+                           # cap tested: +131 setups vs $150 at the BEST avg
+                           # return of any cap (+1.92%/trade vs +1.78%). Fully
+                           # uncapped is worse — the >$500 tail is toxic (8
+                           # trades, 25% win, -22.79% avg, COIN/MSTR-style
+                           # blowups) and drags the aggregate down to +1.61%.
 CALL_MIN_CHANGE = 5.0      # % up today
 PUT_MAX_CHANGE = -5.0      # % down today
 PUT_MIN_RUN_1M = 0.40      # the crowd must already have run it up this much
